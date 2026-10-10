@@ -8,6 +8,7 @@
  * web_search / generate_image HTTP clients use host allowlist from society-sandbox.
  * Social tools: create_room / invite_to_room / list_rooms / list_agents / post_room / speak_in_room / send_dm / spawn_agent.
  * Closing tools (idle/reply): speak_in_room / send_dm / write_diary / write_thought / do_nothing / stay_silent.
+ * Side tool: reflect_feelings (subjective soul nudge; not a closing act).
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -109,7 +110,11 @@ export const RESEARCH_TOOL_NAMES = [
   'list_rooms',
   'run_command',
   'generate_image',
+  'reflect_feelings',
 ] as const
+
+/** Side tools that may run before/alongside a closing act (not closing themselves). */
+export const SIDE_TOOL_NAMES = ['reflect_feelings'] as const
 
 export type ClosingActName =
   | 'speak_in_room'
@@ -147,6 +152,43 @@ function splitBubbleBodies(body: string): string[] {
   }
   return [trimmed.slice(0, 2000)]
 }
+
+const SIDE_TOOL_DEFINITIONS: ToolDefinition[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'reflect_feelings',
+      description:
+        'Record YOUR OWN subjective soul shift after this turn (openness/trust/energy/mood). Optional; call at most once per turn when your feelings actually changed. Warm chat may raise energy/trust; exhaustion may lower energy. Deltas are small (±0.05 max each). Does NOT speak for you — still call a closing tool.',
+      parameters: {
+        type: 'object',
+        properties: {
+          openness: {
+            type: 'number',
+            description: 'Delta for openness, clamped to ±0.05',
+          },
+          trust: {
+            type: 'number',
+            description: 'Delta for trust, clamped to ±0.05',
+          },
+          energy: {
+            type: 'number',
+            description: 'Delta for energy, clamped to ±0.05',
+          },
+          mood: {
+            type: 'string',
+            description: 'Optional short mood label (e.g. 开心、疲惫、好奇)',
+          },
+          reason: {
+            type: 'string',
+            description: 'Optional short reason for the audit log',
+          },
+        },
+        required: [],
+      },
+    },
+  },
+]
 
 const CLOSING_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
@@ -491,7 +533,7 @@ export class SocietyToolsService extends Service {
 
   /** OpenAI-style tool schemas for chat/completions (full catalog). */
   getToolDefinitions(): ToolDefinition[] {
-    return mergeToolDefs(TOOL_DEFINITIONS, CLOSING_TOOL_DEFINITIONS)
+    return mergeToolDefs(TOOL_DEFINITIONS, CLOSING_TOOL_DEFINITIONS, SIDE_TOOL_DEFINITIONS)
   }
 
   /** Idle self-loop: research tools + idle closing tools. */
@@ -590,6 +632,8 @@ export class SocietyToolsService extends Service {
             acted: 'stay_silent',
             reason: args.reason != null ? String(args.reason) : undefined,
           })
+        case 'reflect_feelings':
+          return this.reflectFeelings(agentId, args)
         case 'spawn_agent':
           return this.spawnAgent(agentId, args)
         default:
@@ -926,6 +970,66 @@ export class SocietyToolsService extends Service {
       path: rel,
       clock,
       text: raw.slice(0, 200),
+    })
+  }
+
+  /**
+   * Subjective soul update for THIS agent only (no keyword heuristics, no fan-out).
+   */
+  reflectFeelings(agentId: AgentId, args: Record<string, unknown>): string {
+    const patch: {
+      openness?: number
+      trust?: number
+      energy?: number
+      mood?: string
+      reason?: string
+    } = {}
+    if (args.openness != null && Number.isFinite(Number(args.openness))) {
+      patch.openness = Number(args.openness)
+    }
+    if (args.trust != null && Number.isFinite(Number(args.trust))) {
+      patch.trust = Number(args.trust)
+    }
+    if (args.energy != null && Number.isFinite(Number(args.energy))) {
+      patch.energy = Number(args.energy)
+    }
+    if (args.mood != null) patch.mood = String(args.mood)
+    if (args.reason != null) patch.reason = String(args.reason)
+    if (
+      patch.openness == null &&
+      patch.trust == null &&
+      patch.energy == null &&
+      !patch.mood
+    ) {
+      return JSON.stringify({
+        ok: false,
+        acted: 'reflect_feelings',
+        error: 'provide at least one of openness/trust/energy/mood',
+      })
+    }
+    const before = this.ctx.societySoul.get(agentId)
+    const after = this.ctx.societySoul.applySubjective(agentId, patch)
+    return JSON.stringify({
+      ok: true,
+      acted: 'reflect_feelings',
+      before: {
+        openness: before.openness,
+        trust: before.trust,
+        energy: before.energy,
+        mood: before.mood,
+      },
+      after: {
+        openness: after.openness,
+        trust: after.trust,
+        energy: after.energy,
+        mood: after.mood,
+      },
+      deltas: {
+        openness: Math.round((after.openness - before.openness) * 10000) / 10000,
+        trust: Math.round((after.trust - before.trust) * 10000) / 10000,
+        energy: Math.round((after.energy - before.energy) * 10000) / 10000,
+      },
+      reason: patch.reason || 'reflect_feelings',
     })
   }
 

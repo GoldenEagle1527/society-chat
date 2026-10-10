@@ -116,11 +116,55 @@ async function main() {
   const noop = await ctx.societyTools.execute('bob', 'do_nothing', '{}')
   assert.equal(JSON.parse(noop).acted, 'do_nothing')
 
+  // Subjective soul: no auto heuristic on room post; only reflect_feelings
+  const bobBefore = { ...ctx.societySoul.get('bob') }
+  ctx.societyRooms.post({
+    roomId: room.id,
+    from: 'alice',
+    body: '危险！系统崩溃了吗？谢谢你的分享，很有趣！',
+  })
+  const bobAfterPost = ctx.societySoul.get('bob')
+  assert.equal(bobAfterPost.trust, bobBefore.trust, 'room fan-out must not change listener trust')
+  assert.equal(bobAfterPost.energy, bobBefore.energy, 'room fan-out must not drain listener energy')
+  assert.equal(bobAfterPost.openness, bobBefore.openness, 'room fan-out must not change listener openness')
+
+  const reflected = await ctx.societyTools.execute(
+    'bob',
+    'reflect_feelings',
+    JSON.stringify({
+      energy: 0.2,
+      trust: 0.03,
+      mood: '愉快',
+      reason: '和 Alice 聊得开心',
+    }),
+  )
+  const refObj = JSON.parse(reflected) as {
+    ok: boolean
+    acted: string
+    deltas: { energy: number; trust: number; openness: number }
+    after: { energy: number; trust: number; mood: string }
+  }
+  assert.equal(refObj.ok, true)
+  assert.equal(refObj.acted, 'reflect_feelings')
+  assert.equal(refObj.deltas.energy, 0.05, 'energy delta must clamp to ±0.05')
+  assert.equal(refObj.deltas.trust, 0.03)
+  assert.equal(refObj.after.mood, '愉快')
+  const bobSoul = ctx.societySoul.get('bob')
+  assert.ok(Math.abs(bobSoul.energy - Math.min(1, bobBefore.energy + 0.05)) < 1e-9)
+  assert.ok(Math.abs(bobSoul.trust - Math.min(1, bobBefore.trust + 0.03)) < 1e-9)
+  console.log('✓ reflect_feelings updates only caller; clamps ±0.05; no room heuristic')
+
+  assert.ok(idleNames.includes('reflect_feelings'), 'idle tools must include reflect_feelings')
+  assert.ok(replyNames.includes('reflect_feelings'), 'reply tools must include reflect_feelings')
+  assert.equal(isClosingToolName('reflect_feelings'), false)
+
   // Prompt strings used by llm must not advertise ACTION menus
   const sys = ctx.societyLlm.buildSystemPrompt('alice', true)
   assert.ok(!/ACTION:ROOM/.test(sys))
   assert.ok(!/ACTION:SILENT/.test(sys))
   assert.ok(/speak_in_room/.test(sys) || /收束工具/.test(sys))
+  assert.ok(/reflect_feelings/.test(sys), 'system prompt must mention reflect_feelings')
+  assert.ok(/主观/.test(sys) || /reflect_feelings/.test(sys))
   assert.ok(/当前北京时间：\d{4}-\d{2}-\d{2}/.test(sys), 'system prompt must include Beijing date')
   assert.ok(/Asia\/Shanghai/.test(sys), 'system prompt must name Asia/Shanghai')
   assert.ok(/星期/.test(sys), 'system prompt must include Chinese weekday')

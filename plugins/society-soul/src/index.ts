@@ -5,11 +5,15 @@
  * Persists to data/agents/<id>/soul.json
  * Audit: data/agents/<id>/soul-log.jsonl
  * Seeds from identity profile (agents/*.json) on first run.
+ *
+ * Soul openness/trust/energy/mood change ONLY via the agent's own
+ * subjective tool call (reflect_feelings → applySubjective). No
+ * keyword heuristics on room fan-out.
  */
 import fs from 'node:fs'
 import path from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
-import type { AgentId, RoomMessage, SoulState } from '../../../src/types.ts'
+import type { AgentId, SoulState } from '../../../src/types.ts'
 import { agentDataDir } from '../../../src/paths.ts'
 
 declare module '@deepseek-ai/cordis' {
@@ -30,8 +34,16 @@ export interface SoulLogEntry {
   deltas: Partial<Record<'openness' | 'trust' | 'energy', number>>
 }
 
+/** Max absolute delta per metric per reflect_feelings call. */
+export const SUBJECTIVE_DELTA_CLAMP = 0.05
+
 function clamp01(n: number): number {
   return Math.max(0, Math.min(1, n))
+}
+
+function clampDelta(n: number, maxAbs = SUBJECTIVE_DELTA_CLAMP): number {
+  if (!Number.isFinite(n)) return 0
+  return Math.max(-maxAbs, Math.min(maxAbs, n))
 }
 
 function soulPath(agentId: AgentId): string {
@@ -53,78 +65,25 @@ function snapshot(s: SoulState): SoulState {
   }
 }
 
-/** Deterministic valence / keyword heuristic (no LLM). */
-function heuristicDeltas(body: string, role: 'speaker' | 'listener'): {
-  openness: number
-  trust: number
-  energy: number
+export interface SubjectiveSoulPatch {
+  /** Relative deltas; each clamped to ±SUBJECTIVE_DELTA_CLAMP then 0–1. */
+  openness?: number
+  trust?: number
+  energy?: number
+  /** Optional short mood label (agent's subjective feeling). */
   mood?: string
-} {
-  const text = body
-  let openness = 0
-  let trust = 0
-  let energy = 0
-  let mood: string | undefined
-
-  if (/谢谢|感谢|欢迎|开心|喜欢|棒|赞|有趣|期待|嗨|你好/.test(text)) {
-    trust += 0.012
-    energy += 0.01
-    mood = '友善'
-  }
-  if (/好奇|探索|为什么|怎么|发现|想法|分享/.test(text)) {
-    openness += 0.015
-    mood = mood || '好奇'
-  }
-  if (/系统|隔离|安全|权限|细节|工程|工具/.test(text)) {
-    energy += role === 'speaker' ? 0.008 : 0.004
-    openness += 0.004
-  }
-  if (/累|烦|讨厌|生气|危险|炸|崩溃|拒绝/.test(text)) {
-    trust -= 0.01
-    energy -= 0.015
-    mood = '警惕'
-  }
-  if (/吗\？|\?|？/.test(text)) {
-    openness += 0.008
-    energy -= 0.003
-  }
-  // Speaking costs a tiny bit of energy; listening a bit less
-  if (role === 'speaker') energy -= 0.005
-  else energy -= 0.002
-
-  return { openness, trust, energy, mood }
+  /** Optional short reason for the audit log. */
+  reason?: string
 }
 
 export class SocietySoulService extends Service {
-  static inject = ['societyIdentity', 'societyRooms']
+  static inject = ['societyIdentity']
 
   private readonly cache = new Map<AgentId, SoulRecord>()
 
   constructor(ctx: Context) {
     super(ctx, 'societySoul')
-
-    ctx.on('society/room-message', (msg: RoomMessage) => {
-      const room = ctx.societyRooms.get(msg.roomId)
-      const members = room?.members ?? []
-      for (const member of members) {
-        const role: 'speaker' | 'listener' =
-          msg.from !== 'system' && member === msg.from ? 'speaker' : 'listener'
-        try {
-          this.nudgeFromText(member, msg.body, role, `room:${msg.roomId.slice(0, 8)}`)
-        } catch (err) {
-          ctx.logger('society-soul').warn(String(err))
-        }
-      }
-    })
-
-    ctx.on('society/mail-delivered', (msg) => {
-      if (msg.kind !== 'direct') return
-      try {
-        this.nudgeFromText(msg.to, msg.body, 'listener', `dm-from:${msg.from}`)
-      } catch (err) {
-        ctx.logger('society-soul').warn(String(err))
-      }
-    })
+    // No automatic room/mail heuristic nudges — soul changes only via applySubjective.
   }
 
   /** Load or seed soul.json from identity profile. */
@@ -168,47 +127,42 @@ export class SocietySoulService extends Service {
     return this.load(agentId)
   }
 
-  /** Apply heuristic deltas; writes soul.json + soul-log.jsonl. */
-  nudgeFromText(
-    agentId: AgentId,
-    body: string,
-    role: 'speaker' | 'listener',
-    reason: string,
-  ): SoulRecord {
+  /**
+   * Apply the agent's own subjective feeling deltas (from reflect_feelings).
+   * Only updates THIS agentId. Each numeric delta clamped to ±0.05; result 0–1.
+   */
+  applySubjective(agentId: AgentId, patch: SubjectiveSoulPatch): SoulRecord {
     const before = this.load(agentId)
-    const d = heuristicDeltas(body, role)
-    if (d.openness === 0 && d.trust === 0 && d.energy === 0 && !d.mood) {
+    const dOpen = clampDelta(Number(patch.openness ?? 0))
+    const dTrust = clampDelta(Number(patch.trust ?? 0))
+    const dEnergy = clampDelta(Number(patch.energy ?? 0))
+    const moodIn =
+      patch.mood != null && String(patch.mood).trim()
+        ? String(patch.mood).trim().slice(0, 32)
+        : undefined
+    const reasonRaw =
+      patch.reason != null && String(patch.reason).trim()
+        ? String(patch.reason).trim().slice(0, 120)
+        : 'reflect_feelings'
+
+    if (dOpen === 0 && dTrust === 0 && dEnergy === 0 && !moodIn) {
       return before
     }
 
     const after: SoulRecord = {
-      openness: clamp01(before.openness + d.openness),
-      trust: clamp01(before.trust + d.trust),
-      energy: clamp01(before.energy + d.energy),
+      openness: clamp01(before.openness + dOpen),
+      trust: clamp01(before.trust + dTrust),
+      energy: clamp01(before.energy + dEnergy),
       interests: [...before.interests],
-      mood: d.mood || before.mood || '平静',
+      mood: moodIn || before.mood || '平静',
       notes: before.notes,
       updatedAt: new Date().toISOString(),
-    }
-
-    // Interest discovery from keywords (deterministic)
-    const interestHints: Array<[RegExp, string]> = [
-      [/探索|发现/, '探索'],
-      [/聊天|说话|交流/, '聊天'],
-      [/系统|工程|工具/, '系统'],
-      [/隔离|安全|权限/, '隔离'],
-      [/笔记|记录/, '笔记'],
-    ]
-    for (const [re, tag] of interestHints) {
-      if (re.test(body) && !after.interests.includes(tag)) {
-        after.interests = [...after.interests, tag].slice(0, 8)
-      }
     }
 
     this.persist(agentId, after)
     this.appendLog(agentId, {
       ts: after.updatedAt,
-      reason,
+      reason: reasonRaw,
       before: snapshot(before),
       after: snapshot(after),
       deltas: {
@@ -228,6 +182,7 @@ export class SocietySoulService extends Service {
       `- 开放度=${s.openness.toFixed(2)}，信任=${s.trust.toFixed(2)}，精力=${s.energy.toFixed(2)}`,
       `- 心情：${s.mood || '平静'}`,
       `- 兴趣：${s.interests.length ? s.interests.join('、') : '无'}`,
+      '- 以上数值是你的主观状态；若本回合心情/精力/信任确有变化，可另调一次 reflect_feelings（每回合最多一次，不必每次都调）。',
     ]
     if (s.notes?.trim()) lines.push(`- 备注：${s.notes.trim().slice(0, 120)}`)
     return lines.join('\n')
@@ -264,7 +219,7 @@ function round4(n: number): number {
 }
 
 export const name = 'society-soul'
-export const inject = ['societyIdentity', 'societyRooms']
+export const inject = ['societyIdentity']
 
 export function apply(ctx: Context) {
   ctx.plugin(SocietySoulService)
