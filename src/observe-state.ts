@@ -15,6 +15,7 @@ import {
   agentDataDir,
   agentWorkspaceDir,
 } from './paths.ts'
+import { listDmThreads } from './dm-threads.ts'
 
 const SECRET_KEY_RE = /(api[_-]?key|secret|password|token|authorization|bearer|agnes_api|glm_api)/i
 
@@ -635,6 +636,11 @@ export function readObserveState(opts?: {
     })
   }
 
+  // Ensured DM threads (human↔agent) from registry — show even with no messages yet
+  for (const t of listDmThreads()) {
+    dmPairKeys.add(t.pair)
+  }
+
   for (const pair of dmPairKeys) {
     const [a, b] = pair.split('|') as [string, string]
     const cid = dmChatId(a, b)
@@ -656,8 +662,6 @@ export function readObserveState(opts?: {
       messageCount: msgs.length,
     })
   }
-
-  // Also ensure human↔agent DMs appear even with no prior messages? skip until first say
 
   chats.sort((x, y) => {
     const tx = x.lastMessage?.createdAt || ''

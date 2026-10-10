@@ -29,17 +29,44 @@
     profileName: document.getElementById('profileName'),
     profileId: document.getElementById('profileId'),
     profileBody: document.getElementById('profileBody'),
+    profileActions: document.getElementById('profileActions'),
+    profileDmBtn: document.getElementById('profileDmBtn'),
     sidebar: document.getElementById('sidebar'),
     main: document.getElementById('main'),
     backBtn: document.getElementById('backBtn'),
+    menuBtn: document.getElementById('menuBtn'),
+    newChatBtn: document.getElementById('newChatBtn'),
+    newMenu: document.getElementById('newMenu'),
+    menuNewGroup: document.getElementById('menuNewGroup'),
+    menuNewDm: document.getElementById('menuNewDm'),
+    newGroupModal: document.getElementById('newGroupModal'),
+    newGroupBackdrop: document.getElementById('newGroupBackdrop'),
+    newGroupClose: document.getElementById('newGroupClose'),
+    newGroupCancel: document.getElementById('newGroupCancel'),
+    newGroupCreate: document.getElementById('newGroupCreate'),
+    newGroupName: document.getElementById('newGroupName'),
+    newGroupMembers: document.getElementById('newGroupMembers'),
+    newGroupStatus: document.getElementById('newGroupStatus'),
+    dmPickModal: document.getElementById('dmPickModal'),
+    dmPickBackdrop: document.getElementById('dmPickBackdrop'),
+    dmPickClose: document.getElementById('dmPickClose'),
+    dmPickList: document.getElementById('dmPickList'),
+    settingsDrawer: document.getElementById('settingsDrawer'),
+    settingsBackdrop: document.getElementById('settingsBackdrop'),
+    settingsClose: document.getElementById('settingsClose'),
+    settingsBody: document.getElementById('settingsBody'),
   };
 
   /** @type {any} */
   let state = null;
+  /** @type {any} */
+  let settingsCache = null;
   let selectedChatId = localStorage.getItem('society.selectedChat') || '';
   let searchQ = '';
   let sending = false;
   let stickBottom = true;
+  let profileAgentId = '';
+  let creating = false;
 
   function esc(s) {
     return String(s ?? '').replace(/[&<>"']/g, (c) =>
@@ -160,7 +187,6 @@
                 </div>
                 <div class="tg-chat-preview">${esc(previewText(c))}</div>
               </div>
-              <div>${c.messageCount ? '' : ''}</div>
             </button>`;
           })
           .join('');
@@ -286,7 +312,6 @@
     stickBottom = true;
     renderChatList();
     renderMessages();
-    // mobile: hide sidebar when chat open
     if (window.matchMedia('(max-width: 900px)').matches && selectedChatId) {
       el.sidebar.classList.add('collapsed');
       el.main.classList.add('with-chat');
@@ -296,10 +321,7 @@
   function profileTargetFromChat(chat) {
     if (!chat) return null;
     if (chat.kind === 'self') return chat.agentId;
-    if (chat.kind === 'group') {
-      // open first non-system member profile if only one interesting? Prefer none — show room info
-      return null;
-    }
+    if (chat.kind === 'group') return null;
     if (chat.kind === 'dm') {
       const peers = chat.peerIds || [];
       return peers.find((p) => p !== 'human') || peers[0] || null;
@@ -308,9 +330,9 @@
   }
 
   function openProfile(agentId) {
+    profileAgentId = '';
     const a = agentById(agentId);
     if (!a) {
-      // room / missing — show lightweight card from chat
       const chat = chatById(selectedChatId);
       if (!chat) return;
       el.profileAvatar.textContent = chat.initials;
@@ -324,11 +346,13 @@
           <div class="tg-profile-row"><span>成员</span><span>${esc((chat.members || chat.peerIds || []).join(', ') || '—')}</span></div>
           <div class="tg-profile-row"><span>消息</span><span>${esc(chat.messageCount)}</span></div>
         </div>`;
+      el.profileActions.classList.add('hidden');
       el.profileModal.classList.remove('hidden');
       el.profileModal.setAttribute('aria-hidden', 'false');
       return;
     }
 
+    profileAgentId = a.id;
     const pct = (v) => Math.round(Math.max(0, Math.min(1, Number(v) || 0)) * 100);
     const bar = (label, v) => {
       const p = pct(v);
@@ -372,6 +396,11 @@
         <div class="tg-profile-row"><span>灵魂</span><span>${esc(a.soulUpdatedAt || '—')}</span></div>
         <div class="tg-profile-row"><span>记忆</span><span>${esc(a.memoryUpdatedAt || '—')}</span></div>
       </div>`;
+    if (state?.canSay) {
+      el.profileActions.classList.remove('hidden');
+    } else {
+      el.profileActions.classList.add('hidden');
+    }
     el.profileModal.classList.remove('hidden');
     el.profileModal.setAttribute('aria-hidden', 'false');
   }
@@ -379,6 +408,7 @@
   function closeProfile() {
     el.profileModal.classList.add('hidden');
     el.profileModal.setAttribute('aria-hidden', 'true');
+    profileAgentId = '';
   }
 
   function openHeaderProfile() {
@@ -386,6 +416,202 @@
     if (!chat) return;
     const aid = profileTargetFromChat(chat);
     openProfile(aid);
+  }
+
+  function closeNewMenu() {
+    el.newMenu.classList.add('hidden');
+    el.newMenu.setAttribute('aria-hidden', 'true');
+  }
+
+  function openNewMenu() {
+    const btn = el.newChatBtn;
+    const rect = btn.getBoundingClientRect();
+    el.newMenu.style.top = Math.min(window.innerHeight - 120, rect.bottom + 6) + 'px';
+    el.newMenu.style.left = Math.min(window.innerWidth - 220, Math.max(8, rect.right - 200)) + 'px';
+    el.newMenu.classList.remove('hidden');
+    el.newMenu.setAttribute('aria-hidden', 'false');
+  }
+
+  function fillAgentChecks(container, { checkbox }) {
+    const agents = state?.agents || [];
+    if (!agents.length) {
+      container.innerHTML = `<div class="tg-muted" style="padding:10px">暂无 Agent</div>`;
+      return;
+    }
+    container.innerHTML = agents
+      .map((a) => {
+        if (checkbox) {
+          return `<label class="tg-check-item">
+            <input type="checkbox" value="${esc(a.id)}" />
+            <span class="tg-avatar sm" style="background:${esc(a.avatarColor)}">${esc(a.initials)}</span>
+            <span class="meta"><span class="title">${esc(a.displayName)}</span>
+            <span class="sub">@${esc(a.id)} · ${esc(a.llmProvider || '—')}</span></span>
+          </label>`;
+        }
+        return `<button type="button" class="tg-check-item" data-dm-agent="${esc(a.id)}">
+          <span class="tg-avatar sm" style="background:${esc(a.avatarColor)}">${esc(a.initials)}</span>
+          <span class="meta"><span class="title">${esc(a.displayName)}</span>
+          <span class="sub">@${esc(a.id)}</span></span>
+        </button>`;
+      })
+      .join('');
+  }
+
+  function openNewGroupModal() {
+    closeNewMenu();
+    el.newGroupName.value = '';
+    el.newGroupStatus.textContent = '';
+    fillAgentChecks(el.newGroupMembers, { checkbox: true });
+    el.newGroupModal.classList.remove('hidden');
+    el.newGroupModal.setAttribute('aria-hidden', 'false');
+    setTimeout(() => el.newGroupName.focus(), 50);
+  }
+
+  function closeNewGroupModal() {
+    el.newGroupModal.classList.add('hidden');
+    el.newGroupModal.setAttribute('aria-hidden', 'true');
+  }
+
+  function openDmPickModal() {
+    closeNewMenu();
+    fillAgentChecks(el.dmPickList, { checkbox: false });
+    el.dmPickList.querySelectorAll('[data-dm-agent]').forEach((btn) => {
+      btn.addEventListener('click', () => startDm(btn.getAttribute('data-dm-agent')));
+    });
+    el.dmPickModal.classList.remove('hidden');
+    el.dmPickModal.setAttribute('aria-hidden', 'false');
+  }
+
+  function closeDmPickModal() {
+    el.dmPickModal.classList.add('hidden');
+    el.dmPickModal.setAttribute('aria-hidden', 'true');
+  }
+
+  async function createGroup() {
+    if (!state?.canSay || creating) return;
+    const name = (el.newGroupName.value || '').trim();
+    const memberIds = [...el.newGroupMembers.querySelectorAll('input[type=checkbox]:checked')].map(
+      (n) => n.value,
+    );
+    if (!name) {
+      el.newGroupStatus.textContent = '请填写群名称';
+      return;
+    }
+    if (!memberIds.length) {
+      el.newGroupStatus.textContent = '请至少选择一名成员';
+      return;
+    }
+    creating = true;
+    el.newGroupCreate.disabled = true;
+    el.newGroupStatus.textContent = '创建中…';
+    try {
+      const res = await fetch('/api/rooms', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, memberIds }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        el.newGroupStatus.textContent = '失败：' + (data.error || res.status);
+        return;
+      }
+      closeNewGroupModal();
+      await tick();
+      if (data.chatId) selectChat(data.chatId);
+      el.sayStatus.textContent = `已创建群聊「${data.roomName || name}」`;
+    } catch (e) {
+      el.newGroupStatus.textContent = '失败：' + e;
+    } finally {
+      creating = false;
+      el.newGroupCreate.disabled = false;
+    }
+  }
+
+  async function startDm(agentId) {
+    if (!agentId) return;
+    if (!state?.canSay) {
+      el.sayStatus.textContent = '只读旁观无法发起私信（请用 society-live）';
+      return;
+    }
+    closeProfile();
+    closeDmPickModal();
+    closeNewMenu();
+    try {
+      const res = await fetch('/api/dm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agentId }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        el.sayStatus.textContent = '私信失败：' + (data.error || res.status);
+        return;
+      }
+      await tick();
+      if (data.chatId) selectChat(data.chatId);
+      el.sayStatus.textContent = data.created ? '已打开新私信' : '已打开已有私信';
+    } catch (e) {
+      el.sayStatus.textContent = '私信失败：' + e;
+    }
+  }
+
+  function renderSettings(s) {
+    const providers = (s.providers || [])
+      .map((p) => {
+        const dot = p.configured ? 'on' : 'off';
+        const right = p.configured
+          ? `${esc(p.model || 'configured')}`
+          : '未配置';
+        return `<div class="tg-settings-row"><span><span class="tg-dot ${dot}"></span>${esc(p.id)}</span><span>${right}</span></div>`;
+      })
+      .join('');
+    el.settingsBody.innerHTML = `
+      <div class="tg-settings-card">
+        <h3>运行上限</h3>
+        <div class="tg-settings-row"><span>并行回复</span><span>${esc(s.maxParallelReplies)}</span></div>
+        <div class="tg-settings-row"><span>最大 exchanges</span><span>${esc(s.maxExchanges)}</span></div>
+        <div class="tg-settings-row"><span>每日 LLM 预算</span><span>${esc(s.dailyLlmBudget)}</span></div>
+        <div class="tg-settings-row"><span>Agent 上限</span><span>${esc(s.maxAgents)}</span></div>
+        <div class="tg-settings-row"><span>心跳间隔</span><span>${esc(s.tickMs)} ms</span></div>
+      </div>
+      <div class="tg-settings-card">
+        <h3>免费通道（不含密钥）</h3>
+        ${providers || '<p class="tg-muted">无</p>'}
+      </div>
+      <div class="tg-settings-card">
+        <h3>安全</h3>
+        <div class="tg-settings-row"><span>远程插话</span><span>${s.allowRemoteSay ? '允许' : '仅本机'}</span></div>
+        <div class="tg-settings-row"><span>模式</span><span>${esc(s.mode || state?.mode || '—')}</span></div>
+      </div>
+      <div class="tg-settings-card">
+        <h3>.env</h3>
+        <p class="tg-settings-note">${esc(s.envNote || '')}</p>
+      </div>`;
+  }
+
+  async function openSettings() {
+    closeNewMenu();
+    el.settingsDrawer.classList.remove('hidden');
+    el.settingsDrawer.setAttribute('aria-hidden', 'false');
+    el.settingsBody.innerHTML = `<p class="tg-muted">加载中…</p>`;
+    try {
+      const res = await fetch('/api/settings', { cache: 'no-store' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.status);
+      settingsCache = data;
+      // Never display raw key fields if somehow present
+      if (data.apiKey || data.AGNES_API_KEY || data.GLM_API_KEY) {
+        throw new Error('settings response contained secrets (blocked in UI)');
+      }
+      renderSettings(data);
+    } catch (e) {
+      el.settingsBody.innerHTML = `<p class="tg-muted">加载失败：${esc(e)}</p>`;
+    }
+  }
+
+  function closeSettings() {
+    el.settingsDrawer.classList.add('hidden');
+    el.settingsDrawer.setAttribute('aria-hidden', 'true');
   }
 
   async function sendSay() {
@@ -455,7 +681,6 @@
         selectedChatId = data.chats?.[0]?.id || '';
       }
       if (!selectedChatId && data.chats?.length) {
-        // prefer plaza group
         const plaza = data.chats.find((c) => c.kind === 'group' && /plaza/i.test(c.title));
         selectedChatId = plaza?.id || data.chats[0].id;
         localStorage.setItem('society.selectedChat', selectedChatId);
@@ -495,8 +720,43 @@
   });
   el.profileClose.addEventListener('click', closeProfile);
   el.profileBackdrop.addEventListener('click', closeProfile);
+  el.profileDmBtn.addEventListener('click', () => {
+    if (profileAgentId) startDm(profileAgentId);
+  });
+
+  el.menuBtn.addEventListener('click', openSettings);
+  el.settingsClose.addEventListener('click', closeSettings);
+  el.settingsBackdrop.addEventListener('click', closeSettings);
+
+  el.newChatBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (el.newMenu.classList.contains('hidden')) openNewMenu();
+    else closeNewMenu();
+  });
+  el.menuNewGroup.addEventListener('click', openNewGroupModal);
+  el.menuNewDm.addEventListener('click', openDmPickModal);
+  document.addEventListener('click', (e) => {
+    if (!el.newMenu.classList.contains('hidden')) {
+      if (!el.newMenu.contains(e.target) && e.target !== el.newChatBtn) closeNewMenu();
+    }
+  });
+
+  el.newGroupClose.addEventListener('click', closeNewGroupModal);
+  el.newGroupCancel.addEventListener('click', closeNewGroupModal);
+  el.newGroupBackdrop.addEventListener('click', closeNewGroupModal);
+  el.newGroupCreate.addEventListener('click', createGroup);
+
+  el.dmPickClose.addEventListener('click', closeDmPickModal);
+  el.dmPickBackdrop.addEventListener('click', closeDmPickModal);
+
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeProfile();
+    if (e.key === 'Escape') {
+      closeProfile();
+      closeNewGroupModal();
+      closeDmPickModal();
+      closeNewMenu();
+      closeSettings();
+    }
   });
   el.backBtn.addEventListener('click', () => {
     el.sidebar.classList.remove('collapsed');

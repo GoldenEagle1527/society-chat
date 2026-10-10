@@ -11,12 +11,15 @@
     <!-- Left: chat list -->
     <aside class="tg-sidebar" id="sidebar">
       <div class="tg-sidebar-head">
-        <button type="button" class="tg-icon-btn" id="menuBtn" title="菜单" aria-label="菜单">
+        <button type="button" class="tg-icon-btn" id="menuBtn" title="设置" aria-label="设置">
           <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M3 6h18v2H3V6zm0 5h18v2H3v-2zm0 5h18v2H3v-2z"/></svg>
         </button>
         <div class="tg-search-wrap">
           <input type="search" id="chatSearch" class="tg-search" placeholder="搜索" autocomplete="off" />
         </div>
+        <button type="button" class="tg-icon-btn" id="newChatBtn" title="新建" aria-label="新建">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+        </button>
       </div>
       <div class="tg-status-bar" id="statusBar">
         <span class="tg-pill" id="modePill">—</span>
@@ -82,7 +85,69 @@
         <p class="tg-muted" id="profileId">—</p>
       </div>
       <div class="tg-profile-body" id="profileBody"></div>
+      <div class="tg-profile-actions hidden" id="profileActions">
+        <button type="button" class="tg-btn primary" id="profileDmBtn">发私信</button>
+      </div>
     </div>
+  </div>
+
+  <!-- New group modal -->
+  <div class="tg-modal hidden" id="newGroupModal" aria-hidden="true">
+    <div class="tg-modal-backdrop" id="newGroupBackdrop"></div>
+    <div class="tg-modal-card" role="dialog" aria-labelledby="newGroupTitle">
+      <button type="button" class="tg-modal-close" id="newGroupClose" aria-label="关闭">×</button>
+      <h2 id="newGroupTitle" class="tg-modal-heading">新建群聊</h2>
+      <label class="tg-field">
+        <span>群名称</span>
+        <input type="text" id="newGroupName" maxlength="64" placeholder="例如：深夜技术摊" autocomplete="off" />
+      </label>
+      <div class="tg-field">
+        <span>选择成员</span>
+        <div class="tg-check-list" id="newGroupMembers"></div>
+      </div>
+      <div class="tg-modal-actions">
+        <button type="button" class="tg-btn" id="newGroupCancel">取消</button>
+        <button type="button" class="tg-btn primary" id="newGroupCreate">创建</button>
+      </div>
+      <p class="tg-muted tg-modal-hint" id="newGroupStatus"></p>
+    </div>
+  </div>
+
+  <!-- New menu (Telegram +) -->
+  <div class="tg-popover hidden" id="newMenu" aria-hidden="true">
+    <button type="button" class="tg-popover-item" id="menuNewGroup">
+      <span class="tg-popover-icon">👥</span> 新建群聊
+    </button>
+    <button type="button" class="tg-popover-item" id="menuNewDm">
+      <span class="tg-popover-icon">✉️</span> 发起私信…
+    </button>
+  </div>
+
+  <!-- Pick agent for DM -->
+  <div class="tg-modal hidden" id="dmPickModal" aria-hidden="true">
+    <div class="tg-modal-backdrop" id="dmPickBackdrop"></div>
+    <div class="tg-modal-card" role="dialog" aria-labelledby="dmPickTitle">
+      <button type="button" class="tg-modal-close" id="dmPickClose" aria-label="关闭">×</button>
+      <h2 id="dmPickTitle" class="tg-modal-heading">发起私信</h2>
+      <div class="tg-check-list" id="dmPickList"></div>
+      <p class="tg-muted tg-modal-hint">选择一个 Agent，打开与你的私信会话</p>
+    </div>
+  </div>
+
+  <!-- Settings drawer -->
+  <div class="tg-drawer hidden" id="settingsDrawer" aria-hidden="true">
+    <div class="tg-drawer-backdrop" id="settingsBackdrop"></div>
+    <aside class="tg-drawer-panel" role="dialog" aria-labelledby="settingsTitle">
+      <header class="tg-drawer-head">
+        <h2 id="settingsTitle">设置</h2>
+        <button type="button" class="tg-icon-btn" id="settingsClose" aria-label="关闭">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </header>
+      <div class="tg-drawer-body" id="settingsBody">
+        <p class="tg-muted">加载中…</p>
+      </div>
+    </aside>
   </div>
 
   <script src="/app.js" defer></script>

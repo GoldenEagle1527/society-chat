@@ -2,7 +2,7 @@
  * Shared observe / society-live HTTP server (Node http only).
  * - Serves Telegram-style UI from public/
  * - observe mode: read-only
- * - live mode: POST /api/say (room / DM / self-note) + composer
+ * - live mode: POST /api/say | /api/rooms | /api/dm + composer
  * Never serves .env or API keys.
  */
 import fs from 'node:fs'
@@ -11,6 +11,7 @@ import path from 'node:path'
 import type { RoomMessage } from './types.ts'
 import { HUMAN_SPEAKER_ID, speakerLabel } from './types.ts'
 import { isForbiddenObservePath, readObserveState } from './observe-state.ts'
+import { readObserveSettings, type ObserveSettings } from './observe-settings.ts'
 import { PROJECT_ROOT } from './paths.ts'
 
 export type ObserveMode = 'observe' | 'live'
@@ -35,14 +36,45 @@ export interface SayResult {
   kind?: 'room' | 'dm' | 'self'
 }
 
+export interface CreateRoomApiRequest {
+  name: string
+  memberIds: string[]
+}
+
+export interface CreateRoomApiResult {
+  ok: true
+  roomId: string
+  roomName: string
+  chatId: string
+  members: string[]
+}
+
+export interface CreateDmApiRequest {
+  agentId: string
+}
+
+export interface CreateDmApiResult {
+  ok: true
+  chatId: string
+  agentId: string
+  created: boolean
+  peers: string[]
+}
+
 export interface ObserveServerOptions {
   mode: ObserveMode
   host?: string
   port?: number
   /** Live only: post human message into society. */
   onSay?: (req: SayRequest) => SayResult | Promise<SayResult>
+  /** Live only: create group room. */
+  onCreateRoom?: (req: CreateRoomApiRequest) => CreateRoomApiResult | Promise<CreateRoomApiResult>
+  /** Live only: ensure human↔agent DM surface. */
+  onCreateDm?: (req: CreateDmApiRequest) => CreateDmApiResult | Promise<CreateDmApiResult>
   /** Optional live status line for /api/state note override. */
   liveNote?: () => string
+  /** Optional settings override (defaults to env-derived caps, no keys). */
+  getSettings?: () => ObserveSettings
 }
 
 export interface ObserveServer {
@@ -85,8 +117,8 @@ function isLocalhost(req: http.IncomingMessage): boolean {
   )
 }
 
-/** When SOCIETY_OBSERVE_ALLOW_REMOTE_SAY=1 (Docker published ports), allow /api/say from non-loopback. */
-function allowSay(req: http.IncomingMessage): boolean {
+/** When SOCIETY_OBSERVE_ALLOW_REMOTE_SAY=1 (Docker published ports), allow mutating APIs from non-loopback. */
+function allowMutatingApi(req: http.IncomingMessage): boolean {
   const flag = (process.env.SOCIETY_OBSERVE_ALLOW_REMOTE_SAY || '').trim()
   if (flag === '1' || /^true$/i.test(flag) || /^yes$/i.test(flag)) return true
   return isLocalhost(req)
@@ -173,12 +205,24 @@ export function createObserveServer(opts: ObserveServerOptions): ObserveServer {
       return
     }
 
+    if (req.method === 'GET' && pathname === '/api/settings') {
+      try {
+        const settings = opts.getSettings ? opts.getSettings() : readObserveSettings()
+        sendJson(res, 200, { ok: true, mode: opts.mode, ...settings })
+      } catch (err) {
+        sendJson(res, 500, {
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+      return
+    }
+
     if (req.method === 'POST' && pathname === '/api/say') {
       if (opts.mode !== 'live' || !opts.onSay) {
         sendJson(res, 404, { error: 'say only available in society-live' })
         return
       }
-      if (!allowSay(req)) {
+      if (!allowMutatingApi(req)) {
         sendJson(res, 403, {
           error: 'localhost only (set SOCIETY_OBSERVE_ALLOW_REMOTE_SAY=1 in Docker)',
         })
@@ -226,6 +270,91 @@ export function createObserveServer(opts: ObserveServerOptions): ObserveServer {
             createdAt: result.message.createdAt,
           },
         })
+      } catch (err) {
+        sendJson(res, 400, {
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+      return
+    }
+
+    if (req.method === 'POST' && pathname === '/api/rooms') {
+      if (opts.mode !== 'live' || !opts.onCreateRoom) {
+        sendJson(res, 404, { error: 'create room only available in society-live' })
+        return
+      }
+      if (!allowMutatingApi(req)) {
+        sendJson(res, 403, {
+          error: 'localhost only (set SOCIETY_OBSERVE_ALLOW_REMOTE_SAY=1 in Docker)',
+        })
+        return
+      }
+      try {
+        const raw = await readBody(req)
+        let parsed: CreateRoomApiRequest
+        try {
+          parsed = JSON.parse(raw || '{}') as CreateRoomApiRequest
+        } catch {
+          sendJson(res, 400, { error: 'invalid JSON' })
+          return
+        }
+        const name = String(parsed.name || '').trim()
+        if (!name) {
+          sendJson(res, 400, { error: 'name required' })
+          return
+        }
+        if (name.length > 64) {
+          sendJson(res, 400, { error: 'name too long (max 64)' })
+          return
+        }
+        const memberIds = Array.isArray(parsed.memberIds)
+          ? [...new Set(parsed.memberIds.map((x) => String(x || '').trim()).filter(Boolean))]
+          : []
+        if (!memberIds.length) {
+          sendJson(res, 400, { error: 'memberIds required (at least one agent)' })
+          return
+        }
+        if (memberIds.length > 32) {
+          sendJson(res, 400, { error: 'too many members (max 32)' })
+          return
+        }
+        const result = await opts.onCreateRoom({ name, memberIds })
+        sendJson(res, 200, result)
+      } catch (err) {
+        sendJson(res, 400, {
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+      return
+    }
+
+    if (req.method === 'POST' && pathname === '/api/dm') {
+      if (opts.mode !== 'live' || !opts.onCreateDm) {
+        sendJson(res, 404, { error: 'create dm only available in society-live' })
+        return
+      }
+      if (!allowMutatingApi(req)) {
+        sendJson(res, 403, {
+          error: 'localhost only (set SOCIETY_OBSERVE_ALLOW_REMOTE_SAY=1 in Docker)',
+        })
+        return
+      }
+      try {
+        const raw = await readBody(req)
+        let parsed: CreateDmApiRequest
+        try {
+          parsed = JSON.parse(raw || '{}') as CreateDmApiRequest
+        } catch {
+          sendJson(res, 400, { error: 'invalid JSON' })
+          return
+        }
+        const agentId = String(parsed.agentId || '').trim()
+        if (!agentId) {
+          sendJson(res, 400, { error: 'agentId required' })
+          return
+        }
+        const result = await opts.onCreateDm({ agentId })
+        sendJson(res, 200, result)
       } catch (err) {
         sendJson(res, 400, {
           error: err instanceof Error ? err.message : String(err),

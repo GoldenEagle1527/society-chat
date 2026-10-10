@@ -20,3 +20,6 @@ export function agentWorkspaceDir(agentId: string): string {
 export const SOCIETY_STATE_ROOT = path.join(DATA_ROOT, 'society')
 export const ROOMS_STATE_FILE = path.join(SOCIETY_STATE_ROOT, 'rooms.json')
 export const MESSAGES_STATE_FILE = path.join(SOCIETY_STATE_ROOT, 'messages.jsonl')
+
+/** Ensured human↔agent DM threads (appear in sidebar before first message). */
+export const DM_THREADS_STATE_FILE = path.join(SOCIETY_STATE_ROOT, 'dm-threads.json')

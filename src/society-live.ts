@@ -15,6 +15,8 @@ import {
   listenObserveServer,
   type SayRequest,
 } from './observe-server.ts'
+import { readObserveSettings } from './observe-settings.ts'
+import { ensureHumanDm } from './dm-threads.ts'
 import { HUMAN_SPEAKER_ID } from './types.ts'
 import type { RoomMessage } from './types.ts'
 
@@ -176,6 +178,7 @@ async function main(): Promise<void> {
           body: req.text,
           createdAt: new Date().toISOString(),
         }
+        ensureHumanDm(agentPeer)
         console.log(`[you] → DM ${agentPeer}: ${req.text}`)
         return {
           ok: true as const,
@@ -241,6 +244,7 @@ async function main(): Promise<void> {
         body: req.text,
         createdAt: new Date().toISOString(),
       }
+      ensureHumanDm(agentId)
       console.log(`[you] → DM ${agentId}: ${req.text}`)
       return {
         ok: true as const,
@@ -276,15 +280,53 @@ async function main(): Promise<void> {
     }
   }
 
+  const onCreateRoom = async (req: { name: string; memberIds: string[] }) => {
+    const members = [...new Set(req.memberIds.map((x) => String(x).trim()).filter(Boolean))]
+    for (const id of members) ctx.societyIdentity.require(id)
+    const room = ctx.societyRooms.create({
+      name: req.name.trim(),
+      createdBy: 'system',
+      members,
+    })
+    console.log(`[room+] ${room.name} (${room.id.slice(0, 8)}…) members=${room.members.join(',')}`)
+    return {
+      ok: true as const,
+      roomId: room.id,
+      roomName: room.name,
+      chatId: `room:${room.id}`,
+      members: [...room.members],
+    }
+  }
+
+  const onCreateDm = async (req: { agentId: string }) => {
+    const agentId = String(req.agentId || '').trim()
+    ctx.societyIdentity.require(agentId)
+    const ensured = ensureHumanDm(agentId)
+    console.log(
+      `[dm+] human↔${agentId} chatId=${ensured.chatId}` +
+        (ensured.created ? ' (new)' : ' (existing)'),
+    )
+    return {
+      ok: true as const,
+      chatId: ensured.chatId,
+      agentId,
+      created: ensured.created,
+      peers: [...ensured.peers],
+    }
+  }
+
   const srv = createObserveServer({
     mode: 'live',
     onSay,
+    onCreateRoom,
+    onCreateDm,
+    getSettings: () => readObserveSettings(),
     liveNote: () =>
       `直播中 · tick=${ticksDone} exchanges=${ctx.societyScheduler.exchangeCountOf()}/${maxExchanges} · 选中会话后发言 · 不暴露密钥`,
   })
   await listenObserveServer(srv)
   console.log(`[live] http://${srv.host}:${srv.port}/`)
-  console.log(`[live] POST /api/say (room|dm|self) · caps maxExchanges=${maxExchanges} tickMs=${tickMs}`)
+  console.log(`[live] POST /api/say|/api/rooms|/api/dm · caps maxExchanges=${maxExchanges} tickMs=${tickMs}`)
   console.log('  stop: Ctrl+C / SIGTERM')
 
   ctx.on('society/agent-replied', (p) => {
