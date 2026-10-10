@@ -19,6 +19,7 @@
  * - room replies auto-set replyTo to the stimulus room message id
  * - agents may ACTION:SILENT; replies may be multi-bubble (|||)
  * - idle self-loop: mix diary with ROOM/DM; news personas often web_search then share
+ * - idle DIARY/SELF: private-only prompts + remap/split outbound chat voice to ROOM
  * - idle tools: occasionally actAsAgent; search idle path has per-agent cooldown
  */
 import { Context, Service } from '@deepseek-ai/cordis'
@@ -403,6 +404,142 @@ export function parseIdleAction(
     return { body, act: 'dm', to }
   }
   return { body, act: 'none' }
+}
+
+
+/** Known cast display names / ids for outbound-chat heuristics. */
+const CAST_NAME_RE = /老码|阿宁|时辰|文心|agnes|glm|xingchen[_a-z0-9]*/i
+
+/**
+ * True if a single line looks like outbound plaza/DM speech
+ * (addressing others, @mentions, group questions) rather than private notes.
+ */
+export function looksLikeOutboundChatLine(line: string): boolean {
+  const t = String(line || '').trim()
+  if (!t) return false
+  if (/@[\w\u4e00-\u9fff]+/.test(t)) return true
+  if (/(在吗|大家好|有没有人|想问问大家|群里|有人吗|谁在|请问大家|各位好)/.test(t)) return true
+  if (/想问问|大家一般|有没有人会|求问|初入职场群/.test(t)) return true
+  // "老码在吗？" / "文心你好" / naming someone then asking
+  if (CAST_NAME_RE.test(t) && /(在吗|你好|请问|帮忙|一起|怎么看|觉得呢|对吗|来一下|看一下)/.test(t)) {
+    return true
+  }
+  // second-person questions aimed at a named agent: 「老码，…？」
+  if (CAST_NAME_RE.test(t) && /[，,]\s*.*[？?]/.test(t) && /(你|您)/.test(t)) return true
+  return false
+}
+
+export type IdlePrivateBodyClass = {
+  kind: 'private' | 'chatty' | 'mixed'
+  privateBody: string
+  chatBody: string
+}
+
+/**
+ * Split diary/self body into private reflection vs outbound chat voice.
+ * Line-oriented (also splits on ||| bubbles). Empty → private.
+ */
+export function classifyIdlePrivateBody(body: string): IdlePrivateBodyClass {
+  const raw = String(body || '').trim()
+  if (!raw) return { kind: 'private', privateBody: '', chatBody: '' }
+
+  const chunks = raw
+    .split(/\r?\n|\|\|\|/g)
+    .map((s) => s.trim())
+    .filter(Boolean)
+  if (!chunks.length) return { kind: 'private', privateBody: '', chatBody: '' }
+
+  const privateParts: string[] = []
+  const chatParts: string[] = []
+  for (const c of chunks) {
+    if (looksLikeOutboundChatLine(c)) chatParts.push(c)
+    else privateParts.push(c)
+  }
+
+  // Whole-body fallback: single paragraph with chat markers mid-text
+  if (!chatParts.length && chunks.length === 1 && looksLikeOutboundChatLine(raw)) {
+    return { kind: 'chatty', privateBody: '', chatBody: raw }
+  }
+  // If no newlines but clearly chatty substring after a private sentence
+  if (!chatParts.length && /[。！？\n]/.test(raw) && /(在吗|想问问大家|大家好|有没有人|@)/.test(raw)) {
+    const parts = raw.split(/(?<=[。！？])/).map((s) => s.trim()).filter(Boolean)
+    if (parts.length >= 2) {
+      privateParts.length = 0
+      for (const p of parts) {
+        if (looksLikeOutboundChatLine(p)) chatParts.push(p)
+        else privateParts.push(p)
+      }
+    }
+  }
+
+  const privateBody = privateParts.join('\n').trim()
+  const chatBody = chatParts.join('\n').trim()
+  if (chatBody && privateBody) return { kind: 'mixed', privateBody, chatBody }
+  if (chatBody) return { kind: 'chatty', privateBody: '', chatBody }
+  return { kind: 'private', privateBody: privateBody || raw, chatBody: '' }
+}
+
+/**
+ * After parseIdleAction: if DIARY/SELF body is outbound chat, remap to ROOM
+ * (or split mixed → private diary + room chat). Caller must have a room for ROOM.
+ */
+export function resolveDiaryChatMix(
+  parsed: IdleActionParse,
+  opts?: { hasRoom?: boolean },
+): {
+  act: IdleActionParse['act']
+  diaryBody?: string
+  roomBody?: string
+  body: string
+  to?: string
+  remapped: boolean
+} {
+  if (parsed.act !== 'diary' && parsed.act !== 'self') {
+    return {
+      act: parsed.act,
+      body: parsed.body,
+      to: parsed.to,
+      remapped: false,
+    }
+  }
+  const classified = classifyIdlePrivateBody(parsed.body)
+  const hasRoom = opts?.hasRoom !== false
+
+  if (classified.kind === 'chatty' && hasRoom) {
+    return {
+      act: 'room',
+      body: classified.chatBody,
+      roomBody: classified.chatBody,
+      remapped: true,
+    }
+  }
+  if (classified.kind === 'mixed' && hasRoom) {
+    return {
+      act: 'room',
+      body: classified.chatBody,
+      diaryBody: classified.privateBody,
+      roomBody: classified.chatBody,
+      remapped: true,
+    }
+  }
+  if (classified.kind === 'chatty' && !hasRoom) {
+    // No plaza — drop chatty voice, keep nothing rather than pollute diary
+    return { act: 'none', body: '', remapped: true }
+  }
+  if (classified.kind === 'mixed' && !hasRoom) {
+    return {
+      act: parsed.act,
+      body: classified.privateBody,
+      diaryBody: classified.privateBody,
+      remapped: true,
+    }
+  }
+  return {
+    act: parsed.act,
+    body: classified.privateBody || parsed.body,
+    diaryBody: classified.privateBody || parsed.body,
+    remapped: false,
+  }
 }
 
 export class SocietySchedulerService extends Service {
@@ -1027,10 +1164,12 @@ export class SocietySchedulerService extends Service {
       const actionMenu = [
         `1) ACTION:ROOM — 去群聊${roomLabel}说一句（鼓励；有感就发，别闷着）`,
         `2) ACTION:DM:<agentId> — 主动私信（对象：${others.join(' / ') || '无'}）`,
-        '3) ACTION:DIARY — 写一句日记/随感（个人空间）',
-        '4) ACTION:SELF — 一句内心独白/随想笔记（个人空间）',
+        '3) ACTION:DIARY — 私人日记/随感（第一人称写给自己；禁止点名他人、禁止 @、禁止「xxx在吗」、禁止「大家」、禁止群聊式提问；想说话用 ROOM/DM）',
+        '4) ACTION:SELF — 内心独白/随想笔记（同样必须是私密笔记，不要写成对别人喊话）',
         '5) ACTION:NONE — 真的什么都不想做时才选（请少用）',
       ]
+      const diaryVsChatRule =
+        'DIARY/SELF 正文只能是写给自己的心里话；若想喊人、提问群友、说「xxx在吗」或「想问问大家」，必须改选 ACTION:ROOM 或 ACTION:DM，不要写进日记。'
 
       let stimulus: string
       if (steerSearch) {
@@ -1040,6 +1179,7 @@ export class SocietySchedulerService extends Service {
           '看完结果后写 1～3 句短评（可引用一条要点），然后选一个收束动作：',
           ...actionMenu.slice(0, 4),
           '优先 ACTION:ROOM 去广场分享短评；若此刻更想沉淀就 ACTION:DIARY。',
+          diaryVsChatRule,
           recent ? `广场近况：\n${recent}` : '广场尚安静——正好适合你带一条新热点过去。',
           '先用工具，再写正文，最后一行必须是上列 ACTION 之一（只选一个）。不要 SILENT，不要空搜不写，不要抄整份菜单。',
         ].join('\n')
@@ -1053,6 +1193,7 @@ export class SocietySchedulerService extends Service {
           '然后用正文 + ACTION 收束：',
           ...actionMenu,
           recent ? `广场近况：\n${recent}` : '广场尚安静——你可以去打招呼，或先记一笔。',
+          diaryVsChatRule,
           `社交与日记要混合：大约 ${Math.round(bias.socialPrefer * 100)}% 时候选 ROOM/DM，其余 DIARY/SELF。`,
           '先写正文（若用了工具就根据结果写），最后一行必须是上列 ACTION 之一。只选一个，禁止列出多个 ACTION 菜单。',
         ].join('\n')
@@ -1062,6 +1203,7 @@ export class SocietySchedulerService extends Service {
           '请只做一件小事（1～3 句），社交与日记要混合，别只会闷头写日记：',
           ...actionMenu,
           recent ? `广场近况：\n${recent}` : '广场尚安静——你可以主动去说一句，或先写日记。',
+          diaryVsChatRule,
           `先写正文，最后一行必须是上列 ACTION 之一（只选一个，禁止把 1)2)3) 整份菜单抄回来）。大约 ${Math.round(bias.socialPrefer * 100)}% 时候请选 ROOM 或 DM。`,
         ].join('\n')
       }
@@ -1105,8 +1247,31 @@ export class SocietySchedulerService extends Service {
       if (parsed.act === 'none' && !parsed.body.trim() && Math.random() < 0.55) {
         parsed = { body: '（静静待了一会儿，整理了一下思绪。）', act: 'self' }
       }
+
+      // Diary/SELF must stay private — remap or split outbound chat voice into ROOM
+      let splitDiaryBody: string | undefined
+      if (parsed.act === 'diary' || parsed.act === 'self') {
+        const resolved = resolveDiaryChatMix(parsed, { hasRoom: !!room })
+        if (resolved.remapped) {
+          this.ctx.logger('society-scheduler').warn(
+            `idle diary/chat mix ${agentId}: ${parsed.act} → ${resolved.act}` +
+              (resolved.diaryBody ? ' (kept private + room)' : ' (chatty→room)'),
+          )
+          if (resolved.diaryBody) splitDiaryBody = resolved.diaryBody
+          parsed = {
+            body: resolved.body,
+            act: resolved.act,
+            to: resolved.to,
+          }
+        } else if (resolved.diaryBody != null) {
+          parsed = { ...parsed, body: resolved.diaryBody }
+        }
+      }
+
       // Soft social nudge: diary-heavy agents sometimes flip to ROOM when plaza exists
+      // (skip if we already split a private diary piece — that private part must be written)
       if (
+        !splitDiaryBody &&
         (parsed.act === 'diary' || parsed.act === 'self') &&
         room &&
         parsed.body.trim() &&
@@ -1116,6 +1281,49 @@ export class SocietySchedulerService extends Service {
       }
 
       this.lastActAt.set(agentId, Date.now())
+
+      // Mixed idle: write private sentences to diary, then continue with ROOM body
+      if (splitDiaryBody && room && parsed.act === 'room') {
+        const now = new Date()
+        const day = localDayStamp(now)
+        const clock = localClock(now)
+        const rel = `diary/${day}.md`
+        const title = `日记 ${day}`
+        let cleanedPrivate = stripActionMarkup(splitDiaryBody)
+        if (!cleanedPrivate.trim() || looksLikeInstructionMenu(cleanedPrivate)) {
+          splitDiaryBody = undefined
+        } else {
+          let content = ''
+          try {
+            content = this.ctx.societyTools.readFile(agentId, rel)
+          } catch {
+            content = `# ${title}\n\n`
+          }
+          if (!content.trim()) content = `# ${title}\n\n`
+          if (!content.includes(`# ${title}`)) {
+            content = `# ${title}\n\n${content}`
+          }
+          const entry = `## ${clock}\n\n${cleanedPrivate}\n`
+          content = content.replace(/\s*$/, '\n') + entry + '\n'
+          this.ctx.societyTools.writeFile(agentId, rel, content)
+          try {
+            this.ctx.societyMemory.rememberInteraction(agentId, {
+              from: agentId,
+              body: cleanedPrivate,
+              kind: 'diary',
+              role: 'speaker',
+            })
+          } catch {
+            /* ignore */
+          }
+          this.ctx.emit('society/agent-replied', {
+            agentId,
+            kind: 'diary',
+            body: cleanedPrivate,
+            stimulusId: `idle-${this.tickCount}`,
+          })
+        }
+      }
 
       if (parsed.act === 'none') {
         this.ctx.emit('society/agent-replied', {
