@@ -121,3 +121,35 @@ export function societyEnvInt(name: string, defaultValue: number): number {
   if (raw && /^\d+$/.test(raw)) return Math.max(0, parseInt(raw, 10))
   return defaultValue
 }
+
+/** Providers that currently have an API key configured (order: agnes, glm). */
+export function configuredFreeProviders(): LlmProviderId[] {
+  loadDotEnv()
+  const out: LlmProviderId[] = []
+  if (process.env.AGNES_API_KEY?.trim()) out.push('agnes')
+  if (process.env.GLM_API_KEY?.trim()) out.push('glm')
+  return out
+}
+
+/** Default free model id for a provider (env override still free-guarded at require*). */
+export function defaultFreeModelFor(provider: LlmProviderId): string {
+  loadDotEnv()
+  if (provider === 'glm') {
+    const m = (process.env.GLM_MODEL?.trim() || 'glm-4-flash').trim()
+    assertGlmFreeModel(m)
+    return m
+  }
+  const m = (process.env.AGNES_MODEL?.trim() || 'agnes-3.0-flash').trim()
+  assertAgnesFreeModel(m)
+  return m
+}
+
+/** Working-memory soft cap before LLM consolidate (default 20). */
+export function societyWorkingMax(defaultValue = 20): number {
+  return societyEnvInt('SOCIETY_WORKING_MAX', defaultValue) || defaultValue
+}
+
+/** Min ms between LLM consolidates per agent (default 5 minutes). */
+export function societyConsolidateCooldownMs(defaultValue = 300_000): number {
+  return societyEnvInt('SOCIETY_CONSOLIDATE_COOLDOWN_MS', defaultValue)
+}

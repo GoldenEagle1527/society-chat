@@ -12,6 +12,7 @@ data/agents/*/memory/
 data/agents/*/memory.json
 data/agents/*/soul.json
 data/agents/*/soul-log.jsonl
+data/agents/*/memory-log.jsonl
 data/agents/*/profile.json
 data/agents/*/workspace/**
 !data/agents/*/workspace/.gitkeep
@@ -21,3 +22,6 @@ data/society/
 
 # Spawned agents beyond seeds — ignore whole carol (and similar) runtime trees if present
 data/agents/carol/
+
+data/agents/dana/
+data/agents/erin/

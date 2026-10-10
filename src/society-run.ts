@@ -59,17 +59,22 @@ async function main() {
 
   const alice = ctx.societyIdentity.require('alice')
   const bob = ctx.societyIdentity.require('bob')
-  console.log(`✓ agents: ${alice.displayName}, ${bob.displayName}`)
+  const allAgents = ctx.societyIdentity.list()
+  const agentIds = allAgents.map((a) => a.id)
+  console.log(`✓ agents: ${allAgents.map((a) => a.displayName).join(', ')}`)
 
-  const soul0 = {
+  const soul0: Record<string, ReturnType<typeof soulSnap>> = {
     alice: soulSnap(ctx.societySoul.load('alice')),
     bob: soulSnap(ctx.societySoul.load('bob')),
+  }
+  for (const a of allAgents) {
+    if (!(a.id in soul0)) soul0[a.id] = soulSnap(ctx.societySoul.load(a.id))
   }
 
   // Event-driven OFF — ticks own the drain (cleaner caps). Smokes still use enableAutoReply.
   ctx.societyScheduler.configure({
     maxExchanges,
-    onlyAgents: ['alice', 'bob'],
+    onlyAgents: agentIds,
     cooldownMs,
     agentCooldownMs,
     idleStaleMs,
@@ -81,14 +86,24 @@ async function main() {
     room = ctx.societyRooms.create({
       name: 'plaza',
       createdBy: 'alice',
-      members: ['alice', 'bob'],
+      members: agentIds,
     })
   } else {
-    ctx.societyRooms.join(room.id, 'alice')
-    ctx.societyRooms.join(room.id, 'bob')
+    for (const id of agentIds) {
+      ctx.societyRooms.join(room.id, id)
+    }
   }
   ctx.societyScheduler.setDefaultRoom(room.id)
-  console.log(`✓ room: ${room.name} (${room.id.slice(0, 8)}…)`)
+  console.log(`✓ room: ${room.name} (${room.id.slice(0, 8)}…) members=${room.members.join(',')}`)
+
+  ctx.on('society/agent-born', (profile) => {
+    try {
+      ctx.societyRooms.join(room!.id, profile.id)
+      ctx.societyScheduler.allowAgent(profile.id)
+    } catch {
+      /* ignore */
+    }
+  })
 
   const history = ctx.societyRooms.historyOf(room.id)
   if (history.length === 0) {

@@ -408,12 +408,14 @@ export class SocietyToolsService extends Service {
       // Seed durable soul + memory files
       this.ctx.societySoul.load(profile.id)
       this.ctx.societyMemory.load(profile.id)
+      const llm = this.ctx.societyIdentity.getLlmPreference(profile.id)
       return JSON.stringify({
         id: profile.id,
         displayName: profile.displayName,
         persona: profile.persona,
         workspacePath: profile.workspacePath,
         bornBy: agentId,
+        llm,
         soul: {
           openness: profile.soul.openness,
           trust: profile.soul.trust,

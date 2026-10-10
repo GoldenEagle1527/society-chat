@@ -71,14 +71,20 @@ async function main(): Promise<void> {
   const human = ctx.societyIdentity.registerHuman()
   const alice = ctx.societyIdentity.require('alice')
   const bob = ctx.societyIdentity.require('bob')
-  console.log(`✓ speakers: ${human.displayName}(${human.id}), ${alice.displayName}, ${bob.displayName}`)
+  const allAgents = ctx.societyIdentity.list()
   console.log(
-    `✓ LLM routes: alice ${ctx.societyLlm.describeAgentRoute('alice')} | bob ${ctx.societyLlm.describeAgentRoute('bob')}`,
+    `✓ speakers: ${human.displayName}(${human.id}), ` +
+      allAgents.map((a) => a.displayName).join(', '),
+  )
+  console.log(
+    '✓ LLM routes: ' +
+      allAgents.map((a) => `${a.id} ${ctx.societyLlm.describeAgentRoute(a.id)}`).join(' | '),
   )
 
+  const agentIds = allAgents.map((a) => a.id)
   ctx.societyScheduler.configure({
     maxExchanges,
-    onlyAgents: ['alice', 'bob'],
+    onlyAgents: agentIds,
     cooldownMs,
     agentCooldownMs,
     idleStaleMs,
@@ -90,14 +96,28 @@ async function main(): Promise<void> {
     room = ctx.societyRooms.create({
       name: 'plaza',
       createdBy: 'alice',
-      members: ['alice', 'bob'],
+      members: agentIds,
     })
   } else {
-    ctx.societyRooms.join(room.id, 'alice')
-    ctx.societyRooms.join(room.id, 'bob')
+    for (const id of agentIds) {
+      ctx.societyRooms.join(room.id, id)
+    }
   }
   ctx.societyScheduler.setDefaultRoom(room.id)
-  console.log(`✓ room: ${room.name} (${room.id.slice(0, 8)}…)`)
+  console.log(`✓ room: ${room.name} (${room.id.slice(0, 8)}…) members=${room.members.join(',')}`)
+
+  // New births during live: join plaza + allowlist so they show up and can act
+  ctx.on('society/agent-born', (profile) => {
+    try {
+      ctx.societyRooms.join(room!.id, profile.id)
+      ctx.societyScheduler.allowAgent(profile.id)
+      console.log(
+        `✓ born ${profile.displayName}(${profile.id}) llm=${ctx.societyLlm.describeAgentRoute(profile.id)} → plaza + allowlist`,
+      )
+    } catch (err) {
+      console.warn(`agent-born hook: ${err instanceof Error ? err.message : err}`)
+    }
+  })
 
   if (ctx.societyRooms.historyOf(room.id).length === 0) {
     const seed =

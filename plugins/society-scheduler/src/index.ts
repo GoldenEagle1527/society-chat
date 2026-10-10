@@ -208,6 +208,34 @@ export class SocietySchedulerService extends Service {
     this.defaultRoomId = roomId
   }
 
+  /** Allow a newly born agent into the auto-reply / tick allowlist (live UI). */
+  allowAgent(agentId: AgentId): void {
+    if (!this.onlyAgents) return
+    this.onlyAgents.add(agentId)
+  }
+
+  /** Expand or replace the allowlist (null = all agents). */
+  setOnlyAgents(ids: AgentId[] | null): void {
+    this.onlyAgents = ids ? new Set(ids) : null
+  }
+
+  private async consolidateAfterAct(agentId: AgentId): Promise<void> {
+    try {
+      const store = this.ctx.societyMemory.load(agentId)
+      if (store.working.length <= this.ctx.societyMemory.workingMax()) return
+      const result = await this.ctx.societyMemory.consolidateIfNeeded(agentId)
+      if (result.did) {
+        this.ctx.logger('society-scheduler').info(
+          `memory consolidate ${agentId} episodic+${result.episodicAdded ?? 0}`,
+        )
+      }
+    } catch (err) {
+      this.ctx.logger('society-scheduler').warn(
+        `memory consolidate ${agentId}: ${err instanceof Error ? err.message : err}`,
+      )
+    }
+  }
+
   private applyOptions(opts?: AutoReplyOptions): void {
     this.maxExchanges = opts?.maxExchanges ?? defaultMaxExchanges()
     this.onlyAgents = opts?.onlyAgents ? new Set(opts.onlyAgents) : null
@@ -433,6 +461,7 @@ export class SocietySchedulerService extends Service {
           stimulusId: message.id,
         })
       }
+      await this.consolidateAfterAct(agentId)
       return true
     } finally {
       this.inFlight.delete(agentId)
@@ -520,6 +549,7 @@ export class SocietySchedulerService extends Service {
           body: parsed.body || '',
           stimulusId: `idle-${this.tickCount}`,
         })
+        await this.consolidateAfterAct(agentId)
         return { action: 'idle-diary', body: parsed.body }
       }
 
@@ -544,6 +574,7 @@ export class SocietySchedulerService extends Service {
           to,
           stimulusId: `idle-${this.tickCount}`,
         })
+        await this.consolidateAfterAct(agentId)
         return { action: 'idle-dm', body: parsed.body }
       }
 
@@ -564,6 +595,7 @@ export class SocietySchedulerService extends Service {
         roomId: room.id,
         stimulusId: `idle-${this.tickCount}`,
       })
+      await this.consolidateAfterAct(agentId)
       return { action: 'idle-room', body: parsed.body }
     } finally {
       this.inFlight.delete(agentId)
@@ -651,6 +683,7 @@ export class SocietySchedulerService extends Service {
           stimulusId: message.id,
         })
       }
+      await this.consolidateAfterAct(agentId)
     } finally {
       this.inFlight.delete(agentId)
     }

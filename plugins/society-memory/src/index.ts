@@ -3,6 +3,9 @@
  * Cordis service name: `societyMemory`
  *
  * Persists to data/agents/<id>/memory.json
+ * LLM consolidate (free flash via agent's provider) when working exceeds N.
+ * Audit: optional data/agents/<id>/memory-log.jsonl
+ * Never logs API keys.
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -16,6 +19,14 @@ import type {
   SemanticBelief,
   WorkingMemoryLine,
 } from '../../../src/types.ts'
+import {
+  providerModelLabel,
+  requireProviderConfig,
+  societyConsolidateCooldownMs,
+  societyEnvInt,
+  societyWorkingMax,
+  type LlmProviderId,
+} from '../../../src/env.ts'
 import { agentDataDir } from '../../../src/paths.ts'
 
 declare module '@deepseek-ai/cordis' {
@@ -24,9 +35,13 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 
-const WORKING_MAX = 20
 const EPISODIC_MAX = 40
 const SEMANTIC_MAX = 30
+
+interface ConsolidateJson {
+  episodic?: Array<{ summary?: string; salience?: number }>
+  semantic?: Array<{ subject?: string; belief?: string; confidence?: number }>
+}
 
 function emptyStore(): AgentMemoryStore {
   return {
@@ -41,24 +56,27 @@ function memoryPath(agentId: AgentId): string {
   return path.join(agentDataDir(agentId), 'memory.json')
 }
 
+function memoryLogPath(agentId: AgentId): string {
+  return path.join(agentDataDir(agentId), 'memory-log.jsonl')
+}
+
 export class SocietyMemoryService extends Service {
   static inject = ['societyIdentity', 'societyRooms']
 
   private readonly cache = new Map<AgentId, AgentMemoryStore>()
+  private readonly lastConsolidateAt = new Map<AgentId, number>()
+  private readonly consolidating = new Set<AgentId>()
 
   constructor(ctx: Context) {
     super(ctx, 'societyMemory')
 
-    // Every room post lightly updates speaker + listeners
     ctx.on('society/room-message', (msg: RoomMessage) => {
       const room = ctx.societyRooms.get(msg.roomId)
       const members = room?.members ?? []
       const roomName = room?.name
       for (const member of members) {
         const role = member === msg.from ? 'speaker' : 'listener'
-        // system posts: everyone is listener
-        const effectiveRole =
-          msg.from === 'system' ? 'listener' : role
+        const effectiveRole = msg.from === 'system' ? 'listener' : role
         try {
           this.rememberInteraction(member, {
             kind: 'room',
@@ -75,7 +93,6 @@ export class SocietyMemoryService extends Service {
       }
     })
 
-    // Direct mail: recipient as listener; sender tracked if known agent
     ctx.on('society/mail-delivered', (msg) => {
       if (msg.kind !== 'direct') return
       try {
@@ -105,6 +122,18 @@ export class SocietyMemoryService extends Service {
         }
       }
     })
+  }
+
+  workingMax(): number {
+    return societyWorkingMax(20)
+  }
+
+  consolidateCooldownMs(): number {
+    return societyConsolidateCooldownMs(300_000)
+  }
+
+  dailyLlmBudget(): number {
+    return societyEnvInt('SOCIETY_DAILY_LLM_BUDGET', 80)
   }
 
   load(agentId: AgentId): AgentMemoryStore {
@@ -150,44 +179,170 @@ export class SocietyMemoryService extends Service {
       roomId: event.roomId,
     }
     store.working.push(line)
-    this.maybeConsolidate(agentId, store)
 
-    // Light semantic nudge from listener perspective
     if (event.role === 'listener' && event.from !== 'system' && event.from !== 'room') {
       this.nudgeSemantic(store, String(event.from), event.body)
     }
     if (event.role === 'speaker' && event.kind === 'room') {
-      // Speaker recalls they addressed the room
       this.nudgeSemantic(store, 'self', `我在群里说了：${event.body.slice(0, 80)}`)
     }
 
     store.updatedAt = new Date().toISOString()
     this.persist(agentId, store)
+
+    // Hard safety cap without LLM if massively overgrown (2× soft max)
+    const soft = this.workingMax()
+    if (store.working.length > soft * 2) {
+      this.dumbConsolidate(agentId, store)
+    } else if (store.working.length > soft) {
+      // Fire-and-forget LLM consolidate (rate-limited inside)
+      void this.consolidateIfNeeded(agentId).catch((err) => {
+        this.ctx.logger('society-memory').warn(
+          `async consolidate ${agentId}: ${err instanceof Error ? err.message : err}`,
+        )
+      })
+    }
   }
 
   /**
-   * When working overflows WORKING_MAX, fold oldest overflow into one episodic summary.
+   * When working overflows soft max, fold oldest overflow into one episodic summary (no LLM).
+   * Kept as fallback / emergency cap.
    */
   maybeConsolidate(agentId: AgentId, store?: AgentMemoryStore): void {
     const s = store ?? this.load(agentId)
-    if (s.working.length <= WORKING_MAX) return
+    if (s.working.length <= this.workingMax()) return
+    this.dumbConsolidate(agentId, s)
+  }
 
-    const overflow = s.working.splice(0, s.working.length - WORKING_MAX)
-    const summary = overflow
-      .map((w) => `${w.from}: ${w.body.slice(0, 60)}`)
-      .join(' / ')
-      .slice(0, 400)
-    const episodic: EpisodicMemory = {
-      ts: new Date().toISOString(),
-      summary: `早期对话压缩（${overflow.length} 条）：${summary}`,
-      salience: 0.4,
+  /**
+   * LLM consolidate when working.length > threshold.
+   * At most 1 per agent per SOCIETY_CONSOLIDATE_COOLDOWN_MS; respects daily LLM budget.
+   * Uses the agent's own free provider (llm.json). Never logs API keys.
+   */
+  async consolidateIfNeeded(
+    agentId: AgentId,
+    opts?: { force?: boolean; bypassCooldown?: boolean },
+  ): Promise<{ did: boolean; reason: string; episodicAdded?: number }> {
+    this.ctx.societyIdentity.require(agentId)
+    const store = this.load(agentId)
+    const soft = this.workingMax()
+    if (store.working.length <= soft && !opts?.force) {
+      return { did: false, reason: 'under-threshold' }
     }
-    s.episodic.push(episodic)
-    if (s.episodic.length > EPISODIC_MAX) {
-      s.episodic.splice(0, s.episodic.length - EPISODIC_MAX)
+    if (this.consolidating.has(agentId)) {
+      return { did: false, reason: 'in-flight' }
     }
-    s.updatedAt = new Date().toISOString()
-    this.persist(agentId, s)
+
+    const cooldown = this.consolidateCooldownMs()
+    const last = this.lastConsolidateAt.get(agentId) ?? 0
+    if (!opts?.bypassCooldown && !opts?.force && last > 0 && Date.now() - last < cooldown) {
+      return { did: false, reason: 'cooldown' }
+    }
+
+    const budget = this.dailyLlmBudget()
+    if (this.getLlmCallsToday(agentId) >= budget && !opts?.force) {
+      // Still cap working so UI/prompts don't explode
+      if (store.working.length > soft) this.dumbConsolidate(agentId, store)
+      return { did: false, reason: 'budget' }
+    }
+
+    // Need at least soft+1 lines, or force with whatever we have above soft
+    if (store.working.length <= soft) {
+      return { did: false, reason: 'under-threshold' }
+    }
+
+    this.consolidating.add(agentId)
+    try {
+      const overflowCount = store.working.length - soft
+      const chunk = store.working.slice(0, overflowCount)
+      const pref = this.ctx.societyIdentity.getLlmPreference(agentId)
+      const provider: LlmProviderId = pref.provider === 'glm' ? 'glm' : 'agnes'
+      const cfg = requireProviderConfig(provider, pref.model)
+
+      this.ctx.logger('society-memory').info(
+        `consolidate ${agentId} chunk=${chunk.length} ${providerModelLabel(cfg)}`,
+      )
+
+      this.recordLlmCall(agentId)
+      const parsed = await this.callConsolidateLlm(agentId, chunk, cfg.provider, cfg.model, cfg.baseUrl, cfg.apiKey)
+
+      // Remove chunk from working (reload in case of concurrent writes — we hold consolidating lock)
+      const fresh = this.load(agentId)
+      // Drop the oldest overflowCount lines that match our chunk timestamps/bodies loosely
+      fresh.working.splice(0, Math.min(overflowCount, fresh.working.length))
+
+      const now = new Date().toISOString()
+      let episodicAdded = 0
+      const epis = Array.isArray(parsed.episodic) ? parsed.episodic : []
+      for (const e of epis.slice(0, 3)) {
+        const summary = String(e?.summary || '').trim()
+        if (!summary) continue
+        const salience = Math.max(0, Math.min(1, Number(e?.salience) || 0.5))
+        const entry: EpisodicMemory = { ts: now, summary: summary.slice(0, 400), salience }
+        fresh.episodic.push(entry)
+        episodicAdded += 1
+      }
+      if (episodicAdded === 0) {
+        // Model returned empty — still persist a minimal episodic so consolidate is visible
+        fresh.episodic.push({
+          ts: now,
+          summary: `早期对话压缩（${chunk.length} 条）：${chunk
+            .map((w) => `${w.from}: ${w.body.slice(0, 40)}`)
+            .join(' / ')
+            .slice(0, 300)}`,
+          salience: 0.4,
+        })
+        episodicAdded = 1
+      }
+      if (fresh.episodic.length > EPISODIC_MAX) {
+        fresh.episodic.splice(0, fresh.episodic.length - EPISODIC_MAX)
+      }
+
+      const sems = Array.isArray(parsed.semantic) ? parsed.semantic : []
+      for (const s of sems.slice(0, 5)) {
+        const subject = String(s?.subject || '').trim().slice(0, 64)
+        const belief = String(s?.belief || '').trim().slice(0, 200)
+        if (!subject || !belief) continue
+        const confidence = Math.max(0, Math.min(1, Number(s?.confidence) || 0.5))
+        const existing = fresh.semantic.find((x) => x.subject === subject)
+        if (existing) {
+          existing.belief = belief
+          existing.confidence = Math.min(1, Math.max(existing.confidence, confidence))
+        } else {
+          fresh.semantic.push({ subject, belief, confidence })
+        }
+      }
+      if (fresh.semantic.length > SEMANTIC_MAX) {
+        fresh.semantic.splice(0, fresh.semantic.length - SEMANTIC_MAX)
+      }
+
+      fresh.updatedAt = now
+      this.persist(agentId, fresh)
+      this.lastConsolidateAt.set(agentId, Date.now())
+      this.appendMemoryLog(agentId, {
+        ts: now,
+        kind: 'llm-consolidate',
+        provider: cfg.provider,
+        model: cfg.model,
+        chunkSize: chunk.length,
+        episodicAdded,
+        semanticTouched: sems.length,
+      })
+      return { did: true, reason: 'ok', episodicAdded }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      this.ctx.logger('society-memory').warn(`consolidate failed ${agentId}: ${msg}`)
+      // Fallback dumb fold so working stays bounded
+      this.dumbConsolidate(agentId, this.load(agentId))
+      this.appendMemoryLog(agentId, {
+        ts: new Date().toISOString(),
+        kind: 'dumb-fallback',
+        error: msg.slice(0, 200),
+      })
+      return { did: false, reason: `llm-error:${msg.slice(0, 80)}` }
+    } finally {
+      this.consolidating.delete(agentId)
+    }
   }
 
   /** Short Chinese block for system prompt. */
@@ -222,8 +377,6 @@ export class SocietyMemoryService extends Service {
     return lines.join('\n')
   }
 
-
-  /** Calendar day key in local (box) timezone. */
   private todayKey(): string {
     const d = new Date()
     const y = d.getFullYear()
@@ -239,7 +392,6 @@ export class SocietyMemoryService extends Service {
     return store.budget.llmCalls
   }
 
-  /** Increment daily LLM call counter; returns new count. */
   recordLlmCall(agentId: AgentId): number {
     const store = this.load(agentId)
     const day = this.todayKey()
@@ -250,6 +402,96 @@ export class SocietyMemoryService extends Service {
     store.updatedAt = new Date().toISOString()
     this.persist(agentId, store)
     return store.budget.llmCalls
+  }
+
+  private dumbConsolidate(agentId: AgentId, store: AgentMemoryStore): void {
+    const soft = this.workingMax()
+    if (store.working.length <= soft) return
+    const overflow = store.working.splice(0, store.working.length - soft)
+    const summary = overflow
+      .map((w) => `${w.from}: ${w.body.slice(0, 60)}`)
+      .join(' / ')
+      .slice(0, 400)
+    const episodic: EpisodicMemory = {
+      ts: new Date().toISOString(),
+      summary: `早期对话压缩（${overflow.length} 条）：${summary}`,
+      salience: 0.4,
+    }
+    store.episodic.push(episodic)
+    if (store.episodic.length > EPISODIC_MAX) {
+      store.episodic.splice(0, store.episodic.length - EPISODIC_MAX)
+    }
+    store.updatedAt = new Date().toISOString()
+    this.persist(agentId, store)
+  }
+
+  private async callConsolidateLlm(
+    agentId: AgentId,
+    chunk: WorkingMemoryLine[],
+    provider: LlmProviderId,
+    model: string,
+    baseUrl: string,
+    apiKey: string,
+  ): Promise<ConsolidateJson> {
+    const transcript = chunk
+      .map((w) => `[${w.ts}] ${w.from}: ${w.body}`)
+      .join('\n')
+      .slice(0, 6000)
+    const system = [
+      '你是记忆整理助手。根据对话片段，输出严格 JSON（不要 markdown 围栏，不要其它文字）：',
+      '{"episodic":[{"summary":"中文情节摘要","salience":0.0到1.0}],"semantic":[{"subject":"对象","belief":"信念","confidence":0.0到1.0}]}',
+      'episodic 1～3 条；semantic 0～5 条。salience/confidence 为数字。',
+    ].join('\n')
+    const user = `Agent id: ${agentId}\n请压缩以下 ${chunk.length} 条工作记忆：\n${transcript}`
+
+    const url = `${baseUrl}/chat/completions`
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user },
+        ],
+        temperature: 0.3,
+        max_tokens: 800,
+      }),
+    })
+    const raw = await res.text()
+    let data: {
+      choices?: Array<{ message?: { content?: string | null } }>
+      error?: { message?: string }
+    }
+    try {
+      data = JSON.parse(raw) as typeof data
+    } catch {
+      throw new Error(`${provider} consolidate non-JSON (HTTP ${res.status})`)
+    }
+    if (!res.ok) {
+      throw new Error(`${provider} consolidate failed: ${data.error?.message || `HTTP ${res.status}`}`)
+    }
+    const content = (data.choices?.[0]?.message?.content || '').trim()
+    if (!content) throw new Error(`${provider} consolidate empty content`)
+    return this.parseConsolidateJson(content)
+  }
+
+  private parseConsolidateJson(content: string): ConsolidateJson {
+    let text = content.trim()
+    // Strip optional ```json fences
+    const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i)
+    if (fence) text = fence[1]!.trim()
+    const start = text.indexOf('{')
+    const end = text.lastIndexOf('}')
+    if (start >= 0 && end > start) text = text.slice(start, end + 1)
+    try {
+      return JSON.parse(text) as ConsolidateJson
+    } catch {
+      throw new Error('consolidate response was not valid JSON')
+    }
   }
 
   private nudgeSemantic(store: AgentMemoryStore, subject: string, body: string): void {
@@ -274,6 +516,20 @@ export class SocietyMemoryService extends Service {
       if (store.semantic.length > SEMANTIC_MAX) {
         store.semantic.splice(0, store.semantic.length - SEMANTIC_MAX)
       }
+    }
+  }
+
+  private appendMemoryLog(agentId: AgentId, entry: Record<string, unknown>): void {
+    try {
+      const dir = agentDataDir(agentId)
+      fs.mkdirSync(dir, { recursive: true })
+      // Never persist secrets
+      const safe = { ...entry }
+      delete safe.apiKey
+      delete safe.key
+      fs.appendFileSync(memoryLogPath(agentId), JSON.stringify(safe) + '\n', 'utf8')
+    } catch {
+      /* best-effort audit */
     }
   }
 

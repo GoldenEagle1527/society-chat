@@ -24,7 +24,9 @@
     "society-live": "tsx src/society-live.ts",
     "human-smoke": "tsx src/human-smoke.ts",
     "glm-smoke": "tsx src/glm-smoke.ts",
-    "start": "tsx src/society-live.ts"
+    "start": "tsx src/society-live.ts",
+    "memory-smoke": "tsx src/memory-smoke.ts",
+    "spawn-route-smoke": "tsx src/spawn-route-smoke.ts"
   },
   "dependencies": {
     "@deepseek-ai/cordis": "^4.0.4",

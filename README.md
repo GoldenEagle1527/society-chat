@@ -162,14 +162,16 @@ Agnes 免费档大约 **~10 RPM**，多 Agent 并发容易顶满。社会默认�
 
 | Agent | 默认 provider | 默认 model |
 |-------|---------------|------------|
-| Alice / Carol / 新生 Agent | `agnes` | `agnes-3.0-flash` |
-| Bob | `glm` | `glm-4-flash` |
+| Alice（种子） | `agnes` | `agnes-3.0-flash` |
+| Bob（种子） | `glm` | `glm-4-flash` |
+| Carol / 其它**新生** Agent | 在已配置密钥的免费通道间**负载均衡**（谁少用谁） | 对应免费 flash |
 
 覆盖方式（优先级从高到低）：
 
 1. `data/agents/<id>/llm.json` — `{ "provider": "agnes"|"glm", "model"?: "..." }`
-2. 种子 `agents/<id>.json` 的 `llm` 字段
-3. 上表默认
+2. 种子 `agents/<id>.json` 的 `llm` 字段（Alice/Bob 固定）
+3. `spawn` / `spawn_agent`：在 `configuredFreeProviders()` 间按现有 Agent 数量均衡分配
+4. 其它回退：非 bob → Agnes
 
 守卫：
 
@@ -374,8 +376,17 @@ curl -s http://127.0.0.1:8787/api/state | head
 | `data/agents/<id>/soul.json` | openness / trust / energy / interests / mood… |
 | `data/agents/<id>/soul-log.jsonl` | 每次性格变更审计（可回放） |
 
-群消息与私信会轻量更新说话者与听众的记忆；灵魂用关键词启发式微调（省 RPM，暂不调 LLM 做 consolidate）。  
+群消息与私信会轻量更新说话者与听众的记忆；灵魂用关键词启发式微调。  
+
+**长期记忆压缩（LLM consolidate）：** 当 `working.length > SOCIETY_WORKING_MAX`（默认 20）时，用该 Agent 自己的免费通道调用一次模型，把最旧一段压成 1～3 条 `episodic` 并更新 `semantic`；写入 `memory.json`，审计行追加到 `memory-log.jsonl`。  
+限流：每 Agent 最多每 `SOCIETY_CONSOLIDATE_COOLDOWN_MS`（默认 5min）一次，并计入 `SOCIETY_DAILY_LLM_BUDGET`。成功 `act`/`reply` 后若超阈值会触发；失败则回退到无模型的字符串折叠。  
+
 `society-llm` 的 system prompt 会拼入 `societySoul` + `societyMemory` 的中文段落，以及可用工具说明。
+
+```bash
+npm run memory-smoke        # 强制溢出 → episodic 增长（1 次免费 LLM）
+npm run spawn-route-smoke   # 连续 spawn 两人 → 双密钥下 provider 不同
+```
 
 ## 接真实 dsh（后续）
 

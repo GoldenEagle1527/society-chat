@@ -7,7 +7,13 @@ import path from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { AgentId, AgentLlmPreference, AgentProfile, SoulState } from '../../../src/types.ts'
 import { HUMAN_SPEAKER_ID, speakerLabel } from '../../../src/types.ts'
-import { loadDotEnv, societyEnvInt } from '../../../src/env.ts'
+import {
+  configuredFreeProviders,
+  defaultFreeModelFor,
+  loadDotEnv,
+  societyEnvInt,
+  type LlmProviderId,
+} from '../../../src/env.ts'
 import { AGENTS_DATA_ROOT, AGENTS_SEED_ROOT, agentDataDir, agentWorkspaceDir } from '../../../src/paths.ts'
 
 declare module '@deepseek-ai/cordis' {
@@ -38,10 +44,42 @@ const DEFAULT_SOUL: SoulState = {
 
 const RESERVED_IDS = new Set(['system', 'room', 'self', 'admin', 'observe', 'human'])
 
-/** Defaults: Bob → GLM; Alice/Carol/others → Agnes (concurrency across providers). */
+/** Seed / fallback defaults: Bob → GLM; Alice/Carol/others → Agnes. */
 export function defaultLlmFor(agentId: string): AgentLlmPreference {
   if (agentId === 'bob') return { provider: 'glm', model: 'glm-4-flash' }
   return { provider: 'agnes', model: 'agnes-3.0-flash' }
+}
+
+/**
+ * Pick free provider with fewest existing agents (balance Agnes RPM vs GLM).
+ * Only considers providers that have API keys configured.
+ * Seeds (Alice/Bob/Carol) keep defaultLlmFor / explicit llm; this is for spawn().
+ */
+export function pickBalancedLlm(existing: AgentLlmPreference[]): AgentLlmPreference {
+  const available = configuredFreeProviders()
+  const pool: LlmProviderId[] = available.length ? available : ['agnes']
+  if (pool.length === 1) {
+    const p = pool[0]!
+    return { provider: p, model: defaultFreeModelFor(p) }
+  }
+  const counts: Record<LlmProviderId, number> = { agnes: 0, glm: 0 }
+  for (const pref of existing) {
+    if (pref.provider === 'glm') counts.glm += 1
+    else counts.agnes += 1
+  }
+  // Prefer fewer agents on that provider
+  let best = pool[0]!
+  for (const p of pool) {
+    if (counts[p] < counts[best]) best = p
+  }
+  // Tie-break: opposite of the most recently listed agent (spreads consecutive spawns)
+  const tied = pool.filter((p) => counts[p] === counts[best])
+  if (tied.length > 1 && existing.length > 0) {
+    const last = existing[existing.length - 1]!
+    const opposite: LlmProviderId = last.provider === 'glm' ? 'agnes' : 'glm'
+    if (tied.includes(opposite)) best = opposite
+  }
+  return { provider: best, model: defaultFreeModelFor(best) }
 }
 
 function writeLlmPreference(agentId: string, pref: AgentLlmPreference): void {
@@ -145,7 +183,19 @@ export class SocietyIdentityService extends Service {
     if (this.agents.size >= max) {
       throw new Error(`max agents (${max}) reached; set SOCIETY_MAX_AGENTS to raise`)
     }
-    const profile = this.register({ ...input, id })
+    // Auto-route free providers unless caller set llm explicitly
+    const llm =
+      input.llm ||
+      pickBalancedLlm(this.list().map((a) => this.getLlmPreference(a.id)))
+    const profile = this.register({ ...input, id, llm })
+    // Always materialize llm.json for born agents
+    writeLlmPreference(id, llm)
+    profile.llm = llm
+    fs.writeFileSync(
+      path.join(agentDataDir(id), 'profile.json'),
+      JSON.stringify(profile, null, 2),
+      'utf8',
+    )
     this.ctx.emit('society/agent-born', profile)
     return profile
   }
@@ -263,6 +313,14 @@ export class SocietyIdentityService extends Service {
           },
           workspacePath,
           createdAt: raw.createdAt || new Date().toISOString(),
+          ...(raw.llm?.provider
+            ? {
+                llm: {
+                  provider: raw.llm.provider === 'glm' ? 'glm' : 'agnes',
+                  ...(raw.llm.model ? { model: String(raw.llm.model).trim() } : {}),
+                },
+              }
+            : {}),
         }
         // Cap: skip loading more than max (seeds already counted)
         if (this.agents.size >= this.maxAgents()) {
