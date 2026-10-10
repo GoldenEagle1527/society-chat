@@ -1,0 +1,516 @@
+/* Telegram Desktop–inspired dark theme for society-chat */
+:root {
+  --sidebar-bg: #17212b;
+  --sidebar-hover: #202b36;
+  --sidebar-active: #2b5278;
+  --chat-bg: #0e1621;
+  --header-bg: #17212b;
+  --bubble-in: #182533;
+  --bubble-out: #2b5278;
+  --bubble-system: #1c2733;
+  --text: #f5f5f5;
+  --text-secondary: #708499;
+  --text-meta: #6d7f8f;
+  --accent: #2b5278;
+  --accent-strong: #64a9dc;
+  --border: #0e1621;
+  --composer-bg: #17212b;
+  --input-bg: #242f3d;
+  --danger: #e17076;
+  --ok: #7bc862;
+  --shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+  --radius: 12px;
+  --sidebar-w: 360px;
+  font-family: "Segoe UI", "Helvetica Neue", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; background: #0b1219; color: var(--text); }
+button, textarea, input { font: inherit; color: inherit; }
+button { cursor: pointer; border: none; background: none; }
+.hidden { display: none !important; }
+
+.tg-app {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) 1fr;
+  height: 100vh;
+  max-width: 1600px;
+  margin: 0 auto;
+  background: var(--chat-bg);
+  box-shadow: var(--shadow);
+}
+
+/* ——— Sidebar ——— */
+.tg-sidebar {
+  display: flex;
+  flex-direction: column;
+  background: var(--sidebar-bg);
+  border-right: 1px solid #0b1219;
+  min-width: 0;
+}
+.tg-sidebar-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+}
+.tg-icon-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  color: var(--text-secondary);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+.tg-icon-btn:hover { background: var(--sidebar-hover); color: var(--text); }
+.tg-search-wrap { flex: 1; min-width: 0; }
+.tg-search {
+  width: 100%;
+  border: none;
+  outline: none;
+  background: var(--input-bg);
+  border-radius: 22px;
+  padding: 9px 14px;
+  color: var(--text);
+}
+.tg-search::placeholder { color: var(--text-meta); }
+
+.tg-status-bar {
+  padding: 0 14px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+.tg-pill {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #243447;
+  color: var(--accent-strong);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.tg-pill.soft { background: #1e2a38; color: var(--text-secondary); font-weight: 500; }
+.tg-pill.live { background: #1d3b2a; color: var(--ok); }
+.tg-muted { color: var(--text-secondary); font-size: 12px; line-height: 1.35; }
+
+.tg-chat-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0 8px;
+}
+.tg-chat-item {
+  display: grid;
+  grid-template-columns: 52px 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 12px;
+  cursor: pointer;
+  border: none;
+  width: 100%;
+  text-align: left;
+  color: inherit;
+  background: transparent;
+}
+.tg-chat-item:hover { background: var(--sidebar-hover); }
+.tg-chat-item.active { background: var(--sidebar-active); }
+.tg-chat-item.active .tg-chat-preview,
+.tg-chat-item.active .tg-chat-time { color: rgba(255,255,255,0.72); }
+
+.tg-avatar {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  font-size: 16px;
+  color: #fff;
+  user-select: none;
+  flex-shrink: 0;
+  position: relative;
+}
+.tg-avatar.sm { width: 36px; height: 36px; font-size: 13px; }
+.tg-avatar.xl { width: 96px; height: 96px; font-size: 36px; margin: 0 auto 12px; }
+.tg-avatar.group::after {
+  content: "";
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #64a9dc url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='white'%3E%3Cpath d='M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z'/%3E%3C/svg%3E") center/12px no-repeat;
+  border: 2px solid var(--sidebar-bg);
+}
+.tg-chat-item.active .tg-avatar.group::after { border-color: var(--sidebar-active); }
+
+.tg-chat-main { min-width: 0; }
+.tg-chat-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: baseline;
+}
+.tg-chat-title {
+  font-weight: 600;
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tg-chat-time {
+  font-size: 12px;
+  color: var(--text-meta);
+  flex-shrink: 0;
+}
+.tg-chat-preview {
+  margin-top: 2px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tg-chat-preview .from { color: var(--accent-strong); }
+.tg-badge {
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 10px;
+  background: #4ea4f6;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+}
+.tg-chat-item.active .tg-badge { background: #fff; color: var(--sidebar-active); }
+
+.tg-section-label {
+  padding: 10px 16px 4px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-meta);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.tg-sidebar-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px;
+  border-top: 1px solid #0b1219;
+  font-size: 11px;
+}
+
+/* ——— Main pane ——— */
+.tg-main {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background:
+    radial-gradient(ellipse at 20% 0%, rgba(43, 82, 120, 0.18), transparent 50%),
+    radial-gradient(ellipse at 80% 100%, rgba(100, 169, 220, 0.08), transparent 45%),
+    var(--chat-bg);
+}
+
+.tg-empty {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+.tg-empty-card {
+  background: rgba(23, 33, 43, 0.92);
+  border-radius: 16px;
+  padding: 28px 32px;
+  text-align: center;
+  max-width: 420px;
+  box-shadow: var(--shadow);
+}
+.tg-logo {
+  font-size: 28px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  margin-bottom: 10px;
+  background: linear-gradient(90deg, #64a9dc, #a695e7);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.tg-chat-pane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.tg-chat-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  background: var(--header-bg);
+  border-bottom: 1px solid #0b1219;
+  min-height: 56px;
+}
+.tg-header-avatar { padding: 0; border-radius: 50%; }
+.tg-header-avatar:hover { filter: brightness(1.08); }
+.tg-header-meta {
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+  border-radius: 8px;
+  padding: 2px 4px;
+}
+.tg-header-meta:hover { background: rgba(255,255,255,0.04); }
+.tg-header-title {
+  font-weight: 600;
+  font-size: 15px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tg-header-sub {
+  font-size: 13px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tg-header-actions { display: flex; align-items: center; gap: 8px; }
+.tg-mobile-only { display: none; }
+
+.tg-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 18px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tg-day {
+  align-self: center;
+  margin: 10px 0;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(24, 37, 51, 0.85);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.tg-row {
+  display: flex;
+  gap: 8px;
+  max-width: min(680px, 92%);
+  margin: 2px 0;
+  align-items: flex-end;
+}
+.tg-row.out { align-self: flex-end; flex-direction: row-reverse; }
+.tg-row.in { align-self: flex-start; }
+.tg-row.system { align-self: center; max-width: min(560px, 90%); }
+
+.tg-bubble {
+  padding: 8px 12px 6px;
+  border-radius: 12px;
+  background: var(--bubble-in);
+  box-shadow: 0 1px 1px rgba(0,0,0,0.15);
+  position: relative;
+  word-wrap: break-word;
+  white-space: pre-wrap;
+  line-height: 1.4;
+  font-size: 14.5px;
+}
+.tg-row.out .tg-bubble {
+  background: var(--bubble-out);
+  border-bottom-right-radius: 4px;
+}
+.tg-row.in .tg-bubble { border-bottom-left-radius: 4px; }
+.tg-row.system .tg-bubble {
+  background: var(--bubble-system);
+  color: var(--text-secondary);
+  font-size: 13px;
+  text-align: center;
+  border-radius: 10px;
+}
+.tg-bubble .name {
+  display: block;
+  font-size: 13px;
+  font-weight: 700;
+  margin-bottom: 2px;
+}
+.tg-bubble .meta {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 11px;
+  color: rgba(255,255,255,0.45);
+}
+.tg-row.out .tg-bubble .meta { color: rgba(255,255,255,0.55); }
+.tg-kind-tag {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.75;
+}
+
+/* ——— Composer ——— */
+.tg-composer {
+  background: var(--composer-bg);
+  border-top: 1px solid #0b1219;
+  padding: 8px 12px 10px;
+}
+.tg-composer-inner {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: end;
+  background: var(--input-bg);
+  border-radius: 16px;
+  padding: 6px 6px 6px 14px;
+}
+.tg-composer textarea {
+  resize: none;
+  border: none;
+  outline: none;
+  background: transparent;
+  max-height: 140px;
+  min-height: 24px;
+  padding: 8px 0;
+  line-height: 1.35;
+  width: 100%;
+}
+.tg-composer textarea:disabled { opacity: 0.45; }
+.tg-send {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  background: var(--accent-strong);
+  color: #fff;
+  display: grid;
+  place-items: center;
+}
+.tg-send:disabled { opacity: 0.35; cursor: default; }
+.tg-send:not(:disabled):hover { filter: brightness(1.08); }
+.tg-composer-hint {
+  min-height: 16px;
+  margin-top: 6px;
+  padding: 0 8px;
+  font-size: 12px;
+  color: var(--text-meta);
+}
+
+/* ——— Profile modal ——— */
+.tg-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+.tg-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+}
+.tg-modal-card {
+  position: relative;
+  width: min(440px, 100%);
+  max-height: min(88vh, 720px);
+  overflow: auto;
+  background: #1c2733;
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+  padding: 24px 22px 20px;
+  z-index: 1;
+}
+.tg-modal-close {
+  position: absolute;
+  top: 10px;
+  right: 14px;
+  font-size: 28px;
+  line-height: 1;
+  color: var(--text-secondary);
+  width: 36px;
+  height: 36px;
+}
+.tg-modal-close:hover { color: var(--text); }
+.tg-profile-hero { text-align: center; margin-bottom: 16px; }
+.tg-profile-hero h2 { margin: 0 0 4px; font-size: 22px; }
+.tg-profile-body { display: grid; gap: 12px; }
+.tg-profile-card {
+  background: #242f3d;
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+.tg-profile-card h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-meta);
+}
+.tg-profile-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 0;
+  font-size: 14px;
+}
+.tg-profile-row span:last-child { color: var(--text-secondary); text-align: right; }
+.tg-bars { display: grid; gap: 8px; }
+.tg-bar-row {
+  display: grid;
+  grid-template-columns: 48px 1fr 40px;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.tg-bar-track {
+  height: 6px;
+  background: #17212b;
+  border-radius: 3px;
+  overflow: hidden;
+}
+.tg-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #64a9dc, #7bc862);
+  border-radius: 3px;
+}
+.tg-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.tg-tag {
+  background: #17212b;
+  color: var(--accent-strong);
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+}
+.tg-persona {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.45;
+  color: var(--text);
+  white-space: pre-wrap;
+}
+
+@media (max-width: 900px) {
+  .tg-app { grid-template-columns: 1fr; }
+  .tg-sidebar.collapsed { display: none; }
+  .tg-main.with-chat .tg-empty { display: none; }
+  .tg-mobile-only { display: grid; }
+  :root { --sidebar-w: 100%; }
+}

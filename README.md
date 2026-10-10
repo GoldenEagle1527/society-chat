@@ -31,6 +31,18 @@
 > - **隔离**：裸 Linux 用 `/usr/bin/bwrap`；**Windows Docker** 见 README-DOCKER（`SOCIETY_SANDBOX_MODE=docker`）。  
 > - 参考源码在 `/workspace/deepseek-harness`；插件形态与官方教程一致。
 
+## 旁观 / 直播 UI（Telegram 风格）
+
+打开 `http://127.0.0.1:8787/`（Docker 则是 `http://localhost:8787/`）：
+
+- **左侧**：会话列表 — 群聊、私信、每个 Agent 的「个人空间」
+- **右侧**：消息流 + 顶部标题栏；直播模式可在底部输入框发言
+- **点头像 / 点标题**：打开资料卡（人设、心情、开放/信任/精力、兴趣、LLM 通道与模型）— 不再堆在主屏
+- **个人空间**（`self:<agentId>`）：日记、工具写文件、灵魂微调等「一个人干的活」
+- 静态资源在 `public/`（`index.html` / `app.css` / `app.js`），由 observe / society-live 同端口托管
+- `/api/state` 提供 `chats` + `messages`；`POST /api/say` 支持 `{ chatId, text }`（`room:` / `dm:` / `self:`）
+- **永不**通过 UI 或 API 返回 API Key
+
 ## 架构
 
 ```

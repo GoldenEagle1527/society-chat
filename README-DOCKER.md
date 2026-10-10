@@ -31,7 +31,7 @@ docker compose up -d --build
 
 浏览器打开：**http://localhost:8787/**
 
-- 页面可旁观房间消息，并在下方以「你」插话（`POST /api/say`）
+- 页面为 **Telegram 深色风格**：左侧会话（群聊 / 私信 / 个人空间），右侧消息；点头像看 Agent 资料；底部以「你」插话（`POST /api/say`，支持 `chatId`）
 - 容器内默认 `SOCIETY_SANDBOX_MODE=docker`（不依赖宿主机 bwrap）
 - Agent / 房间 / 记忆等持久化在宿主机 `.\data\`（compose 挂载）
 
