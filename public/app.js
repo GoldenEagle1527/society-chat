@@ -272,7 +272,7 @@
       if (isSystemish(m) && chat.kind === 'self') {
         html += `<div class="tg-row system">
           <div class="tg-msg-wrap">
-            <div class="tg-bubble">${esc(m.body)}
+            <div class="tg-bubble"><span class="tg-sys-text">${esc(m.body)}</span>
               <div class="meta"><span class="tg-kind-tag">${esc(m.kind || 'system')}</span></div>
             </div>
             <time class="tg-msg-time" datetime="${esc(m.createdAt || '')}">${esc(fmtClock(m.createdAt))}</time>

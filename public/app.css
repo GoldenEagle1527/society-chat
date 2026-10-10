@@ -413,6 +413,9 @@ button { cursor: pointer; border: none; background: none; }
   flex: 1 1 auto;
   width: 100%;
   max-width: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   background: rgba(28, 39, 51, 0.92);
   color: var(--text-secondary);
   font-size: 12.5px;
@@ -421,9 +424,20 @@ button { cursor: pointer; border: none; background: none; }
   padding: 7px 12px;
   white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis;
   box-shadow: none;
   line-height: 1.35;
+}
+.tg-row.system .tg-bubble > .tg-sys-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tg-row.system .tg-bubble .meta {
+  display: inline-flex;
+  flex-shrink: 0;
+  margin: 0;
 }
 .tg-name-row {
   display: flex;
