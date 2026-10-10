@@ -32,7 +32,7 @@ html, body {
   background: var(--sidebar-bg);
   color: var(--text);
 }
-button, textarea, input { font: inherit; color: inherit; }
+button, textarea, input, select { font: inherit; color: inherit; }
 button { cursor: pointer; border: none; background: none; }
 .hidden { display: none !important; }
 
@@ -733,7 +733,8 @@ button { cursor: pointer; border: none; background: none; }
   color: var(--text-secondary);
 }
 .tg-field input[type="text"],
-.tg-field textarea {
+.tg-field textarea,
+.tg-field select {
   background: var(--input-bg);
   border: none;
   outline: none;
@@ -742,11 +743,31 @@ button { cursor: pointer; border: none; background: none; }
   color: var(--text);
   width: 100%;
   font: inherit;
-  resize: vertical;
   min-height: 40px;
 }
+.tg-field textarea {
+  resize: vertical;
+}
+.tg-field select {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  cursor: pointer;
+  color-scheme: dark;
+  background-color: var(--input-bg);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%23708499' d='M1.4.6 6 5.2 10.6.6 12 2 6 8 0 2z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 12px 8px;
+  padding-right: 36px;
+}
+.tg-field select option {
+  background-color: var(--input-bg);
+  color: var(--text);
+}
 .tg-field input[type="text"]:focus,
-.tg-field textarea:focus {
+.tg-field textarea:focus,
+.tg-field select:focus {
   box-shadow: 0 0 0 2px rgba(100, 169, 220, 0.35);
 }
 .tg-modal-card-wide {
