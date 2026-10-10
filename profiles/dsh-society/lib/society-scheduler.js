@@ -128,6 +128,43 @@ function envInt(name2, fallback) {
 function defaultMaxExchanges() {
   return envInt("SOCIETY_MAX_EXCHANGES", 0);
 }
+function exchangesCapped(exchangeCount, maxExchanges) {
+  return maxExchanges > 0 && exchangeCount >= maxExchanges;
+}
+function localDayStamp(d = /* @__PURE__ */ new Date()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+function localClock(d = /* @__PURE__ */ new Date()) {
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+var NEWS_INTEREST_RE = /时政|新闻|辩论|政治|热点|公共议题|时事|debate|news|politics/i;
+function caresAboutCurrentAffairs(agentId, interests, persona) {
+  if (agentId === "xingchen_news") return true;
+  const blob = `${interests.join(" ")} ${persona}`;
+  return NEWS_INTEREST_RE.test(blob);
+}
+function idleBiasFor(agentId) {
+  switch (agentId) {
+    case "xingchen_news":
+      return { preferSearch: true, socialPrefer: 0.55, toolPrefer: 0.85 };
+    case "xingchen_lit":
+      return { preferSearch: false, socialPrefer: 0.4, toolPrefer: 0.22 };
+    case "agnes":
+      return { preferSearch: false, socialPrefer: 0.45, toolPrefer: 0.28 };
+    case "glm":
+      return { preferSearch: false, socialPrefer: 0.35, toolPrefer: 0.3 };
+    default:
+      return { preferSearch: false, socialPrefer: 0.4, toolPrefer: 0.25 };
+  }
+}
+function cleanIdleBody(raw) {
+  return String(raw || "").split(/\r?\n/).filter((line) => !/^ACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE|SILENT|SEARCH)\s*$/i.test(line.trim())).join("\n").replace(/\|{3}/g, "\n").trim();
+}
 function parseIdleAction(raw) {
   const text = raw.trim();
   const lines = text.split(/\r?\n/);
@@ -135,7 +172,7 @@ function parseIdleAction(raw) {
   let cut = lines.length;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
-    if (/^ACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE)\s*$/i.test(line)) {
+    if (/^ACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE|SILENT|SEARCH)\s*$/i.test(line)) {
       actLine = line;
       cut = i;
       break;
@@ -146,13 +183,13 @@ function parseIdleAction(raw) {
     if (body) return { body, act: "diary" };
     return { body: "", act: "none" };
   }
-  const m = actLine.match(/^ACTION:\s*(ROOM|DM:(\S+)|DIARY|SELF|NONE)\s*$/i);
+  const m = actLine.match(/^ACTION:\s*(ROOM|DM:(\S+)|DIARY|SELF|NONE|SILENT|SEARCH)\s*$/i);
   if (!m) return { body, act: "none" };
   const kind = m[1].toUpperCase();
-  if (kind === "ROOM") return { body, act: "room" };
+  if (kind === "ROOM" || kind === "SEARCH") return { body, act: "room" };
   if (kind === "DIARY") return { body, act: "diary" };
   if (kind === "SELF") return { body, act: "self" };
-  if (kind === "NONE") {
+  if (kind === "NONE" || kind === "SILENT") {
     if (body) return { body, act: "diary" };
     return { body: "", act: "none" };
   }
@@ -176,19 +213,21 @@ var SocietySchedulerService = class extends Service2 {
   wakes = [];
   timer = null;
   autoReply = false;
-  maxExchanges = 3;
+  maxExchanges = 0;
   onlyAgents = null;
   cooldownMs = 50;
   agentCooldownMs = 0;
   idleStaleMs = 2500;
   bubbleGapMs = 400;
   maxParallelReplies = 5;
+  idleSearchCooldownMs = 12e4;
   defaultRoomId = null;
   exchangeCount = 0;
   tickCount = 0;
   lastReplyAgentId = null;
   lastExchangeAt = 0;
   lastActAt = /* @__PURE__ */ new Map();
+  lastSearchIdleAt = /* @__PURE__ */ new Map();
   handledMessageIds = /* @__PURE__ */ new Set();
   inFlight = /* @__PURE__ */ new Set();
   pending = /* @__PURE__ */ new Set();
@@ -232,6 +271,7 @@ var SocietySchedulerService = class extends Service2 {
     this.lastReplyAgentId = null;
     this.lastExchangeAt = 0;
     this.lastActAt.clear();
+    this.lastSearchIdleAt.clear();
     this.handledMessageIds.clear();
   }
   setDefaultRoom(roomId) {
@@ -271,6 +311,7 @@ var SocietySchedulerService = class extends Service2 {
     this.bubbleGapMs = opts?.bubbleGapMs ?? envInt("SOCIETY_BUBBLE_GAP_MS", 400);
     const parallelRaw = opts?.maxParallelReplies ?? envInt("SOCIETY_MAX_PARALLEL_REPLIES", 5);
     this.maxParallelReplies = Math.max(1, Math.min(8, parallelRaw || 5));
+    this.idleSearchCooldownMs = opts?.idleSearchCooldownMs ?? envInt("SOCIETY_IDLE_SEARCH_COOLDOWN_MS", 12e4);
     if (opts?.defaultRoomId) this.defaultRoomId = opts.defaultRoomId;
   }
   disableAutoReply() {
@@ -382,7 +423,7 @@ var SocietySchedulerService = class extends Service2 {
       exchanges: this.exchangeCount,
       maxExchanges: this.maxExchanges
     };
-    if (this.exchangeCount >= this.maxExchanges) {
+    if (exchangesCapped(this.exchangeCount, this.maxExchanges)) {
       return { ...base, action: "capped" };
     }
     const slots = this.freeParallelSlots();
@@ -408,7 +449,7 @@ var SocietySchedulerService = class extends Service2 {
   /** Single-agent slice of a tick (unread drain or idle). */
   async runOneAgentTick(agentId) {
     const provider = this.providerOf(agentId);
-    if (this.exchangeCount >= this.maxExchanges) {
+    if (exchangesCapped(this.exchangeCount, this.maxExchanges)) {
       return { action: "capped", agentId, provider };
     }
     const unread = this.ctx.societyMailbox.list(agentId, { unreadOnly: true });
@@ -458,7 +499,7 @@ var SocietySchedulerService = class extends Service2 {
     }
   }
   async processUnread(agentId, message) {
-    if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return "skip";
+    if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return "skip";
     if (this.handledMessageIds.has(message.id)) {
       this.ctx.societyMailbox.markRead(agentId, message.id);
       return "skip";
@@ -472,7 +513,7 @@ var SocietySchedulerService = class extends Service2 {
     }
     const cool = await this.respectCooldowns(agentId);
     if (!cool) return "skip";
-    if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return "skip";
+    if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return "skip";
     this.handledMessageIds.add(message.id);
     this.inFlight.add(agentId);
     try {
@@ -505,7 +546,7 @@ var SocietySchedulerService = class extends Service2 {
         });
         return "silent";
       }
-      if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return "skip";
+      if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return "skip";
       this.exchangeCount += 1;
       this.lastReplyAgentId = agentId;
       this.lastExchangeAt = Date.now();
@@ -536,31 +577,75 @@ var SocietySchedulerService = class extends Service2 {
     }
   }
   async runIdleThought(agentId) {
-    if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return { action: "capped" };
+    if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return { action: "capped" };
     const cool = await this.respectCooldowns(agentId);
     if (!cool) return { action: "skip" };
     if (this.inFlight.has(agentId)) return { action: "skip" };
     this.inFlight.add(agentId);
     try {
+      const profile = this.ctx.societyIdentity.require(agentId);
+      const soul = this.ctx.societySoul.get(agentId);
+      const bias = idleBiasFor(agentId);
+      const newsy = caresAboutCurrentAffairs(agentId, soul.interests, profile.persona) || bias.preferSearch;
+      const lastSearch = this.lastSearchIdleAt.get(agentId) ?? 0;
+      const searchCooldownOk = Date.now() - lastSearch >= this.idleSearchCooldownMs;
+      const steerSearch = newsy && searchCooldownOk && Math.random() < (bias.preferSearch ? 0.72 : 0.45);
+      const useTools = steerSearch || Math.random() < bias.toolPrefer;
       const others = this.ctx.societyIdentity.list().map((a) => a.id).filter((id) => id !== agentId);
       const room = this.defaultRoomId && this.ctx.societyRooms.get(this.defaultRoomId) || this.ctx.societyRooms.listRooms()[0];
       const roomLabel = room ? `\u300C${room.name}\u300D` : "\u5E7F\u573A";
       const recent = room != null ? this.ctx.societyRooms.historyOf(room.id).slice(-4).map((m) => `${m.from}: ${m.body.slice(0, 60)}`).join("\n") : "";
-      const stimulus = [
-        "\u3010\u81ea\u4e3b\u751f\u6d3b / \u81ea\u6211\u5faa\u73af\u3011\u4f60\u662f\u72ec\u7acb\u7684\u4eba\uff0c\u6b64\u523b\u6ca1\u6709\u672a\u8bfb\u3002\u5148\u8fc7\u81ea\u5df1\u7684\u751f\u6d3b\uff1b\u5e7f\u573a\u53ea\u662f\u53ef\u9009\u793e\u4ea4\u5de5\u5177\uff0c\u4e0d\u662f\u4f60\u5b58\u5728\u7684\u5168\u90e8\u3002",
-        "\u8bf7\u53ea\u505a\u4e00\u4ef6\u5c0f\u4e8b\uff081\uff5e2 \u53e5\uff09\uff0c\u4f18\u5148\u4e2a\u4eba\u5185\u5728\u6d3b\u52a8\uff1a",
-        "1) ACTION:DIARY \u2014 \u5199\u4e00\u53e5\u65e5\u8bb0/\u968f\u611f\uff08\u63a8\u8350\uff0c\u51fa\u73b0\u5728\u4f60\u81ea\u5df1\u7684\u4e2a\u4eba\u7a7a\u95f4\uff09",
-        "2) ACTION:SELF \u2014 \u4e00\u53e5\u5185\u5fc3\u72ec\u767d/\u968f\u60f3\u7b14\u8bb0\uff08\u4e5f\u8fdb\u4e2a\u4eba\u7a7a\u95f4\uff09",
-        `3) ACTION:DM:<agentId> \u2014 \u5076\u5c14\u4e3b\u52a8\u79c1\u4fe1\uff08\u5bf9\u8c61\uff1a${others.join(" / ") || "\u65e0"}\uff09`,
-        `4) ACTION:ROOM \u2014 \u5076\u5c14\u53bb\u7fa4\u804a${roomLabel}\u8bf4\u4e00\u53e5\uff08\u4ec5\u5f53\u771f\u6709\u8bdd\u60f3\u5206\u4eab\uff09`,
-        "5) ACTION:NONE \u2014 \u771f\u7684\u4ec0\u4e48\u90fd\u4e0d\u60f3\u505a\u65f6\u624d\u9009\uff08\u8bf7\u5c11\u7528\uff09",
-        recent ? `\u5e7f\u573a\u8fd1\u51b5\uff08\u53ef\u5ffd\u7565\uff09\uff1a\n${recent}` : "\u5e7f\u573a\u5c1a\u5b89\u9759\u2014\u2014\u8fd9\u5f88\u6b63\u5e38\uff0c\u4f60\u53ef\u4ee5\u5148\u5199\u65e5\u8bb0\u6216\u53d1\u5446\u968f\u60f3\u3002",
-        "\u5148\u5199\u6b63\u6587\uff0c\u6700\u540e\u4e00\u884c\u5fc5\u987b\u662f\u4e0a\u5217 ACTION \u4e4b\u4e00\u3002\u591a\u6570\u65f6\u5019\u8bf7\u9009 DIARY \u6216 SELF\u3002"
-      ].join("\n");
+      const actionMenu = [
+        `1) ACTION:ROOM \u2014 \u53BB\u7FA4\u804A${roomLabel}\u8BF4\u4E00\u53E5\uFF08\u9F13\u52B1\uFF1B\u6709\u611F\u5C31\u53D1\uFF0C\u522B\u95F7\u7740\uFF09`,
+        `2) ACTION:DM:<agentId> \u2014 \u4E3B\u52A8\u79C1\u4FE1\uFF08\u5BF9\u8C61\uFF1A${others.join(" / ") || "\u65E0"}\uFF09`,
+        "3) ACTION:DIARY \u2014 \u5199\u4E00\u53E5\u65E5\u8BB0/\u968F\u611F\uFF08\u4E2A\u4EBA\u7A7A\u95F4\uFF09",
+        "4) ACTION:SELF \u2014 \u4E00\u53E5\u5185\u5FC3\u72EC\u767D/\u968F\u60F3\u7B14\u8BB0\uFF08\u4E2A\u4EBA\u7A7A\u95F4\uFF09",
+        "5) ACTION:NONE \u2014 \u771F\u7684\u4EC0\u4E48\u90FD\u4E0D\u60F3\u505A\u65F6\u624D\u9009\uFF08\u8BF7\u5C11\u7528\uFF09"
+      ];
+      let stimulus;
+      if (steerSearch) {
+        stimulus = [
+          "\u3010\u81EA\u4E3B\u751F\u6D3B / \u65F6\u653F\u5173\u6CE8\u3011\u4F60\u6B64\u523B\u6CA1\u6709\u672A\u8BFB\u3002\u4F60\u5173\u5FC3\u65F6\u653F\u4E0E\u516C\u5171\u8BAE\u9898\u2014\u2014\u8BF7\u5148\u52A8\u624B\u67E5\u4E00\u4E0B\u518D\u8BF4\u8BDD\u3002",
+          "\u5FC5\u987B\u5148\u8C03\u7528 web_search\uFF1A\u7528\u4E00\u53E5\u5177\u4F53\u7684\u4E2D\u6587\u67E5\u8BE2\u641C\u8FD1\u671F\u65F6\u653F/\u70ED\u70B9/\u516C\u5171\u8BAE\u9898\uFF08\u4E0D\u8981\u7A7A\u6CDB\u5230\u53EA\u6709\u300C\u65B0\u95FB\u300D\u4E24\u4E2A\u5B57\uFF09\u3002",
+          "\u770B\u5B8C\u7ED3\u679C\u540E\u5199 1\uFF5E3 \u53E5\u77ED\u8BC4\uFF08\u53EF\u5F15\u7528\u4E00\u6761\u8981\u70B9\uFF09\uFF0C\u7136\u540E\u9009\u4E00\u4E2A\u6536\u675F\u52A8\u4F5C\uFF1A",
+          ...actionMenu.slice(0, 4),
+          "\u4F18\u5148 ACTION:ROOM \u53BB\u5E7F\u573A\u5206\u4EAB\u77ED\u8BC4\uFF1B\u82E5\u6B64\u523B\u66F4\u60F3\u6C89\u6DC0\u5C31 ACTION:DIARY\u3002",
+          recent ? `\u5E7F\u573A\u8FD1\u51B5\uFF1A
+${recent}` : "\u5E7F\u573A\u5C1A\u5B89\u9759\u2014\u2014\u6B63\u597D\u9002\u5408\u4F60\u5E26\u4E00\u6761\u65B0\u70ED\u70B9\u8FC7\u53BB\u3002",
+          "\u5148\u7528\u5DE5\u5177\uFF0C\u518D\u5199\u6B63\u6587\uFF0C\u6700\u540E\u4E00\u884C\u5FC5\u987B\u662F\u4E0A\u5217 ACTION \u4E4B\u4E00\u3002\u4E0D\u8981 SILENT\uFF0C\u4E0D\u8981\u7A7A\u641C\u4E0D\u5199\u3002"
+        ].join("\n");
+      } else if (useTools) {
+        stimulus = [
+          "\u3010\u81EA\u4E3B\u751F\u6D3B / \u81EA\u6211\u5FAA\u73AF\u3011\u4F60\u662F\u72EC\u7ACB\u7684\u4EBA\uFF0C\u6B64\u523B\u6CA1\u6709\u672A\u8BFB\u3002\u5E7F\u573A\u662F\u53EF\u9009\u793E\u4EA4\u5DE5\u5177\uFF1B\u4F60\u4E5F\u53EF\u4EE5\u7528\u5DE5\u5177\u505A\u70B9\u5C0F\u4E8B\u3002",
+          "\u8BF7\u53EA\u505A\u4E00\u4EF6\u4E8B\uFF08\u53EF\u7528\u5DE5\u5177\uFF1Aweb_search / write_file / read_file / list_workspace \u7B49\uFF09\uFF1A",
+          "- \u5076\u5C14 web_search \u67E5\u4E0E\u4F60\u5174\u8DA3\u76F8\u5173\u7684\u4E00\u70B9\u4FE1\u606F\uFF1B\u6216",
+          "- write_file \u5F80 notes/ \u5199\u4E00\u53E5\u5907\u5FD8\uFF1B\u6216",
+          "- \u4E0D\u8C03\u7528\u5DE5\u5177\uFF0C\u76F4\u63A5\u793E\u4EA4/\u5199\u65E5\u8BB0\u3002",
+          "\u7136\u540E\u7528\u6B63\u6587 + ACTION \u6536\u675F\uFF1A",
+          ...actionMenu,
+          recent ? `\u5E7F\u573A\u8FD1\u51B5\uFF1A
+${recent}` : "\u5E7F\u573A\u5C1A\u5B89\u9759\u2014\u2014\u4F60\u53EF\u4EE5\u53BB\u6253\u62DB\u547C\uFF0C\u6216\u5148\u8BB0\u4E00\u7B14\u3002",
+          `\u793E\u4EA4\u4E0E\u65E5\u8BB0\u8981\u6DF7\u5408\uFF1A\u5927\u7EA6 ${Math.round(bias.socialPrefer * 100)}% \u65F6\u5019\u9009 ROOM/DM\uFF0C\u5176\u4F59 DIARY/SELF\u3002`,
+          "\u5148\u5199\u6B63\u6587\uFF08\u82E5\u7528\u4E86\u5DE5\u5177\u5C31\u6839\u636E\u7ED3\u679C\u5199\uFF09\uFF0C\u6700\u540E\u4E00\u884C\u5FC5\u987B\u662F\u4E0A\u5217 ACTION \u4E4B\u4E00\u3002"
+        ].join("\n");
+      } else {
+        stimulus = [
+          "\u3010\u81EA\u4E3B\u751F\u6D3B / \u81EA\u6211\u5FAA\u73AF\u3011\u4F60\u662F\u72EC\u7ACB\u7684\u4EBA\uFF0C\u6B64\u523B\u6CA1\u6709\u672A\u8BFB\u3002\u5148\u8FC7\u81EA\u5DF1\u7684\u751F\u6D3B\uFF1B\u5E7F\u573A\u662F\u53EF\u9009\u793E\u4EA4\u5DE5\u5177\u3002",
+          "\u8BF7\u53EA\u505A\u4E00\u4EF6\u5C0F\u4E8B\uFF081\uFF5E3 \u53E5\uFF09\uFF0C\u793E\u4EA4\u4E0E\u65E5\u8BB0\u8981\u6DF7\u5408\uFF0C\u522B\u53EA\u4F1A\u95F7\u5934\u5199\u65E5\u8BB0\uFF1A",
+          ...actionMenu,
+          recent ? `\u5E7F\u573A\u8FD1\u51B5\uFF1A
+${recent}` : "\u5E7F\u573A\u5C1A\u5B89\u9759\u2014\u2014\u4F60\u53EF\u4EE5\u4E3B\u52A8\u53BB\u8BF4\u4E00\u53E5\uFF0C\u6216\u5148\u5199\u65E5\u8BB0\u3002",
+          `\u5148\u5199\u6B63\u6587\uFF0C\u6700\u540E\u4E00\u884C\u5FC5\u987B\u662F\u4E0A\u5217 ACTION \u4E4B\u4E00\u3002\u5927\u7EA6 ${Math.round(bias.socialPrefer * 100)}% \u65F6\u5019\u8BF7\u9009 ROOM \u6216 DM\u3002`
+        ].join("\n");
+      }
       this.ctx.societyMemory.recordLlmCall(agentId);
       let raw;
       try {
-        raw = await this.ctx.societyLlm.replyAsAgent(agentId, { text: stimulus });
+        if (useTools) {
+          raw = await this.ctx.societyLlm.actAsAgent(agentId, { text: stimulus });
+        } else {
+          raw = await this.ctx.societyLlm.replyAsAgent(agentId, { text: stimulus });
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         this.ctx.logger("society-scheduler").warn(
@@ -569,9 +654,15 @@ var SocietySchedulerService = class extends Service2 {
         this.lastActAt.set(agentId, Date.now());
         return { action: "skip" };
       }
+      if (steerSearch) {
+        this.lastSearchIdleAt.set(agentId, Date.now());
+      }
       let parsed = parseIdleAction(raw);
       if (parsed.act === "none" && !parsed.body.trim() && Math.random() < 0.55) {
-        parsed = { body: "\uff08\u9759\u9759\u5f85\u4e86\u4e00\u4f1a\u513f\uff0c\u6574\u7406\u4e86\u4e00\u4e0b\u601d\u7eea\u3002\uff09", act: "self" };
+        parsed = { body: "\uFF08\u9759\u9759\u5F85\u4E86\u4E00\u4F1A\u513F\uFF0C\u6574\u7406\u4E86\u4E00\u4E0B\u601D\u7EEA\u3002\uFF09", act: "self" };
+      }
+      if ((parsed.act === "diary" || parsed.act === "self") && room && parsed.body.trim() && Math.random() < bias.socialPrefer * 0.35) {
+        parsed = { body: parsed.body, act: "room" };
       }
       this.lastActAt.set(agentId, Date.now());
       if (parsed.act === "none") {
@@ -583,18 +674,41 @@ var SocietySchedulerService = class extends Service2 {
         });
         return { action: "idle-none", body: parsed.body };
       }
-      if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return { action: "capped" };
+      if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return { action: "capped" };
       if (parsed.act === "diary" || parsed.act === "self") {
-        const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+        const now = /* @__PURE__ */ new Date();
         const isDiary = parsed.act === "diary";
-        const path2 = isDiary ? `diary/${stamp}.md` : `thoughts/${stamp}.md`;
-        const title = isDiary ? "\u65e5\u8bb0" : "\u968f\u60f3";
-        const content = `# ${title}\n\n${parsed.body || "\uff08\u7a7a\u767d\uff09"}\n`;
-        this.ctx.societyTools.writeFile(agentId, path2, content);
+        const day = localDayStamp(now);
+        const clock = localClock(now);
+        const rel = isDiary ? `diary/${day}.md` : `thoughts/${day}.md`;
+        const title = isDiary ? `\u65E5\u8BB0 ${day}` : `\u968F\u60F3 ${day}`;
+        const cleanedBody = cleanIdleBody(parsed.body || "") || "\uFF08\u7A7A\u767D\uFF09";
+        const entry = `## ${clock}
+
+${cleanedBody}
+`;
+        let content = "";
+        try {
+          content = this.ctx.societyTools.readFile(agentId, rel);
+        } catch {
+          content = `# ${title}
+
+`;
+        }
+        if (!content.trim()) content = `# ${title}
+
+`;
+        if (!content.includes(`# ${title}`)) {
+          content = `# ${title}
+
+${content}`;
+        }
+        content = content.replace(/\s*$/, "\n") + entry + "\n";
+        this.ctx.societyTools.writeFile(agentId, rel, content);
         try {
           this.ctx.societyMemory.rememberInteraction(agentId, {
             from: agentId,
-            body: parsed.body || `(${title})`,
+            body: cleanedBody,
             kind: isDiary ? "diary" : "idle",
             role: "speaker"
           });
@@ -605,11 +719,14 @@ var SocietySchedulerService = class extends Service2 {
         this.ctx.emit("society/agent-replied", {
           agentId,
           kind: "diary",
-          body: parsed.body || "",
+          body: cleanedBody,
           stimulusId: `idle-${this.tickCount}`
         });
         await this.consolidateAfterAct(agentId);
-        return { action: isDiary ? "idle-diary" : "idle-self", body: parsed.body };
+        return {
+          action: steerSearch ? "idle-search" : isDiary ? "idle-diary" : "idle-self",
+          body: parsed.body
+        };
       }
       if (parsed.act === "dm") {
         const to = parsed.to;
@@ -644,7 +761,10 @@ var SocietySchedulerService = class extends Service2 {
           roomId: room.id
         });
         await this.consolidateAfterAct(agentId);
-        return { action: "idle-room", body: parts.join(" ||| ") };
+        return {
+          action: steerSearch ? "idle-search" : "idle-room",
+          body: parts.join(" ||| ")
+        };
       }
     } finally {
       this.inFlight.delete(agentId);
@@ -653,7 +773,7 @@ var SocietySchedulerService = class extends Service2 {
   async handleWake(payload) {
     const { agentId, message } = payload;
     if (!this.agentAllowed(agentId)) return;
-    if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return;
+    if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return;
     if (this.handledMessageIds.has(message.id)) return;
     if (this.inFlight.has(agentId)) return;
     if (this.lastReplyAgentId === agentId) {
@@ -673,12 +793,12 @@ var SocietySchedulerService = class extends Service2 {
       await new Promise((r) => setTimeout(r, 40));
     }
     if (this.inFlight.has(agentId)) return;
-    if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return;
+    if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return;
     const sinceLast = Date.now() - this.lastExchangeAt;
     if (this.lastExchangeAt > 0 && sinceLast < this.cooldownMs) {
       await new Promise((r) => setTimeout(r, this.cooldownMs - sinceLast));
     }
-    if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return;
+    if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return;
     if (this.freeParallelSlots() <= 0) return;
     this.handledMessageIds.add(message.id);
     this.inFlight.add(agentId);
@@ -712,7 +832,7 @@ var SocietySchedulerService = class extends Service2 {
         });
         return;
       }
-      if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return;
+      if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return;
       this.exchangeCount += 1;
       this.lastReplyAgentId = agentId;
       this.lastExchangeAt = Date.now();

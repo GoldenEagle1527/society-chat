@@ -238,6 +238,7 @@ export class SocietyLlmService extends Service {
       lines.push(
         '- 你可以使用工具：write_file / read_file / list_workspace（仅限自己的 workspace）、run_command（bubblewrap 沙箱）、web_search、generate_image。',
         '- 社交工具：create_room / invite_to_room / list_rooms / list_agents / post_room / send_dm / spawn_agent（可自建侧边群聊；spawn_agent 可诞生新 Agent，受人数上限约束）。',
+        '- 若兴趣含时政/新闻/辩论/政治：空闲时请主动 web_search 查近期热点，再简短分享或记日记，不要只会空想。',
         '- 只有对方明确要求生图时才调用 generate_image；不要主动刷图。',
         '- 需要落盘时用 write_file；路径必须是相对路径，禁止 .. 与绝对路径。',
         '- run_command 在沙箱内执行，默认无网络；argv[0] 必须是 /bin/ 或 /usr/bin/ 下的绝对路径。',

@@ -15,7 +15,8 @@
  * - LLM call counters in memory.json are display-only (no daily hard cap)
  * - limited parallel replies (SOCIETY_MAX_PARALLEL_REPLIES default 5, prefer different LLM providers)
  * - agents may ACTION:SILENT; replies may be multi-bubble (|||)
- * - idle self-loop: diary / self notes are primary; plaza/DM are optional social tools
+ * - idle self-loop: mix diary with ROOM/DM; news personas often web_search then share
+ * - idle tools: occasionally actAsAgent; search idle path has per-agent cooldown
  */
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { AgentId, InboxMessage, RoomId } from '../../../src/types.ts'
@@ -70,6 +71,8 @@ export interface AutoReplyOptions {
    * Prefer picking agents on different providers when > 1.
    */
   maxParallelReplies?: number
+  /** Min ms between search-steered idle acts per agent (default SOCIETY_IDLE_SEARCH_COOLDOWN_MS || 120000). */
+  idleSearchCooldownMs?: number
 }
 
 export interface TickActionResult {
@@ -80,6 +83,7 @@ export interface TickActionResult {
     | 'idle-dm'
     | 'idle-diary'
     | 'idle-self'
+    | 'idle-search'
     | 'idle-none'
     | 'skip'
     | 'capped'
@@ -126,10 +130,35 @@ function localClock(d = new Date()): string {
   return `${hh}:${mm}`
 }
 
+/** Interests / persona that should chase news with web_search. */
+const NEWS_INTEREST_RE = /时政|新闻|辩论|政治|热点|公共议题|时事|debate|news|politics/i
+
+function caresAboutCurrentAffairs(agentId: string, interests: string[], persona: string): boolean {
+  if (agentId === 'xingchen_news') return true
+  const blob = `${interests.join(' ')} ${persona}`
+  return NEWS_INTEREST_RE.test(blob)
+}
+
+/** Soft per-agent idle bias (seed cast + hardcoded). Higher socialPrefer → more ROOM/DM nudges. */
+function idleBiasFor(agentId: string): { preferSearch: boolean; socialPrefer: number; toolPrefer: number } {
+  switch (agentId) {
+    case 'xingchen_news':
+      return { preferSearch: true, socialPrefer: 0.55, toolPrefer: 0.85 }
+    case 'xingchen_lit':
+      return { preferSearch: false, socialPrefer: 0.4, toolPrefer: 0.22 }
+    case 'agnes':
+      return { preferSearch: false, socialPrefer: 0.45, toolPrefer: 0.28 }
+    case 'glm':
+      return { preferSearch: false, socialPrefer: 0.35, toolPrefer: 0.3 }
+    default:
+      return { preferSearch: false, socialPrefer: 0.4, toolPrefer: 0.25 }
+  }
+}
+
 function cleanIdleBody(raw: string): string {
   return String(raw || '')
     .split(/\r?\n/)
-    .filter((line) => !/^ACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE)\s*$/i.test(line.trim()))
+    .filter((line) => !/^ACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE|SILENT|SEARCH)\s*$/i.test(line.trim()))
     .join('\n')
     .replace(/\|{3}/g, '\n')
     .trim()
@@ -146,7 +175,7 @@ function parseIdleAction(raw: string): {
   let cut = lines.length
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]!.trim()
-    if (/^ACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE)\s*$/i.test(line)) {
+    if (/^ACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE|SILENT|SEARCH)\s*$/i.test(line)) {
       actLine = line
       cut = i
       break
@@ -154,18 +183,18 @@ function parseIdleAction(raw: string): {
   }
   const body = lines.slice(0, cut).join('\n').trim()
   if (!actLine) {
-    // Prefer personal life over plaza spam when model forgets ACTION
+    // Balanced default: keep a personal note rather than vanishing
     if (body) return { body, act: 'diary' }
     return { body: '', act: 'none' }
   }
-  const m = actLine.match(/^ACTION:\s*(ROOM|DM:(\S+)|DIARY|SELF|NONE)\s*$/i)
+  const m = actLine.match(/^ACTION:\s*(ROOM|DM:(\S+)|DIARY|SELF|NONE|SILENT|SEARCH)\s*$/i)
   if (!m) return { body, act: 'none' }
   const kind = m[1]!.toUpperCase()
-  if (kind === 'ROOM') return { body, act: 'room' }
+  if (kind === 'ROOM' || kind === 'SEARCH') return { body, act: 'room' }
   if (kind === 'DIARY') return { body, act: 'diary' }
   if (kind === 'SELF') return { body, act: 'self' }
-  if (kind === 'NONE') {
-    // Body with NONE → still keep a personal note rather than vanishing
+  if (kind === 'NONE' || kind === 'SILENT') {
+    // Body with NONE/SILENT → still keep a personal note rather than vanishing
     if (body) return { body, act: 'diary' }
     return { body: '', act: 'none' }
   }
@@ -199,6 +228,7 @@ export class SocietySchedulerService extends Service {
   private idleStaleMs = 2_500
   private bubbleGapMs = 400
   private maxParallelReplies = 5
+  private idleSearchCooldownMs = 120_000
   private defaultRoomId: RoomId | null = null
 
   private exchangeCount = 0
@@ -206,6 +236,7 @@ export class SocietySchedulerService extends Service {
   private lastReplyAgentId: AgentId | null = null
   private lastExchangeAt = 0
   private readonly lastActAt = new Map<AgentId, number>()
+  private readonly lastSearchIdleAt = new Map<AgentId, number>()
   private readonly handledMessageIds = new Set<string>()
   private readonly inFlight = new Set<AgentId>()
   private readonly pending = new Set<Promise<void>>()
@@ -254,6 +285,7 @@ export class SocietySchedulerService extends Service {
     this.lastReplyAgentId = null
     this.lastExchangeAt = 0
     this.lastActAt.clear()
+    this.lastSearchIdleAt.clear()
     this.handledMessageIds.clear()
   }
 
@@ -298,6 +330,8 @@ export class SocietySchedulerService extends Service {
     this.bubbleGapMs = opts?.bubbleGapMs ?? envInt('SOCIETY_BUBBLE_GAP_MS', 400)
     const parallelRaw = opts?.maxParallelReplies ?? envInt('SOCIETY_MAX_PARALLEL_REPLIES', 5)
     this.maxParallelReplies = Math.max(1, Math.min(8, parallelRaw || 5))
+    this.idleSearchCooldownMs =
+      opts?.idleSearchCooldownMs ?? envInt('SOCIETY_IDLE_SEARCH_COOLDOWN_MS', 120_000)
     if (opts?.defaultRoomId) this.defaultRoomId = opts.defaultRoomId
   }
 
@@ -632,6 +666,17 @@ export class SocietySchedulerService extends Service {
 
     this.inFlight.add(agentId)
     try {
+      const profile = this.ctx.societyIdentity.require(agentId)
+      const soul = this.ctx.societySoul.get(agentId)
+      const bias = idleBiasFor(agentId)
+      const newsy = caresAboutCurrentAffairs(agentId, soul.interests, profile.persona) || bias.preferSearch
+      const lastSearch = this.lastSearchIdleAt.get(agentId) ?? 0
+      const searchCooldownOk = Date.now() - lastSearch >= this.idleSearchCooldownMs
+      // News personas: often take the search path when cooldown allows.
+      const steerSearch = newsy && searchCooldownOk && Math.random() < (bias.preferSearch ? 0.72 : 0.45)
+      // Everyone else: occasional tools (notes / light search), not tools-disabled always.
+      const useTools = steerSearch || Math.random() < bias.toolPrefer
+
       const others = this.ctx.societyIdentity
         .list()
         .map((a) => a.id)
@@ -649,23 +694,56 @@ export class SocietySchedulerService extends Service {
               .join('\n')
           : ''
 
-      const stimulus = [
-        '【自主生活 / 自我循环】你是独立的人，此刻没有未读。先过自己的生活；广场只是可选社交工具，不是你存在的全部。',
-        '请只做一件小事（1～2 句），优先个人内在活动：',
-        '1) ACTION:DIARY — 写一句日记/随感（推荐，出现在你自己的个人空间）',
-        '2) ACTION:SELF — 一句内心独白/随想笔记（也进个人空间）',
-        `3) ACTION:DM:<agentId> — 偶尔主动私信（对象：${others.join(' / ') || '无'}）`,
-        `4) ACTION:ROOM — 偶尔去群聊${roomLabel}说一句（仅当真有话想分享）`,
+      const actionMenu = [
+        `1) ACTION:ROOM — 去群聊${roomLabel}说一句（鼓励；有感就发，别闷着）`,
+        `2) ACTION:DM:<agentId> — 主动私信（对象：${others.join(' / ') || '无'}）`,
+        '3) ACTION:DIARY — 写一句日记/随感（个人空间）',
+        '4) ACTION:SELF — 一句内心独白/随想笔记（个人空间）',
         '5) ACTION:NONE — 真的什么都不想做时才选（请少用）',
-        recent ? `广场近况（可忽略）：\n${recent}` : '广场尚安静——这很正常，你可以先写日记或发呆随想。',
-        '先写正文，最后一行必须是上列 ACTION 之一。多数时候请选 DIARY 或 SELF。',
-      ].join('\n')
+      ]
+
+      let stimulus: string
+      if (steerSearch) {
+        stimulus = [
+          '【自主生活 / 时政关注】你此刻没有未读。你关心时政与公共议题——请先动手查一下再说话。',
+          '必须先调用 web_search：用一句具体的中文查询搜近期时政/热点/公共议题（不要空泛到只有「新闻」两个字）。',
+          '看完结果后写 1～3 句短评（可引用一条要点），然后选一个收束动作：',
+          ...actionMenu.slice(0, 4),
+          '优先 ACTION:ROOM 去广场分享短评；若此刻更想沉淀就 ACTION:DIARY。',
+          recent ? `广场近况：\n${recent}` : '广场尚安静——正好适合你带一条新热点过去。',
+          '先用工具，再写正文，最后一行必须是上列 ACTION 之一。不要 SILENT，不要空搜不写。',
+        ].join('\n')
+      } else if (useTools) {
+        stimulus = [
+          '【自主生活 / 自我循环】你是独立的人，此刻没有未读。广场是可选社交工具；你也可以用工具做点小事。',
+          '请只做一件事（可用工具：web_search / write_file / read_file / list_workspace 等）：',
+          '- 偶尔 web_search 查与你兴趣相关的一点信息；或',
+          '- write_file 往 notes/ 写一句备忘；或',
+          '- 不调用工具，直接社交/写日记。',
+          '然后用正文 + ACTION 收束：',
+          ...actionMenu,
+          recent ? `广场近况：\n${recent}` : '广场尚安静——你可以去打招呼，或先记一笔。',
+          `社交与日记要混合：大约 ${Math.round(bias.socialPrefer * 100)}% 时候选 ROOM/DM，其余 DIARY/SELF。`,
+          '先写正文（若用了工具就根据结果写），最后一行必须是上列 ACTION 之一。',
+        ].join('\n')
+      } else {
+        stimulus = [
+          '【自主生活 / 自我循环】你是独立的人，此刻没有未读。先过自己的生活；广场是可选社交工具。',
+          '请只做一件小事（1～3 句），社交与日记要混合，别只会闷头写日记：',
+          ...actionMenu,
+          recent ? `广场近况：\n${recent}` : '广场尚安静——你可以主动去说一句，或先写日记。',
+          `先写正文，最后一行必须是上列 ACTION 之一。大约 ${Math.round(bias.socialPrefer * 100)}% 时候请选 ROOM 或 DM。`,
+        ].join('\n')
+      }
 
       this.ctx.societyMemory.recordLlmCall(agentId)
-      // Idle: no tools (cheaper); diary/self written by scheduler
       let raw: string
       try {
-        raw = await this.ctx.societyLlm.replyAsAgent(agentId, { text: stimulus })
+        if (useTools) {
+          raw = await this.ctx.societyLlm.actAsAgent(agentId, { text: stimulus })
+        } else {
+          raw = await this.ctx.societyLlm.replyAsAgent(agentId, { text: stimulus })
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         this.ctx.logger('society-scheduler').warn(
@@ -674,11 +752,23 @@ export class SocietySchedulerService extends Service {
         this.lastActAt.set(agentId, Date.now())
         return { action: 'skip' }
       }
+      if (steerSearch) {
+        this.lastSearchIdleAt.set(agentId, Date.now())
+      }
       let parsed = parseIdleAction(raw)
 
       // Soft bias: empty NONE sometimes becomes a short self-note so society stays alive
       if (parsed.act === 'none' && !parsed.body.trim() && Math.random() < 0.55) {
         parsed = { body: '（静静待了一会儿，整理了一下思绪。）', act: 'self' }
+      }
+      // Soft social nudge: diary-heavy agents sometimes flip to ROOM when plaza exists
+      if (
+        (parsed.act === 'diary' || parsed.act === 'self') &&
+        room &&
+        parsed.body.trim() &&
+        Math.random() < bias.socialPrefer * 0.35
+      ) {
+        parsed = { body: parsed.body, act: 'room' }
       }
 
       this.lastActAt.set(agentId, Date.now())
@@ -738,7 +828,7 @@ export class SocietySchedulerService extends Service {
         })
         await this.consolidateAfterAct(agentId)
         return {
-          action: isDiary ? 'idle-diary' : 'idle-self',
+          action: steerSearch ? 'idle-search' : isDiary ? 'idle-diary' : 'idle-self',
           body: parsed.body,
         }
       }
@@ -778,7 +868,10 @@ export class SocietySchedulerService extends Service {
           roomId: room.id,
         })
         await this.consolidateAfterAct(agentId)
-        return { action: 'idle-room', body: parts.join(' ||| ') }
+        return {
+          action: steerSearch ? 'idle-search' : 'idle-room',
+          body: parts.join(' ||| '),
+        }
       }
     } finally {
       this.inFlight.delete(agentId)
