@@ -411,7 +411,42 @@ button { cursor: pointer; border: none; background: none; }
   font-size: 11px;
   color: rgba(255,255,255,0.45);
 }
-.tg-row.out .tg-bubble .meta { color: rgba(255,255,255,0.55); }
+
+.tg-msg-wrap {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  max-width: 100%;
+  min-width: 0;
+}
+.tg-row.in .tg-msg-wrap { flex-direction: row; }
+.tg-row.out .tg-msg-wrap { flex-direction: row-reverse; }
+.tg-row.system .tg-msg-wrap {
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.tg-msg-time {
+  flex-shrink: 0;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--text-meta);
+  opacity: 0;
+  transform: translateY(1px);
+  transition: opacity 0.12s ease;
+  pointer-events: none;
+  user-select: none;
+  white-space: nowrap;
+  padding-bottom: 4px;
+}
+.tg-row:hover .tg-msg-time,
+.tg-row:focus-within .tg-msg-time {
+  opacity: 1;
+}
+.tg-row.system .tg-msg-time {
+  padding-bottom: 0;
+}
 .tg-kind-tag {
   font-size: 10px;
   text-transform: uppercase;

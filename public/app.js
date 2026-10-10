@@ -231,9 +231,14 @@
         html += `<div class="tg-day">${esc(dayLabel(m.createdAt))}</div>`;
       }
       if (isSystemish(m) && chat.kind === 'self') {
-        html += `<div class="tg-row system"><div class="tg-bubble">${esc(m.body)}
-          <div class="meta"><span class="tg-kind-tag">${esc(m.kind || 'system')}</span><span>${esc(fmtClock(m.createdAt))}</span></div>
-        </div></div>`;
+        html += `<div class="tg-row system">
+          <div class="tg-msg-wrap">
+            <div class="tg-bubble">${esc(m.body)}
+              <div class="meta"><span class="tg-kind-tag">${esc(m.kind || 'system')}</span></div>
+            </div>
+            <time class="tg-msg-time" datetime="${esc(m.createdAt || '')}">${esc(fmtClock(m.createdAt))}</time>
+          </div>
+        </div>`;
         continue;
       }
       const out = isOutgoing(m.from);
@@ -248,8 +253,9 @@
               (agentById(m.from)?.initials) || String(m.fromName || m.from).slice(0, 2).toUpperCase(),
             )}</span>`
           : '';
-      html += `<div class="tg-row ${rowClass}">${avatarHtml}<div class="tg-bubble">${nameHtml}${esc(m.body)}
-        <div class="meta"><span>${esc(fmtClock(m.createdAt))}</span></div>
+      html += `<div class="tg-row ${rowClass}">${avatarHtml}<div class="tg-msg-wrap">
+        <div class="tg-bubble">${nameHtml}${esc(m.body)}</div>
+        <time class="tg-msg-time" datetime="${esc(m.createdAt || '')}">${esc(fmtClock(m.createdAt))}</time>
       </div></div>`;
     }
     if (!msgs.length) {
