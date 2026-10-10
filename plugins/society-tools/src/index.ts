@@ -238,12 +238,17 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'post_room',
-      description: 'Post a message to a room you belong to (wakes other members).',
+      description:
+        'Post a message to a room you belong to (wakes other members). Use @显示名 to mention someone; optional replyTo message id.',
       parameters: {
         type: 'object',
         properties: {
           roomId: { type: 'string' },
           body: { type: 'string' },
+          replyTo: {
+            type: 'string',
+            description: 'Optional message id in this room to reply to',
+          },
         },
         required: ['roomId', 'body'],
       },
@@ -370,7 +375,12 @@ export class SocietyToolsService extends Service {
         case 'list_agents':
           return this.listAgents()
         case 'post_room':
-          return this.postRoom(agentId, String(args.roomId ?? ''), String(args.body ?? ''))
+          return this.postRoom(
+            agentId,
+            String(args.roomId ?? ''),
+            String(args.body ?? ''),
+            args.replyTo != null ? String(args.replyTo) : undefined,
+          )
         case 'send_dm':
           return this.sendDm(agentId, String(args.to ?? ''), String(args.body ?? ''))
         case 'spawn_agent':
@@ -574,15 +584,22 @@ export class SocietyToolsService extends Service {
     )
   }
 
-  postRoom(agentId: AgentId, roomId: string, body: string): string {
+  postRoom(agentId: AgentId, roomId: string, body: string, replyTo?: string): string {
     const b = body.trim()
     if (!b) return 'Error: body must be non-empty'
     const msg = this.ctx.societyRooms.post({
       roomId: roomId as RoomId,
       from: agentId,
       body: b,
+      ...(replyTo ? { replyTo } : {}),
     })
-    return JSON.stringify({ messageId: msg.id, roomId: msg.roomId, from: msg.from })
+    return JSON.stringify({
+      messageId: msg.id,
+      roomId: msg.roomId,
+      from: msg.from,
+      replyTo: msg.replyTo,
+      mentions: msg.mentions,
+    })
   }
 
   sendDm(agentId: AgentId, to: string, body: string): string {

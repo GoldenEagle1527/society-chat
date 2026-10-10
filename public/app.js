@@ -22,6 +22,11 @@
     sayBtn: document.getElementById('sayBtn'),
     sayStatus: document.getElementById('sayStatus'),
     composer: document.getElementById('composer'),
+    replyBar: document.getElementById('replyBar'),
+    replyBarWho: document.getElementById('replyBarWho'),
+    replyBarSnip: document.getElementById('replyBarSnip'),
+    replyBarCancel: document.getElementById('replyBarCancel'),
+    mentionMenu: document.getElementById('mentionMenu'),
     profileModal: document.getElementById('profileModal'),
     profileBackdrop: document.getElementById('profileBackdrop'),
     profileClose: document.getElementById('profileClose'),
@@ -88,11 +93,159 @@
   let profileAgentId = '';
   let creating = false;
   let birthing = false;
+  /** @type {{ id: string, fromName: string, body: string } | null} */
+  let replyTarget = null;
+  let mentionActive = -1;
+  let mentionQuery = '';
+  let mentionStart = -1;
 
   function esc(s) {
     return String(s ?? '').replace(/[&<>"']/g, (c) =>
       ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c],
     );
+  }
+
+
+  function clipSnip(s, n = 60) {
+    const t = String(s || '').replace(/\s+/g, ' ').trim();
+    if (t.length <= n) return t;
+    return t.slice(0, n - 1) + '…';
+  }
+
+  function findMsgById(id) {
+    if (!id || !state?.messages) return null;
+    return state.messages.find((m) => m.id === id) || null;
+  }
+
+  function setReplyTarget(msg) {
+    if (!msg || !msg.id) {
+      clearReplyTarget();
+      return;
+    }
+    replyTarget = {
+      id: msg.id,
+      fromName: msg.fromName || agentById(msg.from)?.displayName || msg.from || '消息',
+      body: msg.body || '',
+    };
+    renderReplyBar();
+    el.sayText?.focus();
+  }
+
+  function clearReplyTarget() {
+    replyTarget = null;
+    renderReplyBar();
+  }
+
+  function renderReplyBar() {
+    if (!el.replyBar) return;
+    if (!replyTarget) {
+      el.replyBar.classList.add('hidden');
+      return;
+    }
+    el.replyBar.classList.remove('hidden');
+    el.replyBarWho.textContent = replyTarget.fromName;
+    el.replyBarSnip.textContent = clipSnip(replyTarget.body, 80);
+  }
+
+  function mentionCandidates(q) {
+    const agents = state?.agents || [];
+    const qq = String(q || '').toLowerCase();
+    const list = agents
+      .map((a) => ({ id: a.id, displayName: a.displayName || a.id, initials: a.initials, avatarColor: a.avatarColor }))
+      .filter((a) => {
+        if (!qq) return true;
+        return (
+          a.displayName.toLowerCase().includes(qq) ||
+          a.id.toLowerCase().includes(qq)
+        );
+      });
+    // Broadcast tokens
+    const broadcasts = [
+      { id: 'everyone', displayName: '全体', initials: '@', avatarColor: '#64a9dc' },
+      { id: '广场', displayName: '广场', initials: '@', avatarColor: '#64a9dc' },
+    ].filter((b) => !qq || b.displayName.includes(q) || b.id.toLowerCase().includes(qq));
+    return [...broadcasts, ...list].slice(0, 8);
+  }
+
+  function hideMentionMenu() {
+    mentionActive = -1;
+    mentionQuery = '';
+    mentionStart = -1;
+    if (el.mentionMenu) {
+      el.mentionMenu.classList.add('hidden');
+      el.mentionMenu.innerHTML = '';
+    }
+  }
+
+  function showMentionMenu(items) {
+    if (!el.mentionMenu) return;
+    if (!items.length) {
+      hideMentionMenu();
+      return;
+    }
+    el.mentionMenu.innerHTML = items
+      .map(
+        (a, i) =>
+          `<button type="button" class="tg-mention-item${i === mentionActive ? ' active' : ''}" data-idx="${i}" data-name="${esc(a.displayName)}" role="option">
+            <span class="tg-avatar sm" style="background:${esc(a.avatarColor || '#64a9dc')}">${esc(a.initials || a.displayName.slice(0, 1))}</span>
+            <span>${esc(a.displayName)}</span>
+            <span class="id">@${esc(a.id === 'everyone' || a.id === '广场' ? a.displayName : a.id)}</span>
+          </button>`,
+      )
+      .join('');
+    el.mentionMenu.classList.remove('hidden');
+    el.mentionMenu.querySelectorAll('[data-name]').forEach((node) => {
+      node.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        insertMention(node.getAttribute('data-name'));
+      });
+    });
+  }
+
+  function insertMention(displayName) {
+    const ta = el.sayText;
+    if (!ta || mentionStart < 0) return;
+    const val = ta.value || '';
+    const cursor = ta.selectionStart ?? val.length;
+    const before = val.slice(0, mentionStart);
+    const after = val.slice(cursor);
+    const insert = '@' + displayName + ' ';
+    ta.value = before + insert + after;
+    const pos = before.length + insert.length;
+    ta.setSelectionRange(pos, pos);
+    hideMentionMenu();
+    autoSize();
+    ta.focus();
+  }
+
+  function updateMentionFromInput() {
+    const ta = el.sayText;
+    if (!ta || ta.disabled) {
+      hideMentionMenu();
+      return;
+    }
+    const val = ta.value || '';
+    const cursor = ta.selectionStart ?? 0;
+    const upto = val.slice(0, cursor);
+    const m = upto.match(/@([A-Za-z0-9_\-\u4e00-\u9fff]{0,32})$/);
+    if (!m) {
+      hideMentionMenu();
+      return;
+    }
+    mentionStart = cursor - m[0].length;
+    mentionQuery = m[1] || '';
+    mentionActive = 0;
+    showMentionMenu(mentionCandidates(mentionQuery));
+  }
+
+  function renderReplyQuote(m) {
+    if (!m.replyTo) return '';
+    const target = findMsgById(m.replyTo);
+    const who = target
+      ? target.fromName || agentById(target.from)?.displayName || target.from
+      : '消息';
+    const snip = target ? clipSnip(target.body, 90) : '（原消息不在近期历史）';
+    return `<div class="tg-reply-quote" data-jump="${esc(m.replyTo)}" title="查看原消息"><span class="who">${esc(who)}</span><span class="snip">${esc(snip)}</span></div>`;
   }
 
   function fmtTime(iso) {
@@ -474,8 +627,13 @@
               (agentById(m.from)?.initials) || String(m.fromName || m.from).slice(0, 2).toUpperCase(),
             )}</span>`
           : '';
-      html += `<div class="tg-row ${rowClass}">${avatarHtml}<div class="tg-msg-wrap">
-        <div class="tg-bubble">${nameHtml}${esc(m.body)}</div>
+      const quoteHtml = renderReplyQuote(m);
+      const canReply = !!state?.canSay && chat.kind === 'group' && m.kind === 'text';
+      const replyBtn = canReply
+        ? `<div class="tg-bubble-actions"><button type="button" class="tg-reply-btn" data-reply="${esc(m.id)}">回复</button></div>`
+        : '';
+      html += `<div class="tg-row ${rowClass}" data-msg-id="${esc(m.id)}">${avatarHtml}<div class="tg-msg-wrap">
+        <div class="tg-bubble">${nameHtml}${quoteHtml}${esc(m.body)}${replyBtn}</div>
         <time class="tg-msg-time" datetime="${esc(m.createdAt || '')}">${esc(fmtClock(m.createdAt))}</time>
       </div></div>`;
     }
@@ -512,6 +670,26 @@
         }
       });
     });
+    el.messages.querySelectorAll('[data-reply]').forEach((node) => {
+      node.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const id = node.getAttribute('data-reply');
+        const msg = findMsgById(id);
+        if (msg) setReplyTarget(msg);
+      });
+    });
+    el.messages.querySelectorAll('[data-jump]').forEach((node) => {
+      node.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const id = node.getAttribute('data-jump');
+        const row = el.messages.querySelector(`[data-msg-id="${CSS.escape(id)}"]`);
+        if (row) {
+          row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          row.classList.add('flash');
+          setTimeout(() => row.classList.remove('flash'), 800);
+        }
+      });
+    });
   }
 
   function selectChat(chatId) {
@@ -519,6 +697,8 @@
     if (selectedChatId) localStorage.setItem('society.selectedChat', selectedChatId);
     else localStorage.removeItem('society.selectedChat');
     stickBottom = true;
+    clearReplyTarget();
+    hideMentionMenu();
     renderChatList();
     renderMessages();
     if (window.matchMedia('(max-width: 900px)').matches && selectedChatId) {
@@ -987,10 +1167,12 @@
     el.sayBtn.disabled = true;
     el.sayStatus.textContent = '发送中…';
     try {
+      const payload = { chatId: selectedChatId, text, as: 'human' };
+      if (replyTarget?.id) payload.replyTo = replyTarget.id;
       const res = await fetch('/api/say', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chatId: selectedChatId, text, as: 'human' }),
+        body: JSON.stringify(payload),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -998,6 +1180,8 @@
         return;
       }
       el.sayText.value = '';
+      clearReplyTarget();
+      hideMentionMenu();
       autoSize();
       el.sayStatus.textContent =
         data.kind === 'dm'
@@ -1057,13 +1241,44 @@
     renderChatList();
   });
   el.sayBtn.addEventListener('click', sendSay);
-  el.sayText.addEventListener('input', autoSize);
+  el.sayText.addEventListener('input', () => {
+    autoSize();
+    updateMentionFromInput();
+  });
   el.sayText.addEventListener('keydown', (e) => {
+    const menuOpen = el.mentionMenu && !el.mentionMenu.classList.contains('hidden');
+    if (menuOpen) {
+      const items = mentionCandidates(mentionQuery);
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        mentionActive = Math.min(items.length - 1, mentionActive + 1);
+        showMentionMenu(items);
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        mentionActive = Math.max(0, mentionActive - 1);
+        showMentionMenu(items);
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        const pick = items[mentionActive] || items[0];
+        if (pick) insertMention(pick.displayName);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        hideMentionMenu();
+        return;
+      }
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       sendSay();
     }
   });
+  el.replyBarCancel?.addEventListener('click', () => clearReplyTarget());
   el.messages.addEventListener('scroll', () => {
     stickBottom =
       el.messages.scrollHeight - el.messages.scrollTop - el.messages.clientHeight < 80;

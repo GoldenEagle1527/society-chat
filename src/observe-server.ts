@@ -25,6 +25,8 @@ export interface SayRequest {
   toAgentId?: string
   text: string
   as?: 'human'
+  /** Optional reply-to message id (group rooms). */
+  replyTo?: string
 }
 
 export interface SayResult {
@@ -314,6 +316,7 @@ export function createObserveServer(opts: ObserveServerOptions): ObserveServer {
           sendJson(res, 400, { error: 'as must be human' })
           return
         }
+        const replyTo = parsed.replyTo ? String(parsed.replyTo).trim() : undefined
         const result = await opts.onSay({
           chatId: parsed.chatId,
           roomId: parsed.roomId,
@@ -321,6 +324,7 @@ export function createObserveServer(opts: ObserveServerOptions): ObserveServer {
           toAgentId: parsed.toAgentId,
           text,
           as: 'human',
+          ...(replyTo ? { replyTo } : {}),
         })
         sendJson(res, 200, {
           ok: true,
@@ -335,6 +339,8 @@ export function createObserveServer(opts: ObserveServerOptions): ObserveServer {
             fromId: result.message.from,
             body: result.message.body,
             createdAt: result.message.createdAt,
+            replyTo: result.message.replyTo,
+            mentions: result.message.mentions,
           },
         })
       } catch (err) {

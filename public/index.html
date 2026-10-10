@@ -62,8 +62,19 @@
         <div class="tg-messages" id="messages"></div>
 
         <footer class="tg-composer" id="composer">
+          <div class="tg-reply-bar hidden" id="replyBar">
+            <div class="tg-reply-bar-inner">
+              <span class="tg-reply-bar-label">回复</span>
+              <span class="tg-reply-bar-who" id="replyBarWho"></span>
+              <span class="tg-reply-bar-snip" id="replyBarSnip"></span>
+            </div>
+            <button type="button" class="tg-reply-bar-cancel" id="replyBarCancel" title="取消回复" aria-label="取消回复">×</button>
+          </div>
           <div class="tg-composer-inner">
-            <textarea id="sayText" rows="1" maxlength="2000" placeholder="写入消息…" disabled></textarea>
+            <div class="tg-composer-input-wrap">
+              <textarea id="sayText" rows="1" maxlength="2000" placeholder="写入消息… 用 @ 点名" disabled></textarea>
+              <div class="tg-mention-menu hidden" id="mentionMenu" role="listbox"></div>
+            </div>
             <button type="button" class="tg-send" id="sayBtn" disabled title="发送 (Enter)">
               <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z"/></svg>
             </button>

@@ -42,6 +42,10 @@ export interface RoomMessage {
   from: AgentId | 'system' | 'human'
   body: string
   createdAt: string
+  /** When set, this message replies to another message in the same room. */
+  replyTo?: MessageId
+  /** Agent ids @mentioned in the body (plus any explicit list). */
+  mentions?: AgentId[]
 }
 
 export interface Room {
@@ -55,13 +59,21 @@ export interface Room {
 export interface InboxMessage {
   id: MessageId
   to: AgentId
-  from: AgentId | 'system' | 'room'
+  from: AgentId | 'system' | 'room' | 'human'
   kind: 'direct' | 'room' | 'system'
   /** When kind=room, the originating room id. */
   roomId?: RoomId
   body: string
   createdAt: string
   read: boolean
+  /** Room message this mail replies to (copied from RoomMessage.replyTo). */
+  replyTo?: MessageId
+  /** Agents @mentioned on the source room/DM message. */
+  mentions?: AgentId[]
+  /** For kind=room: the RoomMessage.id that spawned this inbox copy. */
+  sourceMessageId?: MessageId
+  /** True when this recipient was specifically @mentioned (or @everyone). */
+  mentioned?: boolean
 }
 
 export interface CreateRoomRequest {
@@ -74,14 +86,21 @@ export interface PostRoomMessageRequest {
   roomId: RoomId
   from: AgentId | 'system' | 'human'
   body: string
+  replyTo?: MessageId
+  /** Optional explicit mentions; merged with body @parse on post. */
+  mentions?: AgentId[]
 }
 
 export interface DeliverMailRequest {
   to: AgentId
-  from: AgentId | 'system' | 'room'
+  from: AgentId | 'system' | 'room' | 'human'
   kind: InboxMessage['kind']
   roomId?: RoomId
   body: string
+  replyTo?: MessageId
+  mentions?: AgentId[]
+  sourceMessageId?: MessageId
+  mentioned?: boolean
 }
 
 /** One interaction fact for society-memory. */

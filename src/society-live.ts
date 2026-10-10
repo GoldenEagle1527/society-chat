@@ -165,6 +165,7 @@ async function main(): Promise<void> {
           roomId: target.id,
           from: HUMAN_SPEAKER_ID,
           body: req.text,
+          ...(req.replyTo ? { replyTo: req.replyTo } : {}),
         })
         console.log(`[you] → ${target.name}: ${req.text}`)
         return {
@@ -286,6 +287,7 @@ async function main(): Promise<void> {
       roomId: target.id,
       from: HUMAN_SPEAKER_ID,
       body: req.text,
+      ...(req.replyTo ? { replyTo: req.replyTo } : {}),
     })
     console.log(`[you] → ${target.name}: ${req.text}`)
     return {

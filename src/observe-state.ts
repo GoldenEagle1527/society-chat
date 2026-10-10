@@ -56,6 +56,8 @@ export interface ObserveMessage {
   from: string
   body: string
   createdAt: string
+  replyTo?: string
+  mentions?: string[]
 }
 
 export interface ObserveSoulLogLine {
@@ -81,6 +83,10 @@ export interface ObserveChatMessage {
   journalClock?: string
   /** Banner title e.g. 日记 2026-10-10 */
   journalTitle?: string
+  /** Reply-to message id in the same chat (group rooms). */
+  replyTo?: string
+  /** @mentioned agent ids. */
+  mentions?: string[]
 }
 
 export interface ObserveChat {
@@ -714,12 +720,18 @@ export function readObserveState(opts?: {
             from?: string
             body?: string
             createdAt?: string
+            replyTo?: string
+            mentions?: string[]
           }
           if (!msg.id || !msg.roomId) continue
           const from = String(msg.from || '')
           const body = String(msg.body || '').slice(0, 500)
           const createdAt = String(msg.createdAt || '')
           const roomId = String(msg.roomId)
+          const replyTo = msg.replyTo ? String(msg.replyTo) : undefined
+          const mentions = Array.isArray(msg.mentions)
+            ? msg.mentions.map(String).filter(Boolean)
+            : undefined
           recentMessages.push({
             id: String(msg.id),
             roomId,
@@ -727,6 +739,8 @@ export function readObserveState(opts?: {
             from,
             body,
             createdAt,
+            ...(replyTo ? { replyTo } : {}),
+            ...(mentions?.length ? { mentions } : {}),
           })
           chatMessages.push({
             id: String(msg.id),
@@ -736,6 +750,8 @@ export function readObserveState(opts?: {
             body,
             createdAt,
             kind: 'text',
+            ...(replyTo ? { replyTo } : {}),
+            ...(mentions?.length ? { mentions } : {}),
           })
         } catch {
           /* skip */

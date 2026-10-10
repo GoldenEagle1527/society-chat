@@ -10,7 +10,7 @@
  * Turns: optional silence + multi-bubble (||| / JSON).
  */
 import { Context, Service } from '@deepseek-ai/cordis'
-import type { AgentId, InboxMessage } from '../../../src/types.ts'
+import type { AgentId, InboxMessage, RoomMessage } from '../../../src/types.ts'
 import {
   normalizeProviderId,
   providerModelLabel,
@@ -34,6 +34,8 @@ export interface ReplyStimulus {
   text?: string
   /** Optional short room name for prompt context. */
   roomName?: string
+  /** Recent room timeline (oldest→newest), injected by LLM service if omitted. */
+  roomRecent?: RoomMessage[]
 }
 
 export interface ChatMessage {
@@ -196,7 +198,7 @@ function splitBubbles(body: string): string[] {
 }
 
 export class SocietyLlmService extends Service {
-  static inject = ['societyIdentity', 'societyMemory', 'societySoul', 'societyTools']
+  static inject = ['societyIdentity', 'societyMemory', 'societySoul', 'societyTools', 'societyRooms']
 
   constructor(ctx: Context) {
     super(ctx, 'societyLlm')
@@ -229,10 +231,11 @@ export class SocietyLlmService extends Service {
       '- 始终保持上述人设、灵魂状态与记忆，用中文简短说话。',
       '- 不要加「Alice:」之类前缀，不要解释你是 AI 或模型。',
       '- 不要输出思考过程或 reasoning。',
-      '- 收到消息后先判断要不要开口：若消息在点名你、问候你、问你问题、或私信给你，应当回复，不要 SILENT。',
-      '- 群聊里别人互相对话、话题与你无关、或已有充分回应时，可只输出一行 ACTION:SILENT（或 JSON {"reply":false}），不要抢着刷屏。',
+      '- 收到消息后先判断要不要开口：若消息 @点名你、回复你的话、问候你、问你问题、或私信给你，应当回复，不要 SILENT。',
+      '- 群聊里别人互相对话、话题与你无关、刺激已被更新的话题盖过且你未被 @，可只输出一行 ACTION:SILENT（或 JSON {"reply":false}），不要抢着刷屏。',
+      '- 点名某人时在正文里写 @显示名（例如 @阿宁）；回复某条时系统会自动挂 replyTo，你只需对准说话对象。',
       '- 若要回复：可把长话拆成 2～4 条短气泡，用 ||| 分隔；或输出 JSON {"reply":true,"bubbles":["第一句","第二句"]}；也可在最后一行写 ACTION:REPLY。',
-      '- 单条气泡尽量一两句；整轮最多约 4 条气泡。',
+      '- 单条气泡尽量一两句；整轮最多约 4 条气泡。不要扮演别人发言。',
     ]
     if (withTools) {
       lines.push(
@@ -252,20 +255,49 @@ export class SocietyLlmService extends Service {
     const agent = this.ctx.societyIdentity.require(agentId)
     const msg = stimulus.message
     const decideHint =
-      '先决定要不要回：若对方在问候/点名/问你，必须回复；仅当与你无关或无需插话时才输出 ACTION:SILENT。要回则用短气泡（可用 ||| 拆分）。'
+      '先决定要不要回：若对方 @你 / 回复你 / 问候或问你，必须回复；若刺激已被更新话题盖过且你未被点名，输出 ACTION:SILENT。要回则用短气泡（可用 |||；点名别人用 @显示名）。'
     if (msg) {
       if (msg.kind === 'room' && msg.roomId) {
         const roomLabel = stimulus.roomName ? `「${stimulus.roomName}」` : ''
+        const recent =
+          stimulus.roomRecent ??
+          this.ctx.societyRooms.historyOf(msg.roomId).slice(-8)
+        const nameOf = (id: string) => this.ctx.societyIdentity.displayNameOf(id)
+        const timeline = recent
+          .map((m) => {
+            const mark = m.id === msg.sourceMessageId ? ' ←【你正在回应的这条】' : ''
+            const reply =
+              m.replyTo
+                ? ` (回复 ${recent.find((x) => x.id === m.replyTo)?.from ? nameOf(recent.find((x) => x.id === m.replyTo)!.from) : m.replyTo.slice(0, 8)})`
+                : ''
+            const at =
+              m.mentions?.length
+                ? ` [@${m.mentions.map(nameOf).join(' @')}]`
+                : ''
+            return `- [${m.id.slice(0, 8)}] ${nameOf(m.from)}${reply}${at}: ${m.body}${mark}`
+          })
+          .join('\n')
+        const mentioned =
+          msg.mentioned || msg.mentions?.includes(agentId)
+            ? '是，这条消息点名了你。'
+            : '否，你未被明确 @。'
+        const replyTarget = msg.replyTo
+          ? `该消息本身在回复另一条（id=${msg.replyTo.slice(0, 8)}）。`
+          : ''
         return [
           `你在群聊${roomLabel}中收到一条消息。`,
           `原始投递：${msg.body}`,
+          `是否点名你：${mentioned} ${replyTarget}`.trim(),
+          '广场最近消息（旧→新）：',
+          timeline || '（暂无历史）',
           decideHint,
-          `若开口，请以 ${agent.displayName} 的身份说话。`,
+          `若开口，请以 ${agent.displayName} 的身份说话，对准正确的人；可用 @显示名。系统会自动把你的回复挂到刺激消息上。`,
         ].join('\n')
       }
       if (msg.kind === 'direct') {
+        const fromLabel = this.ctx.societyIdentity.displayNameOf(String(msg.from))
         return [
-          `你收到来自 ${msg.from} 的私信（私信默认应回复，除非是骚扰/无意义刷屏）：`,
+          `你收到来自 ${fromLabel}（${msg.from}）的私信（私信默认应回复，除非是骚扰/无意义刷屏）：`,
           msg.body,
           '用短气泡回复；长话可用 ||| 拆分。一般不要 SILENT。',
           `请以 ${agent.displayName} 的身份说话。`,
@@ -477,7 +509,7 @@ export class SocietyLlmService extends Service {
 }
 
 export const name = 'society-llm'
-export const inject = ['societyIdentity', 'societyMemory', 'societySoul', 'societyTools']
+export const inject = ['societyIdentity', 'societyMemory', 'societySoul', 'societyTools', 'societyRooms']
 
 export function apply(ctx: Context) {
   ctx.plugin(SocietyLlmService)

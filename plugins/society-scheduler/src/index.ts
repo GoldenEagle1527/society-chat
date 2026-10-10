@@ -9,11 +9,14 @@
  * Guards:
  * - global exchange counter (SOCIETY_MAX_EXCHANGES)
  * - onlyAgents allowlist
- * - same agent cannot reply twice in a row (needs other-agent stimulus between)
+ * - same agent cannot reply twice in a row unless @mentioned or replyTo their message
  * - per-agent cooldown + global cooldown
  * - each inbox message id handled at most once
  * - LLM call counters in memory.json are display-only (no daily hard cap)
  * - limited parallel replies (SOCIETY_MAX_PARALLEL_REPLIES default 5, prefer different LLM providers)
+ * - at most MAX_ROOM_REPLIES_PER_TICK room replies per tick (idle/DM still parallel) to reduce same-room blindness
+ * - prefer @mention / replyTo-me unread; skip stale room stimuli (>STALE_NEWER_COUNT newer msgs or age)
+ * - room replies auto-set replyTo to the stimulus room message id
  * - agents may ACTION:SILENT; replies may be multi-bubble (|||)
  * - idle self-loop: mix diary with ROOM/DM; news personas often web_search then share
  * - idle tools: occasionally actAsAgent; search idle path has per-agent cooldown
@@ -115,6 +118,71 @@ function defaultMaxExchanges(): number {
 /** true when a hard exchange cap is hit. maxExchanges<=0 means unlimited. */
 function exchangesCapped(exchangeCount: number, maxExchanges: number): boolean {
   return maxExchanges > 0 && exchangeCount >= maxExchanges
+}
+
+
+/** Max room (plaza) LLM replies started in one runTick — idle/DM still parallel. */
+const MAX_ROOM_REPLIES_PER_TICK = 2
+/** Skip room stimulus if this many newer room messages already exist. */
+const STALE_NEWER_COUNT = 8
+/** Skip room stimulus older than this (ms). Default ~4 min. */
+const STALE_AGE_MS = 4 * 60_000
+
+/** Whether this inbox item @mentions the agent (or @everyone → mentioned flag on their copy). */
+export function mailMentionsAgent(message: InboxMessage, agentId: AgentId): boolean {
+  if (message.mentions?.includes(agentId)) return true
+  // `mentioned` is set only on that recipient's fan-out copy
+  if (message.mentioned && message.to === agentId) return true
+  return false
+}
+
+/** Whether message.replyTo points at a room message authored by agentId. */
+export function mailRepliesToAgent(
+  message: InboxMessage,
+  agentId: AgentId,
+  findMessage: (id: string, roomId?: string) => { from: string } | undefined,
+): boolean {
+  if (!message.replyTo) return false
+  const target = findMessage(message.replyTo, message.roomId)
+  return !!target && target.from === agentId
+}
+
+/** Stale room stimulus: too many newer posts or too old. */
+export function isStaleRoomStimulus(
+  message: InboxMessage,
+  opts: {
+    messagesAfter: (roomId: string, sourceId: string) => number
+    now?: number
+  },
+): boolean {
+  if (message.kind !== 'room' || !message.roomId) return false
+  const sourceId = message.sourceMessageId
+  if (sourceId) {
+    const newer = opts.messagesAfter(message.roomId, sourceId)
+    if (newer >= STALE_NEWER_COUNT) return true
+  }
+  const created = Date.parse(message.createdAt)
+  if (Number.isFinite(created)) {
+    const now = opts.now ?? Date.now()
+    if (now - created > STALE_AGE_MS) return true
+  }
+  return false
+}
+
+/** Score an unread for picking (higher = better). */
+export function scoreUnreadForAgent(
+  message: InboxMessage,
+  agentId: AgentId,
+  findMessage: (id: string, roomId?: string) => { from: string } | undefined,
+): number {
+  let score = 0
+  if (message.kind === 'direct') score += 5_000
+  if (mailMentionsAgent(message, agentId)) score += 20_000
+  if (mailRepliesToAgent(message, agentId, findMessage)) score += 15_000
+  // Prefer fresher mail slightly
+  const created = Date.parse(message.createdAt)
+  if (Number.isFinite(created)) score += Math.min(1_000, created / 1e10)
+  return score
 }
 
 function localDayStamp(d = new Date()): string {
@@ -372,6 +440,8 @@ export class SocietySchedulerService extends Service {
   private readonly handledMessageIds = new Set<string>()
   private readonly inFlight = new Set<AgentId>()
   private readonly pending = new Set<Promise<void>>()
+  /** Room replies started in the current runTick (reset each tick). */
+  private roomRepliesThisTick = 0
 
   constructor(ctx: Context) {
     super(ctx, 'societyScheduler')
@@ -522,13 +592,21 @@ export class SocietySchedulerService extends Service {
     const lastAct = this.lastActAt.get(agentId) ?? 0
     if (lastAct > 0 && now - lastAct < this.agentCooldownMs) return -1
 
-    const unread = this.ctx.societyMailbox.list(agentId, { unreadOnly: true }).length
+    const unreadList = this.ctx.societyMailbox.list(agentId, { unreadOnly: true })
+    const unread = unreadList.length
+    let mentionBoost = 0
+    const findMsg = (id: string, roomId?: string) =>
+      this.ctx.societyRooms.findMessage(id, roomId as RoomId | undefined)
+    for (const m of unreadList) {
+      if (mailMentionsAgent(m, agentId)) mentionBoost = Math.max(mentionBoost, 50_000)
+      else if (mailRepliesToAgent(m, agentId, findMsg)) mentionBoost = Math.max(mentionBoost, 30_000)
+    }
     const staleMs = lastAct === 0 ? 60_000 : Math.max(0, now - lastAct)
     const energy = this.ctx.societySoul.get(agentId).energy
     const explore = Math.random() * 10
 
-    // unread >> stale lastAct >> high energy >> random exploration
-    return unread * 10_000 + staleMs / 100 + energy * 100 + explore
+    // mention/replyTo-me >> unread >> stale lastAct >> high energy >> random exploration
+    return mentionBoost + unread * 10_000 + staleMs / 100 + energy * 100 + explore
   }
 
   private providerOf(agentId: AgentId): string {
@@ -595,6 +673,7 @@ export class SocietySchedulerService extends Service {
    */
   async runTick(): Promise<TickResult> {
     this.tickCount += 1
+    this.roomRepliesThisTick = 0
     const base = {
       tick: this.tickCount,
       exchanges: this.exchangeCount,
@@ -615,7 +694,34 @@ export class SocietySchedulerService extends Service {
       return { ...base, action: 'none' }
     }
 
-    const subResults = await Promise.all(agentIds.map((id) => this.runOneAgentTick(id)))
+    // Split: room-unread agents are capped/serialized-ish; idle+DM stay parallel.
+    // Tradeoff: at most MAX_ROOM_REPLIES_PER_TICK room replies per tick to cut same-room blindness.
+    const roomAgents: AgentId[] = []
+    const otherAgents: AgentId[] = []
+    for (const id of agentIds) {
+      const unread = this.ctx.societyMailbox.list(id, { unreadOnly: true })
+      const hasRoom = unread.some((m) => m.kind === 'room')
+      if (hasRoom) roomAgents.push(id)
+      else otherAgents.push(id)
+    }
+
+    const subResults: TickActionResult[] = []
+    // Room replies: sequential, hard cap
+    for (const id of roomAgents) {
+      if (this.roomRepliesThisTick >= MAX_ROOM_REPLIES_PER_TICK) {
+        // Still allow them to idle if their best unread was skipped as room-capped —
+        // runOneAgentTick will see room unread first; we pass a flag via roomRepliesThisTick.
+        subResults.push(await this.runOneAgentTick(id))
+        continue
+      }
+      subResults.push(await this.runOneAgentTick(id))
+    }
+    // Idle / DM: parallel
+    if (otherAgents.length) {
+      const others = await Promise.all(otherAgents.map((id) => this.runOneAgentTick(id)))
+      subResults.push(...others)
+    }
+
     const primary = subResults.find((r) => r.action !== 'skip' && r.action !== 'none') ?? subResults[0]!
     return {
       ...base,
@@ -637,9 +743,13 @@ export class SocietySchedulerService extends Service {
 
     const unread = this.ctx.societyMailbox.list(agentId, { unreadOnly: true })
     if (unread.length > 0) {
-      const msg = unread[0]!
-      const outcome = await this.processUnread(agentId, msg)
-      return { action: outcome, agentId, provider }
+      const msg = this.pickBestUnread(agentId, unread)
+      if (!msg) {
+        // All room unread deferred by per-tick room cap → fall through to idle if possible
+      } else {
+        const outcome = await this.processUnread(agentId, msg)
+        return { action: outcome, agentId, provider }
+      }
     }
 
     // Idle / self-loop: agents live in their own mind even when plaza is silent.
@@ -654,6 +764,57 @@ export class SocietySchedulerService extends Service {
     return { action: idle.action, agentId, body: idle.body, provider }
   }
 
+  /**
+   * Prefer @mention / replyTo-me / DM; skip stale room mail (mark read, no LLM).
+   * When room-reply slots for this tick are full, defer room mail (return null).
+   */
+  private pickBestUnread(agentId: AgentId, unread: InboxMessage[]): InboxMessage | null {
+    const findMsg = (id: string, roomId?: string) =>
+      this.ctx.societyRooms.findMessage(id, roomId as RoomId | undefined)
+    const after = (roomId: string, sourceId: string) =>
+      this.ctx.societyRooms.messagesAfter(roomId as RoomId, sourceId)
+
+    // Drop / mark-read stale room stimuli first
+    const candidates: InboxMessage[] = []
+    for (const m of unread) {
+      if (this.handledMessageIds.has(m.id)) {
+        this.ctx.societyMailbox.markRead(agentId, m.id)
+        continue
+      }
+      if (
+        m.kind === 'room' &&
+        isStaleRoomStimulus(m, { messagesAfter: after }) &&
+        !mailMentionsAgent(m, agentId) &&
+        !mailRepliesToAgent(m, agentId, findMsg)
+      ) {
+        this.ctx.logger('society-scheduler').info(
+          `stale-skip ${agentId} mail=${m.id.slice(0, 8)} (superseded room thread)`,
+        )
+        this.handledMessageIds.add(m.id)
+        this.ctx.societyMailbox.markRead(agentId, m.id)
+        continue
+      }
+      candidates.push(m)
+    }
+    if (candidates.length === 0) return null
+
+    // If room slots exhausted, only allow non-room (or mentioned room) to proceed
+    const roomSlotsFull = this.roomRepliesThisTick >= MAX_ROOM_REPLIES_PER_TICK
+    const usable = candidates.filter((m) => {
+      if (m.kind !== 'room') return true
+      if (!roomSlotsFull) return true
+      // Still allow hard @mention even when capped? Prefer defer — keep plaza orderly.
+      return false
+    })
+    if (usable.length === 0) return null
+
+    usable.sort(
+      (a, b) =>
+        scoreUnreadForAgent(b, agentId, findMsg) - scoreUnreadForAgent(a, agentId, findMsg),
+    )
+    return usable[0]!
+  }
+
   /** Post one-or-more bubbles to a room or DM with a small human-like gap. */
   private async deliverBubbles(opts: {
     agentId: AgentId
@@ -661,8 +822,10 @@ export class SocietySchedulerService extends Service {
     stimulusId: string
     roomId?: RoomId
     dmTo?: AgentId
+    /** Auto-set when responding to a room stimulus. */
+    replyTo?: string
   }): Promise<void> {
-    const { agentId, bubbles, stimulusId, roomId, dmTo } = opts
+    const { agentId, bubbles, stimulusId, roomId, dmTo, replyTo } = opts
     let posted = 0
     for (let i = 0; i < bubbles.length; i++) {
       let body = stripActionMarkup(bubbles[i]!)
@@ -680,7 +843,12 @@ export class SocietySchedulerService extends Service {
       if (posted > 0 && this.bubbleGapMs > 0) await sleep(this.bubbleGapMs)
       posted += 1
       if (roomId) {
-        this.ctx.societyRooms.post({ roomId, from: agentId, body })
+        this.ctx.societyRooms.post({
+          roomId,
+          from: agentId,
+          body,
+          ...(replyTo ? { replyTo } : {}),
+        })
         this.ctx.emit('society/agent-replied', {
           agentId,
           kind: 'room',
@@ -716,18 +884,33 @@ export class SocietySchedulerService extends Service {
       return 'skip'
     }
     if (this.inFlight.has(agentId)) return 'skip'
-    if (this.lastReplyAgentId === agentId) {
+
+    const findMsg = (id: string, roomId?: string) =>
+      this.ctx.societyRooms.findMessage(id, roomId as RoomId | undefined)
+    const mentionOrReply =
+      mailMentionsAgent(message, agentId) || mailRepliesToAgent(message, agentId, findMsg)
+
+    if (this.lastReplyAgentId === agentId && !mentionOrReply) {
       this.ctx.logger('society-scheduler').info(
         `skip ${agentId}: would be consecutive self-reply (need other-agent stimulus)`,
       )
       return 'skip'
     }
+
+    if (message.kind === 'room' && this.roomRepliesThisTick >= MAX_ROOM_REPLIES_PER_TICK) {
+      this.ctx.logger('society-scheduler').info(
+        `defer ${agentId}: room reply cap ${MAX_ROOM_REPLIES_PER_TICK}/tick`,
+      )
+      return 'skip'
+    }
+
     const cool = await this.respectCooldowns(agentId)
     if (!cool) return 'skip'
     if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return 'skip'
 
     this.handledMessageIds.add(message.id)
     this.inFlight.add(agentId)
+    if (message.kind === 'room') this.roomRepliesThisTick += 1
 
     try {
       this.ctx.societyMailbox.markRead(agentId, message.id)
@@ -773,11 +956,13 @@ export class SocietySchedulerService extends Service {
       this.lastExchangeAt = Date.now()
 
       if (message.kind === 'room' && message.roomId) {
+        const replyTo = message.sourceMessageId
         await this.deliverBubbles({
           agentId,
           bubbles: turn.bubbles,
           stimulusId: message.id,
           roomId: message.roomId,
+          replyTo,
         })
       } else if (message.kind === 'direct') {
         const to = message.from
@@ -1073,7 +1258,11 @@ export class SocietySchedulerService extends Service {
     if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return
     if (this.handledMessageIds.has(message.id)) return
     if (this.inFlight.has(agentId)) return
-    if (this.lastReplyAgentId === agentId) {
+    const findMsg = (id: string, roomId?: string) =>
+      this.ctx.societyRooms.findMessage(id, roomId as RoomId | undefined)
+    const mentionOrReply =
+      mailMentionsAgent(message, agentId) || mailRepliesToAgent(message, agentId, findMsg)
+    if (this.lastReplyAgentId === agentId && !mentionOrReply) {
       this.ctx.logger('society-scheduler').info(
         `skip ${agentId}: would be consecutive self-reply (need other-agent stimulus)`,
       )
@@ -1153,6 +1342,7 @@ export class SocietySchedulerService extends Service {
           bubbles: turn.bubbles,
           stimulusId: message.id,
           roomId: message.roomId,
+          replyTo: message.sourceMessageId,
         })
       } else if (message.kind === 'direct') {
         const to = message.from

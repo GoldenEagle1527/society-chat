@@ -51,12 +51,18 @@ export class SocietyMailboxService extends Service {
       createdAt: new Date().toISOString(),
       read: false,
     }
+    if (req.replyTo) msg.replyTo = String(req.replyTo)
+    if (Array.isArray(req.mentions) && req.mentions.length) {
+      msg.mentions = req.mentions.map(String)
+    }
+    if (req.sourceMessageId) msg.sourceMessageId = String(req.sourceMessageId)
+    if (req.mentioned) msg.mentioned = true
     box.push(msg)
     this.persist(req.to, box)
     this.ctx.emit('society/mail-delivered', msg)
     this.ctx.emit('society/agent-wake', {
       agentId: req.to,
-      reason: `mail:${msg.kind}`,
+      reason: msg.mentioned ? `mail:${msg.kind}:mention` : `mail:${msg.kind}`,
       message: msg,
     })
     return msg
