@@ -47,7 +47,7 @@ export interface WakeRecord {
 export interface AutoReplyOptions {
   /**
    * Max successful auto-replies in this boot.
-   * Default: Number(process.env.SOCIETY_MAX_EXCHANGES) || 3
+   * Default: SOCIETY_MAX_EXCHANGES (0 = unlimited)
    */
   maxExchanges?: number
   /** If set, only these agents auto-reply. Default: all. */
@@ -93,7 +93,13 @@ function envInt(name: string, fallback: number): number {
 }
 
 function defaultMaxExchanges(): number {
-  return envInt('SOCIETY_MAX_EXCHANGES', 3)
+  // 0 = unlimited
+  return envInt('SOCIETY_MAX_EXCHANGES', 0)
+}
+
+/** true when a hard exchange cap is hit. maxExchanges<=0 means unlimited. */
+function exchangesCapped(exchangeCount: number, maxExchanges: number): boolean {
+  return maxExchanges > 0 && exchangeCount >= maxExchanges
 }
 
 function parseIdleAction(raw: string): {
@@ -148,7 +154,7 @@ export class SocietySchedulerService extends Service {
   private timer: ReturnType<typeof setInterval> | null = null
 
   private autoReply = false
-  private maxExchanges = 3
+  private maxExchanges = 0
   private onlyAgents: Set<AgentId> | null = null
   private cooldownMs = 50
   private agentCooldownMs = 0
@@ -391,7 +397,7 @@ export class SocietySchedulerService extends Service {
       maxExchanges: this.maxExchanges,
     }
 
-    if (this.exchangeCount >= this.maxExchanges) {
+    if (exchangesCapped(this.exchangeCount, this.maxExchanges)) {
       return { ...base, action: 'capped' }
     }
 
@@ -421,7 +427,7 @@ export class SocietySchedulerService extends Service {
   /** Single-agent slice of a tick (unread drain or idle). */
   private async runOneAgentTick(agentId: AgentId): Promise<TickActionResult> {
     const provider = this.providerOf(agentId)
-    if (this.exchangeCount >= this.maxExchanges) {
+    if (exchangesCapped(this.exchangeCount, this.maxExchanges)) {
       return { action: 'capped', agentId, provider }
     }
 
@@ -489,7 +495,7 @@ export class SocietySchedulerService extends Service {
     agentId: AgentId,
     message: InboxMessage,
   ): Promise<'reply' | 'silent' | 'skip'> {
-    if (this.exchangeCount >= this.maxExchanges) return 'skip'
+    if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return 'skip'
     if (this.handledMessageIds.has(message.id)) {
       this.ctx.societyMailbox.markRead(agentId, message.id)
       return 'skip'
@@ -503,7 +509,7 @@ export class SocietySchedulerService extends Service {
     }
     const cool = await this.respectCooldowns(agentId)
     if (!cool) return 'skip'
-    if (this.exchangeCount >= this.maxExchanges) return 'skip'
+    if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return 'skip'
 
     this.handledMessageIds.add(message.id)
     this.inFlight.add(agentId)
@@ -546,7 +552,7 @@ export class SocietySchedulerService extends Service {
         return 'silent'
       }
 
-      if (this.exchangeCount >= this.maxExchanges) return 'skip'
+      if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return 'skip'
       this.exchangeCount += 1
       this.lastReplyAgentId = agentId
       this.lastExchangeAt = Date.now()
@@ -581,7 +587,7 @@ export class SocietySchedulerService extends Service {
   private async runIdleThought(
     agentId: AgentId,
   ): Promise<{ action: TickResult['action']; body?: string }> {
-    if (this.exchangeCount >= this.maxExchanges) return { action: 'capped' }
+    if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return { action: 'capped' }
     if (this.lastReplyAgentId === agentId) {
       // Prefer letting someone else go; soft skip
       return { action: 'skip' }
@@ -641,7 +647,7 @@ export class SocietySchedulerService extends Service {
         return { action: 'idle-none', body: parsed.body }
       }
 
-      if (this.exchangeCount >= this.maxExchanges) return { action: 'capped' }
+      if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return { action: 'capped' }
 
       if (parsed.act === 'diary') {
         const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
@@ -712,7 +718,7 @@ export class SocietySchedulerService extends Service {
     const { agentId, message } = payload
 
     if (!this.agentAllowed(agentId)) return
-    if (this.exchangeCount >= this.maxExchanges) return
+    if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return
     if (this.handledMessageIds.has(message.id)) return
     if (this.inFlight.has(agentId)) return
     if (this.lastReplyAgentId === agentId) {
@@ -734,13 +740,13 @@ export class SocietySchedulerService extends Service {
       await new Promise((r) => setTimeout(r, 40))
     }
     if (this.inFlight.has(agentId)) return
-    if (this.exchangeCount >= this.maxExchanges) return
+    if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return
 
     const sinceLast = Date.now() - this.lastExchangeAt
     if (this.lastExchangeAt > 0 && sinceLast < this.cooldownMs) {
       await new Promise((r) => setTimeout(r, this.cooldownMs - sinceLast))
     }
-    if (this.exchangeCount >= this.maxExchanges) return
+    if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return
     if (this.freeParallelSlots() <= 0) return
 
     this.handledMessageIds.add(message.id)
@@ -784,7 +790,7 @@ export class SocietySchedulerService extends Service {
         return
       }
 
-      if (this.exchangeCount >= this.maxExchanges) return
+      if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return
       this.exchangeCount += 1
       this.lastReplyAgentId = agentId
       this.lastExchangeAt = Date.now()

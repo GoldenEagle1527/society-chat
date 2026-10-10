@@ -76,7 +76,7 @@ async function main(): Promise<void> {
   }
 
   const maxTicks = envInt('SOCIETY_MAX_TICKS', 10_000)
-  const maxExchanges = envInt('SOCIETY_MAX_EXCHANGES', 200)
+  const maxExchanges = envInt('SOCIETY_MAX_EXCHANGES', 0) // 0 = unlimited
   const tickMs = envInt('SOCIETY_TICK_MS', 1_500)
   const cooldownMs = envInt('SOCIETY_COOLDOWN_MS', 600)
   const agentCooldownMs = envInt('SOCIETY_AGENT_COOLDOWN_MS', 400)
@@ -405,7 +405,7 @@ async function main(): Promise<void> {
     onSpawnAgent,
     getSettings: () => readObserveSettings(),
     liveNote: () =>
-      `直播中 · tick=${ticksDone} exchanges=${ctx.societyScheduler.exchangeCountOf()}/${maxExchanges} · 选中会话后发言 · 不暴露密钥`,
+      `直播中 · tick=${ticksDone} exchanges=${ctx.societyScheduler.exchangeCountOf()}/${maxExchanges > 0 ? maxExchanges : "∞"} · 选中会话后发言 · 不暴露密钥`,
   })
   await listenObserveServer(srv)
   console.log(`[live] http://${srv.host}:${srv.port}/`)
@@ -428,7 +428,7 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => onSignal('SIGTERM'))
 
   while (!stopping && (maxTicks === 0 || ticksDone < maxTicks)) {
-    if (ctx.societyScheduler.exchangeCountOf() >= maxExchanges) {
+    if (maxExchanges > 0 && ctx.societyScheduler.exchangeCountOf() >= maxExchanges) {
       console.log(
         '[live] maxExchanges reached — idle UI still up; raise SOCIETY_MAX_EXCHANGES to continue LLM',
       )

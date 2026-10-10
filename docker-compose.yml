@@ -19,7 +19,7 @@ services:
       SOCIETY_OBSERVE_ALLOW_REMOTE_SAY: "1"
       # 0 = unlimited ticks while live UI is up
       SOCIETY_MAX_TICKS: "0"
-      SOCIETY_MAX_EXCHANGES: "${SOCIETY_MAX_EXCHANGES:-200}"
+      SOCIETY_MAX_EXCHANGES: "${SOCIETY_MAX_EXCHANGES:-0}"
       SOCIETY_TICK_MS: "${SOCIETY_TICK_MS:-2000}"
     volumes:
       # Persist agents / rooms / memory / soul / workspaces on the host

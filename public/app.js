@@ -838,7 +838,7 @@
       <div class="tg-settings-card">
         <h3>运行上限</h3>
         <div class="tg-settings-row"><span>并行回复</span><span>${esc(s.maxParallelReplies)}</span></div>
-        <div class="tg-settings-row"><span>最大 exchanges</span><span>${esc(s.maxExchanges)}</span></div>
+        <div class="tg-settings-row"><span>最大 exchanges</span><span>${s.maxExchanges > 0 ? esc(s.maxExchanges) : "无上限"}</span></div>
         <div class="tg-settings-row"><span>每日 LLM 预算</span><span>无上限（免费模型）</span></div>
         <div class="tg-settings-row"><span>Agent 上限</span><span>${esc(s.maxAgents)}</span></div>
         <div class="tg-settings-row"><span>心跳间隔</span><span>${esc(s.tickMs)} ms</span></div>

@@ -51,7 +51,7 @@ export function readObserveSettings(): ObserveSettings {
   const allowRemoteSay = flag === '1' || /^true$/i.test(flag) || /^yes$/i.test(flag)
   return {
     maxParallelReplies: Math.max(1, societyEnvInt('SOCIETY_MAX_PARALLEL_REPLIES', 2) || 1),
-    maxExchanges: societyEnvInt('SOCIETY_MAX_EXCHANGES', 200),
+    maxExchanges: societyEnvInt('SOCIETY_MAX_EXCHANGES', 0),
     dailyLlmBudget: null,
     llmBudgetUnlimited: true,
     maxAgents: societyEnvInt('SOCIETY_MAX_AGENTS', 8),

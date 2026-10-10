@@ -32,7 +32,7 @@ async function main() {
   console.log(`✓ Agnes: base=${cfg.baseUrl} model=${cfg.model} key=set`)
 
   const maxTicks = envInt('SOCIETY_MAX_TICKS', 8)
-  const maxExchanges = envInt('SOCIETY_MAX_EXCHANGES', 6)
+  const maxExchanges = envInt('SOCIETY_MAX_EXCHANGES', 0) // 0 = unlimited
   const tickMs = envInt('SOCIETY_TICK_MS', 1_000)
   const cooldownMs = envInt('SOCIETY_COOLDOWN_MS', 800)
   const agentCooldownMs = envInt('SOCIETY_AGENT_COOLDOWN_MS', 400)
@@ -132,7 +132,7 @@ async function main() {
       stopReason = 'signal'
       break
     }
-    if (ctx.societyScheduler.exchangeCountOf() >= maxExchanges) {
+    if (maxExchanges > 0 && ctx.societyScheduler.exchangeCountOf() >= maxExchanges) {
       stopReason = 'maxExchanges'
       break
     }
