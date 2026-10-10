@@ -335,8 +335,9 @@ export function createObserveServer(opts: ObserveServerOptions): ObserveServer {
           message: {
             id: result.message.id,
             roomId: result.message.roomId,
-            from: speakerLabel(result.message.from),
+            from: result.message.from,
             fromId: result.message.from,
+            fromName: speakerLabel(result.message.from),
             body: result.message.body,
             createdAt: result.message.createdAt,
             replyTo: result.message.replyTo,

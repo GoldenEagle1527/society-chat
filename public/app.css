@@ -376,9 +376,14 @@ button { cursor: pointer; border: none; background: none; }
   align-self: stretch;
   box-sizing: border-box;
 }
-.tg-row.out {
+.tg-row.out,
+.tg-row.mine {
   justify-content: flex-end;
-  flex-direction: row-reverse;
+  flex-direction: row;
+}
+.tg-row.out .tg-msg-wrap,
+.tg-row.mine .tg-msg-wrap {
+  margin-left: auto;
 }
 .tg-row.in {
   justify-content: flex-start;
@@ -404,7 +409,8 @@ button { cursor: pointer; border: none; background: none; }
   font-size: 14.5px;
   max-width: 100%;
 }
-.tg-row.out .tg-bubble {
+.tg-row.out .tg-bubble,
+.tg-row.mine .tg-bubble {
   background: var(--bubble-out);
   border-bottom-right-radius: 4px;
 }
@@ -499,7 +505,8 @@ button { cursor: pointer; border: none; background: none; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.tg-row.out .tg-model-pill {
+.tg-row.out .tg-model-pill,
+.tg-row.mine .tg-model-pill {
   color: rgba(255, 255, 255, 0.65);
   background: rgba(0, 0, 0, 0.14);
   border-color: rgba(0, 0, 0, 0.1);
@@ -526,7 +533,8 @@ button { cursor: pointer; border: none; background: none; }
   flex: 0 1 auto;
 }
 .tg-row.in .tg-msg-wrap { flex-direction: row; }
-.tg-row.out .tg-msg-wrap { flex-direction: row-reverse; }
+.tg-row.out .tg-msg-wrap,
+.tg-row.mine .tg-msg-wrap { flex-direction: row-reverse; }
 .tg-row.system .tg-msg-wrap {
   flex-direction: row;
   align-items: center;
@@ -1013,7 +1021,8 @@ button { cursor: pointer; border: none; background: none; }
   max-width: 100%;
   overflow: hidden;
 }
-.tg-row.out .tg-reply-quote {
+.tg-row.out .tg-reply-quote,
+.tg-row.mine .tg-reply-quote {
   border-left-color: #8fd3ff;
   background: rgba(0, 0, 0, 0.22);
 }

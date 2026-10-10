@@ -409,7 +409,7 @@
   }
 
   function isOutgoing(from) {
-    return from === 'human';
+    return from === 'human' || from === '你';
   }
 
 
@@ -638,7 +638,7 @@
         continue;
       }
       const out = isOutgoing(m.from);
-      const rowClass = out ? 'out' : 'in';
+      const rowClass = out ? 'out mine' : 'in';
       const agent = agentById(m.from);
       const modelLabel = (agent && agent.llmModel) || '';
       const modelTitle = agent?.llmProvider
