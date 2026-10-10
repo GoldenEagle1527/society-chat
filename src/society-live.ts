@@ -447,12 +447,21 @@ async function main(): Promise<void> {
       try {
         const result = await ctx.societyScheduler.runTick()
         ticksDone = result.tick
+        const parallelBits =
+          result.parallel && result.parallel.length > 1
+            ? ` parallel=[${result.parallel
+                .map((p) => `${p.agentId || '?'}:${p.action}`)
+                .join(', ')}]`
+            : ''
+        const line =
+          `[tick ${result.tick}] action=${result.action}` +
+          (result.agentId ? ` agent=${result.agentId}` : '') +
+          parallelBits +
+          ` exchanges=${result.exchanges}/${result.maxExchanges}`
         if (result.action !== 'none' && result.action !== 'skip') {
-          console.log(
-            `[tick ${result.tick}] action=${result.action}` +
-              (result.agentId ? ` agent=${result.agentId}` : '') +
-              ` exchanges=${result.exchanges}/${result.maxExchanges}`,
-          )
+          console.log(line)
+        } else if (result.tick % 15 === 0) {
+          console.log(`${line} (heartbeat)`)
         }
       } catch (err) {
         console.error('[tick error]', err instanceof Error ? err.message : err)

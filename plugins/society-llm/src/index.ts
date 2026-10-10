@@ -19,7 +19,7 @@ import {
   type LlmEndpointConfig,
   type LlmProviderId,
 } from '../../../src/env.ts'
-import { LlmHttpError, withLlmRetries } from '../../../src/llm-http.ts'
+import { LlmHttpError, withLlmRetries, llmTimeoutMs, isAbortLikeError } from '../../../src/llm-http.ts'
 import {
   isClosingToolName,
   type ToolDefinition,
@@ -424,6 +424,7 @@ export class SocietyLlmService extends Service {
         ? [
             '【收束规则】可先用研究工具（如 web_search），但本回合结束前必须调用且仅调用一个收束工具：',
             'speak_in_room（去广场/群聊说话；可省略 roomId） / send_dm / write_diary / write_thought / do_nothing。',
+            '广场冷清或几乎没人说话时，优先 speak_in_room；日记/独白有效，但不要连续多回合只写私密笔记。',
             '禁止输出 ACTION: 行，禁止只回纯文本。日记必须是写给自己的私密话。',
           ].join('\n')
         : [
@@ -535,9 +536,9 @@ export class SocietyLlmService extends Service {
         continue
       }
 
-      this.ctx.logger('society-llm').warn(
-        `closing soft-fail ${agentId}: text-only after nudge (${cleaned.slice(0, 80)})`,
-      )
+      const softMsg = `closing soft-fail ${agentId}: text-only after nudge (${cleaned.slice(0, 80)})`
+      this.ctx.logger('society-llm').warn(softMsg)
+      console.warn(`[society-llm] ${softMsg}`)
       return {
         acted: 'none',
         ok: false,
@@ -561,7 +562,10 @@ export class SocietyLlmService extends Service {
     cfg: LlmEndpointConfig,
     opts: { tools: boolean; toolDefs?: ToolDefinition[]; toolChoice?: 'auto' | 'required' | 'none' },
   ): Promise<{ content: string | null; tool_calls?: OpenAiToolCall[] }> {
-    const log = (msg: string) => this.ctx.logger('society-llm').warn(msg)
+    const log = (msg: string) => {
+      this.ctx.logger('society-llm').warn(msg)
+      console.warn(`[society-llm] ${msg}`)
+    }
     return withLlmRetries(
       `${cfg.provider} chat/completions`,
       () => this.chatCompletionsOnce(messages, cfg, opts),
@@ -587,6 +591,7 @@ export class SocietyLlmService extends Service {
       body.tool_choice = opts.toolChoice ?? 'auto'
     }
 
+    const timeoutMs = llmTimeoutMs()
     let res: Response
     try {
       res = await fetch(url, {
@@ -596,8 +601,16 @@ export class SocietyLlmService extends Service {
           Authorization: `Bearer ${cfg.apiKey}`,
         },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(timeoutMs),
       })
     } catch (err) {
+      if (isAbortLikeError(err)) {
+        throw new LlmHttpError(
+          cfg.provider,
+          408,
+          `${cfg.provider} chat/completions timed out after ${timeoutMs}ms`,
+        )
+      }
       const msg = err instanceof Error ? err.message : String(err)
       throw new LlmHttpError(cfg.provider, 0, `${cfg.provider} network error: ${msg}`)
     }

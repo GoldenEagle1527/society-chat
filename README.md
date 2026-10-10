@@ -334,6 +334,8 @@ npm run society-live
 | `SOCIETY_DAILY_LLM_BUDGET` | （忽略） | **已取消硬上限**；`memory.json` 仍记今日调用次数仅供展示 |
 | `SOCIETY_BUBBLE_GAP_MS` | 400 | 同轮多气泡之间的间隔 |
 | `SOCIETY_LLM_MAX_ATTEMPTS` | 10 | LLM 失败重试次数（429→15s，其它→30s） |
+| `SOCIETY_LLM_TIMEOUT_MS` | 75000 | 单次 chat/completions HTTP 超时；超时后重试再 soft-fail |
+| `SOCIETY_AGENT_TICK_BUDGET_MS` | auto | 单 agent 一拍硬超时（默认 timeout×min(attempts,3)+60s），防 tick 卡死 |
 | `SILICONFLOW_API_KEY` / `BASE_URL` / `MODEL` | Xing4.0-29B | 第三家免费通道 SiliconFlow |
 | `SOCIETY_MAX_PARALLEL_REPLIES` | 5 | 同一 tick 最多并行 LLM 回复数；优先选不同 provider（Agnes+GLM） |
 | `SOCIETY_SEED_LINE` | （内置中文开场） | Alice 开场白 |

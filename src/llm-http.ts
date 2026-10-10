@@ -1,6 +1,8 @@
 /**
- * Shared LLM HTTP helpers: typed errors + retry (no API key logging).
- * 429 → wait 15s; other errors → wait 30s; max 10 attempts.
+ * Shared LLM HTTP helpers: typed errors + retry + timeouts (no API key logging).
+ * Per-attempt AbortSignal timeout: SOCIETY_LLM_TIMEOUT_MS (default 75s) → LlmHttpError 408.
+ * 429 → wait 15s; other errors → wait 30s; max SOCIETY_LLM_MAX_ATTEMPTS (default 10).
+ * agentTickBudgetMs(): hard cap so one hung agent cannot freeze runTick forever.
  */
 import { societyEnvInt } from './env.ts'
 
@@ -22,6 +24,29 @@ export function sleep(ms: number): Promise<void> {
 
 export function llmMaxAttempts(): number {
   return Math.max(1, societyEnvInt('SOCIETY_LLM_MAX_ATTEMPTS', 10) || 10)
+}
+
+/** Per chat/completions HTTP attempt timeout (default 75s). */
+export function llmTimeoutMs(): number {
+  return Math.max(5_000, societyEnvInt('SOCIETY_LLM_TIMEOUT_MS', 75_000) || 75_000)
+}
+
+/**
+ * Hard cap for one agent slice of a tick so a hung LLM cannot freeze society forever.
+ * Default: timeoutMs * min(attempts, 3) + 60s (override with SOCIETY_AGENT_TICK_BUDGET_MS).
+ */
+export function agentTickBudgetMs(): number {
+  const override = societyEnvInt('SOCIETY_AGENT_TICK_BUDGET_MS', 0)
+  if (override > 0) return Math.max(10_000, override)
+  const t = llmTimeoutMs()
+  const attempts = Math.min(llmMaxAttempts(), 3)
+  return t * attempts + 60_000
+}
+
+export function isAbortLikeError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false
+  if (err.name === 'AbortError' || err.name === 'TimeoutError') return true
+  return /aborted|abort|timeout/i.test(err.message)
 }
 
 /** Delay before next attempt given last failure (429 → 15s, else 30s). */

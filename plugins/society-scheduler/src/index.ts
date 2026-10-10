@@ -22,11 +22,14 @@
  * - multi-bubble via ||| inside tool body args
  * - idle: always actClosedTurn; news personas often web_search then speak_in_room
  * - write_diary rejects outbound chat voice server-side
+ * - per-agent tick budget (SOCIETY_AGENT_TICK_BUDGET_MS) so hung LLM cannot freeze runTick
+ * - quiet plaza idle bias strongly prefers speak_in_room over diary
  */
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { AgentId, InboxMessage, RoomId } from '../../../src/types.ts'
 import type { AgentActResult } from '../../society-llm/src/index.ts'
 import { formatBeijingNow } from '../../../src/beijing-time.ts'
+import { agentTickBudgetMs, sleep as sleepMs } from '../../../src/llm-http.ts'
 
 // Re-export voice helpers for offline smokes
 export { looksLikeOutboundChatLine, classifyIdlePrivateBody } from '../../society-tools/src/index.ts'
@@ -216,16 +219,21 @@ function caresAboutCurrentAffairs(agentId: string, interests: string[], persona:
 function idleBiasFor(agentId: string): { preferSearch: boolean; socialPrefer: number; toolPrefer: number } {
   switch (agentId) {
     case 'xingchen_news':
-      return { preferSearch: true, socialPrefer: 0.55, toolPrefer: 0.85 }
+      return { preferSearch: true, socialPrefer: 0.78, toolPrefer: 0.85 }
     case 'xingchen_lit':
-      return { preferSearch: false, socialPrefer: 0.4, toolPrefer: 0.22 }
+      return { preferSearch: false, socialPrefer: 0.62, toolPrefer: 0.22 }
     case 'agnes':
-      return { preferSearch: false, socialPrefer: 0.45, toolPrefer: 0.28 }
+      return { preferSearch: false, socialPrefer: 0.72, toolPrefer: 0.28 }
     case 'glm':
-      return { preferSearch: false, socialPrefer: 0.35, toolPrefer: 0.3 }
+      return { preferSearch: false, socialPrefer: 0.6, toolPrefer: 0.3 }
     default:
-      return { preferSearch: false, socialPrefer: 0.4, toolPrefer: 0.25 }
+      return { preferSearch: false, socialPrefer: 0.65, toolPrefer: 0.25 }
   }
+}
+
+function schedWarn(ctx: Context, msg: string): void {
+  ctx.logger('society-scheduler').warn(msg)
+  console.warn(`[society-scheduler] ${msg}`)
 }
 
 /** @deprecated ACTION text protocol removed — kept as no-op stubs for any stray imports. */
@@ -614,8 +622,46 @@ export class SocietySchedulerService extends Service {
     }
   }
 
-  /** Single-agent slice of a tick (unread drain or idle). */
+  /**
+   * Single-agent slice with a hard time budget.
+   * Hung LLM fetch must not block Promise.all / tickRunning forever.
+   * On timeout we return skip immediately; the inner work may still finish and
+   * clear inFlight in its finally (agent stays busy until then).
+   */
   private async runOneAgentTick(agentId: AgentId): Promise<TickActionResult> {
+    const provider = this.providerOf(agentId)
+    const budget = agentTickBudgetMs()
+    const work = this.runOneAgentTickBody(agentId)
+    const winner = await Promise.race([
+      work.then((r) => ({ tag: 'ok' as const, r })),
+      sleepMs(budget).then(() => ({ tag: 'timeout' as const })),
+    ])
+    if (winner.tag === 'timeout') {
+      this.lastActAt.set(agentId, Date.now())
+      schedWarn(
+        this.ctx,
+        `tick timeout agent=${agentId} provider=${provider} after ${budget}ms — releasing tick (inner may still finish)`,
+      )
+      void work.then(
+        (r) => {
+          console.warn(
+            `[society-scheduler] late finish after timeout agent=${agentId} action=${r.action}`,
+          )
+        },
+        (err) => {
+          const msg = err instanceof Error ? err.message : String(err)
+          console.warn(
+            `[society-scheduler] late error after timeout agent=${agentId}: ${msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')}`,
+          )
+        },
+      )
+      return { action: 'skip', agentId, provider }
+    }
+    return winner.r
+  }
+
+  /** Inner agent tick (unread drain or idle) — awaited with budget in runOneAgentTick. */
+  private async runOneAgentTickBody(agentId: AgentId): Promise<TickActionResult> {
     const provider = this.providerOf(agentId)
     if (exchangesCapped(this.exchangeCount, this.maxExchanges)) {
       return { action: 'capped', agentId, provider }
@@ -841,7 +887,8 @@ export class SocietySchedulerService extends Service {
         )
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        this.ctx.logger('society-scheduler').warn(
+        schedWarn(
+          this.ctx,
           `LLM soft-fail ${agentId} (no post): ${msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')}`,
         )
         this.lastActAt.set(agentId, Date.now())
@@ -928,14 +975,20 @@ export class SocietySchedulerService extends Service {
         this.ctx.societyRooms.listRooms().find((r) => r.name === 'plaza') ||
         this.ctx.societyRooms.listRooms()[0]
       const roomLabel = room ? `「${room.name}」` : '广场'
+      const history = room != null ? this.ctx.societyRooms.historyOf(room.id) : []
       const recent =
-        room != null
-          ? this.ctx.societyRooms
-              .historyOf(room.id)
-              .slice(-4)
-              .map((m) => `${m.from}: ${m.body.slice(0, 60)}`)
-              .join('\n')
-          : ''
+        history
+          .slice(-4)
+          .map((m) => `${m.from}: ${m.body.slice(0, 60)}`)
+          .join('\n')
+      // Quiet plaza: only boot/system or almost empty → strongly prefer speak_in_room
+      const agentChatCount = history.filter(
+        (m) => m.from !== 'system' && m.from !== 'human' && m.from !== 'you',
+      ).length
+      const plazaQuiet = history.length <= 1 || agentChatCount <= 1
+      const socialPct = Math.round(
+        (plazaQuiet ? Math.max(bias.socialPrefer, 0.85) : bias.socialPrefer) * 100,
+      )
 
       // Keep tools default room in sync for speak_in_room
       if (room) this.ctx.societyTools.setDefaultRoom(room.id)
@@ -949,7 +1002,9 @@ export class SocietySchedulerService extends Service {
           formatBeijingNow(),
           '【自主生活 / 时政关注】你此刻没有未读。你关心时政与公共议题——请先动手查一下再说话。',
           '必须先调用 web_search：用一句具体的中文查询搜近期时政/热点/公共议题。',
-          '看完结果后写短评，再调用收束工具：优先 speak_in_room 去广场分享；或 write_diary 沉淀。',
+          plazaQuiet
+            ? '广场几乎没人说话——查完后优先 speak_in_room 把热点带到广场；日记可稍后再写。'
+            : '看完结果后写短评，再调用收束工具：优先 speak_in_room 去广场分享；或 write_diary 沉淀。',
           closingList,
           recent ? `广场近况：\n${recent}` : '广场尚安静——正好适合你带一条新热点过去。',
           `可私信对象：${others.join(' / ') || '无'}；默认群聊${roomLabel}。`,
@@ -958,15 +1013,18 @@ export class SocietySchedulerService extends Service {
       } else {
         stimulus = [
           formatBeijingNow(),
-          '【自主生活 / 自我循环】你是独立的人，此刻没有未读。广场是可选社交工具。',
+          '【自主生活 / 自我循环】你是独立的人，此刻没有未读。',
+          plazaQuiet
+            ? '广场几乎没人说话——本回合优先 speak_in_room 开场或接话；日记/独白可以，但不要连续多回合只写日记。'
+            : '广场是社交工具：有话就说，没话可写日记或静静待着。',
           '可先选用研究工具（web_search / write_file / list_agents 等），然后必须用收束工具结束本回合。',
           closingList,
           'speak_in_room：去群聊说一句（可省略 roomId，默认广场）；body 可用 ||| 拆气泡。',
           `send_dm：主动私信（to 为 agentId：${others.join(' / ') || '无'}）。`,
           'write_diary / write_thought：仅第一人称私密笔记（禁止 @、禁止「xxx在吗」、禁止群聊提问）。',
           'do_nothing：真的什么都不想做时才用（请少用）。',
-          recent ? `广场近况：\n${recent}` : '广场尚安静——你可以去打招呼，或先记一笔。',
-          `社交与日记要混合：大约 ${Math.round(bias.socialPrefer * 100)}% 时候选 speak_in_room/send_dm，其余 diary/thought。`,
+          recent ? `广场近况：\n${recent}` : '广场尚安静——请优先 speak_in_room 打个招呼。',
+          `社交权重约 ${socialPct}%：优先 speak_in_room/send_dm；日记有效但不应占主导。`,
           '禁止输出 ACTION: 行或抄工具菜单当聊天。',
         ].join('\n')
       }
@@ -977,7 +1035,8 @@ export class SocietySchedulerService extends Service {
         result = await this.ctx.societyLlm.actClosedTurn(agentId, { text: stimulus }, 'idle')
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        this.ctx.logger('society-scheduler').warn(
+        schedWarn(
+          this.ctx,
           `idle LLM soft-fail ${agentId}: ${msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')}`,
         )
         this.lastActAt.set(agentId, Date.now())
@@ -987,7 +1046,8 @@ export class SocietySchedulerService extends Service {
       this.lastActAt.set(agentId, Date.now())
 
       if (!result.ok || result.acted === 'none') {
-        this.ctx.logger('society-scheduler').warn(
+        schedWarn(
+          this.ctx,
           `idle soft-fail ${agentId}: no closing tool (${result.detail?.slice(0, 80) || ''})`,
         )
         return { action: 'idle-none', body: '' }
@@ -1084,7 +1144,8 @@ export class SocietySchedulerService extends Service {
         )
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        this.ctx.logger('society-scheduler').warn(
+        schedWarn(
+          this.ctx,
           `LLM soft-fail ${agentId} (no post): ${msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')}`,
         )
         this.lastActAt.set(agentId, Date.now())

@@ -2,7 +2,7 @@
   "name": "society-chat",
   "version": "0.1.0",
   "private": true,
-  "description": "Multi-agent society chat system — Cordis plugins on top of DeepSeek Harness patterns",
+  "description": "Multi-agent society chat system \u2014 Cordis plugins on top of DeepSeek Harness patterns",
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -36,7 +36,8 @@
     "idle-parse-smoke": "tsx src/tool-closing-smoke.ts",
     "mention-reply-smoke": "tsx src/mention-reply-smoke.ts",
     "idle-diary-smoke": "tsx src/idle-diary-smoke.ts",
-    "tool-closing-smoke": "tsx src/tool-closing-smoke.ts"
+    "tool-closing-smoke": "tsx src/tool-closing-smoke.ts",
+    "llm-http-smoke": "tsx src/llm-http-smoke.ts"
   },
   "dependencies": {
     "@deepseek-ai/cordis": "^4.0.4",
