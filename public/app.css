@@ -409,35 +409,64 @@ button { cursor: pointer; border: none; background: none; }
   border-bottom-right-radius: 4px;
 }
 .tg-row.in .tg-bubble { border-bottom-left-radius: 4px; }
-.tg-row.system .tg-bubble {
+.tg-row.system .tg-bubble,
+.tg-row.system .tg-sys-banner {
   flex: 1 1 auto;
   width: 100%;
   max-width: none;
   display: flex;
   align-items: center;
   gap: 8px;
-  background: rgba(28, 39, 51, 0.92);
+  background: rgba(28, 39, 51, 0.88);
   color: var(--text-secondary);
   font-size: 12.5px;
   text-align: left;
-  border-radius: 8px;
-  padding: 7px 12px;
+  border-radius: 10px;
+  padding: 6px 10px 6px 8px;
   white-space: nowrap;
   overflow: hidden;
   box-shadow: none;
-  line-height: 1.35;
+  line-height: 1.3;
+  border: 1px solid rgba(255, 255, 255, 0.04);
 }
-.tg-row.system .tg-bubble > .tg-sys-text {
+.tg-sys-icon {
+  flex-shrink: 0;
+  width: 1.35em;
+  height: 1.35em;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  line-height: 1;
+  filter: saturate(1.05);
+}
+.tg-row.system .tg-bubble > .tg-sys-text,
+.tg-sys-text {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: #8fa3b5;
+  font-size: 12.5px;
+  letter-spacing: 0.01em;
+}
+.tg-sys-kind {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  opacity: 0.9;
 }
 .tg-row.system .tg-bubble .meta {
-  display: inline-flex;
-  flex-shrink: 0;
-  margin: 0;
+  display: none; /* kind is icon pill now */
 }
 .tg-name-row {
   display: flex;
@@ -476,9 +505,7 @@ button { cursor: pointer; border: none; background: none; }
   border-color: rgba(0, 0, 0, 0.1);
 }
 .tg-row.system .tg-bubble .meta {
-  display: inline-flex;
-  margin: 0 0 0 8px;
-  vertical-align: middle;
+  display: none;
 }
 .tg-bubble .meta {
   display: flex;
@@ -531,10 +558,7 @@ button { cursor: pointer; border: none; background: none; }
   flex-shrink: 0;
 }
 .tg-kind-tag {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  opacity: 0.75;
+  display: none; /* replaced by .tg-sys-kind icon pill */
 }
 
 /* ——— Composer ——— */

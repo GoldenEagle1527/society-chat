@@ -181,6 +181,16 @@ function clip(s: string, n: number): string {
   return t.length <= n ? t : t.slice(0, n) + '…'
 }
 
+function shortReason(reason: string): string {
+  const r = String(reason || '').trim()
+  if (!r) return ''
+  if (r.startsWith('room:')) return '群聊'
+  if (r.startsWith('dm-from:')) return `私信·${r.slice('dm-from:'.length)}`
+  if (r === 'seed-from-profile') return '初始化'
+  return clip(r, 28)
+}
+
+
 function dmChatId(a: string, b: string): string {
   const [x, y] = [a, b].sort()
   return `dm:${x}:${y}`
@@ -387,10 +397,10 @@ export function readObserveState(opts?: {
                 from: 'system',
                 fromName: '灵魂',
                 body:
-                  `✦ 性格微调` +
-                  (entry.after?.mood ? ` · 心情 ${entry.after.mood}` : '') +
-                  (entry.reason ? `\n原因：${entry.reason}` : '') +
-                  (deltaBits ? `\n${deltaBits}` : ''),
+                  `性格微调` +
+                  (entry.after?.mood ? ` · 心情${entry.after.mood}` : '') +
+                  (entry.reason ? ` · ${shortReason(entry.reason)}` : '') +
+                  (deltaBits ? ` · ${deltaBits}` : ''),
                 createdAt: entry.ts || new Date(0).toISOString(),
                 kind: 'soul',
               })
@@ -435,7 +445,7 @@ export function readObserveState(opts?: {
               chatId: selfId,
               from: kind === 'tool' ? 'system' : from === id ? id : from,
               fromName: kind === 'tool' ? '工具' : nameById.get(from) || from,
-              body: kind === 'tool' ? `🛠 ${body}` : body,
+              body: kind === 'tool' ? body : body,
               createdAt: ts,
               kind: kind === 'tool' ? 'tool' : kind === 'diary' ? 'diary' : 'system',
             })
@@ -456,7 +466,9 @@ export function readObserveState(opts?: {
           chatId: selfId,
           from: 'system',
           fromName: '工作区',
-          body: `📄 ${f.rel}` + (preview ? `\n${preview}` : ''),
+          body:
+            `文件 ${f.rel}` +
+            (preview ? ` · ${clip(preview.replace(/\s+/g, ' '), 72)}` : ''),
           createdAt: f.mtime,
           kind: 'tool',
         })

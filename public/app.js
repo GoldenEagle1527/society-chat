@@ -222,8 +222,117 @@
     return from === 'human';
   }
 
+
+  const MOOD_ICONS = {
+    友善: '😊',
+    好奇: '🤔',
+    警惕: '🤨',
+    平静: '😌',
+    开心: '😄',
+    兴奋: '🤩',
+    疲惫: '😮‍💨',
+    焦虑: '😰',
+    专注: '🧐',
+    放松: '😎',
+  };
+
+  const KIND_ICONS = {
+    soul: '✨',
+    tool: '🔧',
+    diary: '📔',
+    system: 'ℹ️',
+    room: '👥',
+    memory: '🧠',
+  };
+
+  function moodIcon(mood) {
+    const m = String(mood || '').trim();
+    if (!m) return '🙂';
+    if (MOOD_ICONS[m]) return MOOD_ICONS[m];
+    for (const [k, v] of Object.entries(MOOD_ICONS)) {
+      if (m.includes(k)) return v;
+    }
+    return '🙂';
+  }
+
+  /** Parse system/soul/tool/diary bodies into a compact banner. */
+  function parseSystemBanner(m) {
+    const kind = String(m.kind || 'system');
+    const raw = String(m.body || '').replace(/\s+/g, ' ').trim();
+    const moodMatch = raw.match(/心情\s*([^\s·]+)/);
+    const mood = moodMatch ? moodMatch[1] : '';
+    const hasRoom = /群聊|room:/.test(raw);
+    const hasDm = /私信|dm-from:|dm:/.test(raw);
+    const hasFile = /文件\s|\.md\b|\.txt\b|\.json\b|workspace|📄/.test(raw);
+    const hasTool = kind === 'tool' || /🛠|工具/.test(raw);
+    const hasDiary = kind === 'diary' || /日记|diary/.test(raw);
+    const hasMemory = kind === 'memory' || /记忆|memory|压缩/.test(raw);
+    const hasSoul = kind === 'soul' || /性格|灵魂|心情/.test(raw);
+
+    let lead = KIND_ICONS.system;
+    let kindGlyph = KIND_ICONS[kind] || KIND_ICONS.system;
+    let label = raw.replace(/^[✦🛠📄📔]\s*/, '');
+
+    if (hasSoul) {
+      lead = mood ? moodIcon(mood) : KIND_ICONS.soul;
+      kindGlyph = hasRoom ? KIND_ICONS.room : hasDm ? '💬' : KIND_ICONS.soul;
+      const parts = [];
+      if (mood) parts.push(`心情 ${mood}`);
+      else parts.push('性格微调');
+      if (hasRoom) parts.push('群聊');
+      else if (hasDm) parts.push('私信');
+      const deltas = raw.match(/(?:openness|trust|energy)[+-][\d.]+(?:\s*·\s*(?:openness|trust|energy)[+-][\d.]+)*/);
+      if (deltas) parts.push(deltas[0].replace(/\s+/g, ''));
+      else {
+        const other = raw
+          .replace(/^✦\s*/, '')
+          .replace(/性格微调/g, '')
+          .replace(/心情\s*[^\s·]+/g, '')
+          .replace(/群聊|私信(?:·\S+)?|room:\S+|dm-from:\S+|原因[：:]\s*/g, '')
+          .replace(/^[·•\s]+|[·•\s]+$/g, '')
+          .trim();
+        if (other) parts.push(other.slice(0, 36));
+      }
+      label = parts.filter(Boolean).join(' · ');
+    } else if (hasDiary) {
+      lead = KIND_ICONS.diary;
+      kindGlyph = KIND_ICONS.diary;
+    } else if (hasFile) {
+      lead = '📄';
+      kindGlyph = KIND_ICONS.tool;
+      label = label.replace(/^文件\s*/, '文件 ');
+    } else if (hasTool) {
+      lead = KIND_ICONS.tool;
+      kindGlyph = KIND_ICONS.tool;
+    } else if (hasMemory) {
+      lead = KIND_ICONS.memory;
+      kindGlyph = KIND_ICONS.memory;
+    } else if (hasRoom) {
+      lead = KIND_ICONS.room;
+      kindGlyph = KIND_ICONS.room;
+    }
+
+    if (label.length > 96) label = label.slice(0, 95) + '…';
+    return { lead, kindGlyph, kind, label, title: String(m.body || '').trim() };
+  }
+
+  function renderSystemBanner(m) {
+    const b = parseSystemBanner(m);
+    return `<div class="tg-row system" title="${esc(b.title)}">
+      <div class="tg-msg-wrap">
+        <div class="tg-bubble tg-sys-banner">
+          <span class="tg-sys-icon" aria-hidden="true">${b.lead}</span>
+          <span class="tg-sys-text">${esc(b.label)}</span>
+          <span class="tg-sys-kind" title="${esc(b.kind)}" aria-label="${esc(b.kind)}">${b.kindGlyph}</span>
+        </div>
+        <time class="tg-msg-time" datetime="${esc(m.createdAt || '')}">${esc(fmtClock(m.createdAt))}</time>
+      </div>
+    </div>`;
+  }
+
+
   function isSystemish(m) {
-    return m.kind === 'soul' || m.kind === 'tool' || m.kind === 'system' || m.from === 'system';
+    return m.kind === 'soul' || m.kind === 'tool' || m.kind === 'diary' || m.kind === 'system' || m.from === 'system';
   }
 
   function bubbleNameColor(from) {
@@ -270,14 +379,7 @@
         html += `<div class="tg-day">${esc(dayLabel(m.createdAt))}</div>`;
       }
       if (isSystemish(m) && chat.kind === 'self') {
-        html += `<div class="tg-row system">
-          <div class="tg-msg-wrap">
-            <div class="tg-bubble"><span class="tg-sys-text">${esc(m.body)}</span>
-              <div class="meta"><span class="tg-kind-tag">${esc(m.kind || 'system')}</span></div>
-            </div>
-            <time class="tg-msg-time" datetime="${esc(m.createdAt || '')}">${esc(fmtClock(m.createdAt))}</time>
-          </div>
-        </div>`;
+        html += renderSystemBanner(m);
         continue;
       }
       const out = isOutgoing(m.from);
