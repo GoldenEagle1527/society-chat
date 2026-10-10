@@ -24,10 +24,12 @@
  * - write_diary rejects outbound chat voice server-side
  * - per-agent tick budget (SOCIETY_AGENT_TICK_BUDGET_MS) so hung LLM cannot freeze runTick
  * - quiet plaza idle bias strongly prefers speak_in_room over diary
+ * - LLM sync path: 1 attempt (SOCIETY_LLM_SYNC_ATTEMPTS); failures enqueue async retry queue
+ *   (SOCIETY_LLM_MAX_ATTEMPTS with backoff) — does not block tickRunning / next runTick
  */
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { AgentId, InboxMessage, RoomId } from '../../../src/types.ts'
-import type { AgentActResult } from '../../society-llm/src/index.ts'
+import type { ActMode, AgentActResult, ReplyStimulus } from '../../society-llm/src/index.ts'
 import { formatBeijingNow } from '../../../src/beijing-time.ts'
 import { agentTickBudgetMs, sleep as sleepMs } from '../../../src/llm-http.ts'
 
@@ -110,6 +112,20 @@ export interface TickResult extends TickActionResult {
   maxExchanges: number
   /** When parallel > 1, every sub-act in this tick (includes the primary). */
   parallel?: TickActionResult[]
+}
+
+/** Failed sync turn handed to the background LLM retry queue (off the main heartbeat). */
+interface AsyncRetryJob {
+  agentId: AgentId
+  kind: 'idle' | 'reply'
+  stimulusKey: string
+  stimulus: ReplyStimulus
+  mode: ActMode
+  opts?: { injectReplyTo?: string; defaultDmTo?: string }
+  roomId?: string
+  steerSearch?: boolean
+  enqueuedAt: number
+  syncError: string
 }
 
 function envInt(name: string, fallback: number): number {
@@ -330,6 +346,12 @@ export class SocietySchedulerService extends Service {
   private readonly pending = new Set<Promise<void>>()
   /** Room replies started in the current runTick (reset each tick). */
   private roomRepliesThisTick = 0
+
+  /** Background LLM retries — must not block tickRunning / runTick. */
+  private readonly asyncRetryQueue: AsyncRetryJob[] = []
+  private asyncRetryPumping = false
+  /** stimulusKey currently queued or running (dedupe). */
+  private readonly asyncRetryKeys = new Set<string>()
 
   constructor(ctx: Context) {
     super(ctx, 'societyScheduler')
@@ -822,6 +844,177 @@ export class SocietySchedulerService extends Service {
     return { action: 'idle-none', body: detail }
   }
 
+  /** Whether background async LLM retries are enabled (default on). */
+  private asyncRetryEnabled(): boolean {
+    const raw = process.env.SOCIETY_LLM_ASYNC_RETRY?.trim()
+    if (raw === '0' || raw === 'false' || raw === 'off') return false
+    return true
+  }
+
+  private asyncRetryQueueMax(): number {
+    return Math.max(1, envInt('SOCIETY_LLM_ASYNC_RETRY_QUEUE', 16) || 16)
+  }
+
+  private asyncRetryDedupeKey(agentId: AgentId, stimulusKey: string): string {
+    return `${agentId}::${stimulusKey}`
+  }
+
+  /**
+   * Hand a sync-failed turn to the background retry queue.
+   * Returns true if the agent stays inFlight for the async pump to clear.
+   * Never blocks the caller beyond a microtask schedule of the pump.
+   */
+  private enqueueAsyncRetry(job: Omit<AsyncRetryJob, 'enqueuedAt'>): boolean {
+    if (!this.asyncRetryEnabled()) return false
+    const key = this.asyncRetryDedupeKey(job.agentId, job.stimulusKey)
+    if (this.asyncRetryKeys.has(key)) {
+      schedWarn(
+        this.ctx,
+        `async-retry skip-dup agent=${job.agentId} key=${job.stimulusKey.slice(0, 24)}`,
+      )
+      return false
+    }
+    if (this.asyncRetryQueue.length >= this.asyncRetryQueueMax()) {
+      schedWarn(
+        this.ctx,
+        `async-retry drop-full agent=${job.agentId} kind=${job.kind} q=${this.asyncRetryQueue.length}`,
+      )
+      return false
+    }
+    this.asyncRetryKeys.add(key)
+    this.asyncRetryQueue.push({ ...job, enqueuedAt: Date.now() })
+    schedWarn(
+      this.ctx,
+      `async-retry enqueue agent=${job.agentId} kind=${job.kind} mode=${job.mode} key=${job.stimulusKey.slice(0, 24)} syncErr=${job.syncError.slice(0, 120)}`,
+    )
+    void this.pumpAsyncRetries()
+    return true
+  }
+
+  /**
+   * Drain the async retry queue off the main heartbeat.
+   * Uses llmMode=async (full SOCIETY_LLM_MAX_ATTEMPTS + backoff).
+   * Delivers at most once per job when closing tools succeed.
+   */
+  private async pumpAsyncRetries(): Promise<void> {
+    if (this.asyncRetryPumping) return
+    this.asyncRetryPumping = true
+    try {
+      while (this.asyncRetryQueue.length > 0) {
+        const job = this.asyncRetryQueue.shift()!
+        const key = this.asyncRetryDedupeKey(job.agentId, job.stimulusKey)
+        // Agent should already be in inFlight (handoff from sync catch)
+        this.inFlight.add(job.agentId)
+        schedWarn(
+          this.ctx,
+          `async-retry start agent=${job.agentId} kind=${job.kind} waited=${Date.now() - job.enqueuedAt}ms`,
+        )
+        try {
+          const result = await this.ctx.societyLlm.actClosedTurn(
+            job.agentId,
+            job.stimulus,
+            job.mode,
+            { ...job.opts, llmMode: 'async' },
+          )
+          this.lastActAt.set(job.agentId, Date.now())
+
+          if (
+            !result.ok ||
+            result.acted === 'stay_silent' ||
+            result.acted === 'do_nothing' ||
+            result.acted === 'none'
+          ) {
+            schedWarn(
+              this.ctx,
+              `async-retry done agent=${job.agentId} acted=${result.acted} (no post)`,
+            )
+            if (job.kind === 'reply') {
+              this.ctx.emit('society/agent-replied', {
+                agentId: job.agentId,
+                kind: 'silent',
+                body: '[SILENT-async]',
+                roomId: job.roomId,
+                stimulusId: job.stimulusKey,
+              })
+            }
+            continue
+          }
+
+          if (job.kind === 'idle') {
+            const noted = this.noteClosingAct(job.agentId, result, job.stimulusKey, {
+              roomId: job.roomId,
+              steerSearch: job.steerSearch,
+            })
+            schedWarn(
+              this.ctx,
+              `async-retry done agent=${job.agentId} acted=${result.acted} action=${noted.action} (delivered once)`,
+            )
+            if (result.sideEffectDone && noted.action !== 'idle-none' && noted.action !== 'silent') {
+              await this.consolidateAfterAct(job.agentId)
+            }
+          } else {
+            // reply path — tools already posted; count exchange once
+            if (!exchangesCapped(this.exchangeCount, this.maxExchanges)) {
+              this.exchangeCount += 1
+              this.lastReplyAgentId = job.agentId
+              this.lastExchangeAt = Date.now()
+            }
+            if (result.acted === 'speak_in_room') {
+              this.ctx.emit('society/agent-replied', {
+                agentId: job.agentId,
+                kind: 'room',
+                body: result.detail || '',
+                roomId: job.roomId,
+                stimulusId: job.stimulusKey,
+              })
+            } else if (result.acted === 'send_dm') {
+              const to =
+                job.stimulus.message?.from &&
+                job.stimulus.message.from !== 'system' &&
+                job.stimulus.message.from !== 'room'
+                  ? job.stimulus.message.from
+                  : undefined
+              this.ctx.emit('society/agent-replied', {
+                agentId: job.agentId,
+                kind: 'direct',
+                body: result.detail || '',
+                to: to as AgentId | undefined,
+                stimulusId: job.stimulusKey,
+              })
+            } else if (result.acted === 'diary' || result.acted === 'thought') {
+              this.ctx.emit('society/agent-replied', {
+                agentId: job.agentId,
+                kind: 'diary',
+                body: result.detail || '',
+                stimulusId: job.stimulusKey,
+              })
+            }
+            schedWarn(
+              this.ctx,
+              `async-retry done agent=${job.agentId} acted=${result.acted} (delivered once)`,
+            )
+            await this.consolidateAfterAct(job.agentId)
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          const safe = msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+          schedWarn(
+            this.ctx,
+            `async-retry fail agent=${job.agentId} kind=${job.kind}: ${safe.slice(0, 200)}`,
+          )
+          this.lastActAt.set(job.agentId, Date.now())
+        } finally {
+          this.asyncRetryKeys.delete(key)
+          this.inFlight.delete(job.agentId)
+        }
+      }
+    } finally {
+      this.asyncRetryPumping = false
+      // Jobs enqueued while we were finishing
+      if (this.asyncRetryQueue.length > 0) void this.pumpAsyncRetries()
+    }
+  }
+
   private async processUnread(
     agentId: AgentId,
     message: InboxMessage,
@@ -860,6 +1053,7 @@ export class SocietySchedulerService extends Service {
     this.inFlight.add(agentId)
     if (message.kind === 'room') this.roomRepliesThisTick += 1
 
+    let handoffAsync = false
     try {
       this.ctx.societyMailbox.markRead(agentId, message.id)
       this.ctx.societyMemory.recordLlmCall(agentId)
@@ -870,28 +1064,37 @@ export class SocietySchedulerService extends Service {
           : undefined
 
       const mode = message.kind === 'direct' ? 'reply-dm' : 'reply-room'
+      const turnOpts = {
+        injectReplyTo:
+          message.kind === 'room' ? message.sourceMessageId : undefined,
+        defaultDmTo:
+          message.kind === 'direct' && message.from !== 'system' && message.from !== 'room'
+            ? message.from
+            : undefined,
+      }
       let result: AgentActResult
       try {
         result = await this.ctx.societyLlm.actClosedTurn(
           agentId,
           { message, roomName },
           mode,
-          {
-            injectReplyTo:
-              message.kind === 'room' ? message.sourceMessageId : undefined,
-            defaultDmTo:
-              message.kind === 'direct' && message.from !== 'system' && message.from !== 'room'
-                ? message.from
-                : undefined,
-          },
+          turnOpts,
         )
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        schedWarn(
-          this.ctx,
-          `LLM soft-fail ${agentId} (no post): ${msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')}`,
-        )
+        const safe = msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+        schedWarn(this.ctx, `LLM sync-fail ${agentId} (no post): ${safe}`)
         this.lastActAt.set(agentId, Date.now())
+        handoffAsync = this.enqueueAsyncRetry({
+          agentId,
+          kind: 'reply',
+          stimulusKey: message.id,
+          stimulus: { message, roomName },
+          mode,
+          opts: turnOpts,
+          roomId: message.roomId,
+          syncError: safe,
+        })
         return 'skip'
       }
 
@@ -942,7 +1145,7 @@ export class SocietySchedulerService extends Service {
       await this.consolidateAfterAct(agentId)
       return 'reply'
     } finally {
-      this.inFlight.delete(agentId)
+      if (!handoffAsync) this.inFlight.delete(agentId)
     }
   }
 
@@ -955,6 +1158,7 @@ export class SocietySchedulerService extends Service {
     if (this.inFlight.has(agentId)) return { action: 'skip' }
 
     this.inFlight.add(agentId)
+    let handoffAsync = false
     try {
       const profile = this.ctx.societyIdentity.require(agentId)
       const soul = this.ctx.societySoul.get(agentId)
@@ -1030,16 +1234,25 @@ export class SocietySchedulerService extends Service {
       }
 
       this.ctx.societyMemory.recordLlmCall(agentId)
+      const idleStimulusKey = `idle-${this.tickCount}-${agentId}`
       let result: AgentActResult
       try {
         result = await this.ctx.societyLlm.actClosedTurn(agentId, { text: stimulus }, 'idle')
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        schedWarn(
-          this.ctx,
-          `idle LLM soft-fail ${agentId}: ${msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')}`,
-        )
+        const safe = msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+        schedWarn(this.ctx, `idle LLM sync-fail ${agentId}: ${safe}`)
         this.lastActAt.set(agentId, Date.now())
+        handoffAsync = this.enqueueAsyncRetry({
+          agentId,
+          kind: 'idle',
+          stimulusKey: idleStimulusKey,
+          stimulus: { text: stimulus },
+          mode: 'idle',
+          roomId: room?.id,
+          steerSearch,
+          syncError: safe,
+        })
         return { action: 'skip' }
       }
       if (steerSearch) this.lastSearchIdleAt.set(agentId, Date.now())
@@ -1059,7 +1272,7 @@ export class SocietySchedulerService extends Service {
         return { action: 'capped' }
       }
 
-      const noted = this.noteClosingAct(agentId, result, `idle-${this.tickCount}`, {
+      const noted = this.noteClosingAct(agentId, result, idleStimulusKey, {
         roomId: room?.id,
         steerSearch,
       })
@@ -1068,7 +1281,7 @@ export class SocietySchedulerService extends Service {
       }
       return noted
     } finally {
-      this.inFlight.delete(agentId)
+      if (!handoffAsync) this.inFlight.delete(agentId)
     }
   }
 
@@ -1117,6 +1330,7 @@ export class SocietySchedulerService extends Service {
     this.handledMessageIds.add(message.id)
     this.inFlight.add(agentId)
 
+    let handoffAsync = false
     try {
       this.ctx.societyMailbox.markRead(agentId, message.id)
       this.ctx.societyMemory.recordLlmCall(agentId)
@@ -1127,28 +1341,37 @@ export class SocietySchedulerService extends Service {
           : undefined
 
       const mode = message.kind === 'direct' ? 'reply-dm' : 'reply-room'
+      const turnOpts = {
+        injectReplyTo:
+          message.kind === 'room' ? message.sourceMessageId : undefined,
+        defaultDmTo:
+          message.kind === 'direct' && message.from !== 'system' && message.from !== 'room'
+            ? message.from
+            : undefined,
+      }
       let result: AgentActResult
       try {
         result = await this.ctx.societyLlm.actClosedTurn(
           agentId,
           { message, roomName },
           mode,
-          {
-            injectReplyTo:
-              message.kind === 'room' ? message.sourceMessageId : undefined,
-            defaultDmTo:
-              message.kind === 'direct' && message.from !== 'system' && message.from !== 'room'
-                ? message.from
-                : undefined,
-          },
+          turnOpts,
         )
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        schedWarn(
-          this.ctx,
-          `LLM soft-fail ${agentId} (no post): ${msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')}`,
-        )
+        const safe = msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+        schedWarn(this.ctx, `LLM sync-fail ${agentId} (no post): ${safe}`)
         this.lastActAt.set(agentId, Date.now())
+        handoffAsync = this.enqueueAsyncRetry({
+          agentId,
+          kind: 'reply',
+          stimulusKey: message.id,
+          stimulus: { message, roomName },
+          mode,
+          opts: turnOpts,
+          roomId: message.roomId,
+          syncError: safe,
+        })
         return
       }
 
@@ -1197,7 +1420,7 @@ export class SocietySchedulerService extends Service {
       }
       await this.consolidateAfterAct(agentId)
     } finally {
-      this.inFlight.delete(agentId)
+      if (!handoffAsync) this.inFlight.delete(agentId)
     }
   }
 

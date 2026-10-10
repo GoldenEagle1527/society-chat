@@ -6,7 +6,8 @@
  * Image gen stays Agnes-only (society-tools).
  * Never logs API keys.
  *
- * Retries: 429 → 15s; other errors → 30s; max 10 attempts.
+ * Retries: sync path (tick) = SOCIETY_LLM_SYNC_ATTEMPTS (default 1, fail-fast);
+ *   async path (background queue) = SOCIETY_LLM_MAX_ATTEMPTS with 429→15s / else→30s.
  * Turns: structured closing tools (speak_in_room / stay_silent / write_diary / …).
  * Multi-bubble via ||| inside tool args. No ACTION: text protocol.
  */
@@ -19,7 +20,7 @@ import {
   type LlmEndpointConfig,
   type LlmProviderId,
 } from '../../../src/env.ts'
-import { LlmHttpError, withLlmRetries, llmTimeoutMs, isAbortLikeError } from '../../../src/llm-http.ts'
+import { LlmHttpError, withLlmRetries, llmTimeoutMs, isAbortLikeError, type LlmRetryMode } from '../../../src/llm-http.ts'
 import {
   isClosingToolName,
   type ToolDefinition,
@@ -402,7 +403,7 @@ export class SocietyLlmService extends Service {
     agentId: AgentId,
     stimulus: ReplyStimulus,
     mode: ActMode,
-    opts?: { injectReplyTo?: string; defaultDmTo?: string },
+    opts?: { injectReplyTo?: string; defaultDmTo?: string; llmMode?: LlmRetryMode },
   ): Promise<AgentActResult> {
     this.ctx.societyIdentity.require(agentId)
     const cfg = this.resolveConfig(agentId)
@@ -444,6 +445,7 @@ export class SocietyLlmService extends Service {
     const researchTools: string[] = []
     let nudged = false
     let reflected = false
+    const llmMode: LlmRetryMode = opts?.llmMode ?? 'sync'
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS + 1; round++) {
       const allowTools = true
@@ -451,6 +453,7 @@ export class SocietyLlmService extends Service {
         tools: allowTools,
         toolDefs: tools,
         toolChoice: 'auto',
+        llmMode,
       })
 
       if (result.tool_calls?.length) {
@@ -579,16 +582,23 @@ export class SocietyLlmService extends Service {
   private async chatCompletions(
     messages: ChatMessage[],
     cfg: LlmEndpointConfig,
-    opts: { tools: boolean; toolDefs?: ToolDefinition[]; toolChoice?: 'auto' | 'required' | 'none' },
+    opts: {
+      tools: boolean
+      toolDefs?: ToolDefinition[]
+      toolChoice?: 'auto' | 'required' | 'none'
+      llmMode?: LlmRetryMode
+    },
   ): Promise<{ content: string | null; tool_calls?: OpenAiToolCall[] }> {
     const log = (msg: string) => {
       this.ctx.logger('society-llm').warn(msg)
       console.warn(`[society-llm] ${msg}`)
     }
+    const llmMode: LlmRetryMode = opts.llmMode ?? 'sync'
     return withLlmRetries(
       `${cfg.provider} chat/completions`,
       () => this.chatCompletionsOnce(messages, cfg, opts),
       log,
+      { mode: llmMode },
     )
   }
 

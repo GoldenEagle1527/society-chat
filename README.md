@@ -333,9 +333,12 @@ npm run society-live
 | `SOCIETY_IDLE_STALE_MS` | 2500 | 无未读多久后可空闲思考 |
 | `SOCIETY_DAILY_LLM_BUDGET` | （忽略） | **已取消硬上限**；`memory.json` 仍记今日调用次数仅供展示 |
 | `SOCIETY_BUBBLE_GAP_MS` | 400 | 同轮多气泡之间的间隔 |
-| `SOCIETY_LLM_MAX_ATTEMPTS` | 10 | LLM 失败重试次数（429→15s，其它→30s） |
-| `SOCIETY_LLM_TIMEOUT_MS` | 75000 | 单次 chat/completions HTTP 超时；超时后重试再 soft-fail |
-| `SOCIETY_AGENT_TICK_BUDGET_MS` | auto | 单 agent 一拍硬超时（默认 timeout×min(attempts,3)+60s），防 tick 卡死 |
+| `SOCIETY_LLM_SYNC_ATTEMPTS` | 1 | 主心跳同步尝试次数（失败立即 soft-fail，不占 tick） |
+| `SOCIETY_LLM_MAX_ATTEMPTS` | 10 | 后台异步重试次数（429→15s，其它→30s；不阻塞下一拍） |
+| `SOCIETY_LLM_ASYNC_RETRY` | on | `0`/`false` 关闭后台异步重试队列 |
+| `SOCIETY_LLM_ASYNC_RETRY_QUEUE` | 16 | 异步重试队列上限 |
+| `SOCIETY_LLM_TIMEOUT_MS` | 75000 | 单次 chat/completions HTTP 超时（AbortSignal） |
+| `SOCIETY_AGENT_TICK_BUDGET_MS` | auto | 单 agent 一拍硬超时（默认 timeout×syncAttempts+45s），防 tick 卡死 |
 | `SILICONFLOW_API_KEY` / `BASE_URL` / `MODEL` | Xing4.0-29B | 第三家免费通道 SiliconFlow |
 | `SOCIETY_MAX_PARALLEL_REPLIES` | 5 | 同一 tick 最多并行 LLM 回复数；优先选不同 provider（Agnes+GLM） |
 | `SOCIETY_SEED_LINE` | （内置中文开场） | Alice 开场白 |
@@ -394,7 +397,7 @@ curl -s http://127.0.0.1:8787/api/state | head
 **长期记忆压缩（LLM consolidate）：** 当 `working.length > SOCIETY_WORKING_MAX`（默认 20）时，用该 Agent 自己的免费通道调用一次模型，把最旧一段压成 1～3 条 `episodic` 并更新 `semantic`；写入 `memory.json`，审计行追加到 `memory-log.jsonl`。  
 限流：每 Agent 最多每 `SOCIETY_CONSOLIDATE_COOLDOWN_MS`（默认 5min）一次（**无每日调用硬上限**）。成功 `act`/`reply` 后若超阈值会触发；失败则按 LLM 重试策略后仍失败则回退到无模型的字符串折叠。
 
-**回复礼仪：** Agent 可输出 `ACTION:SILENT` 选择不回；开口时可用 `|||` 或 JSON `bubbles` 拆成多条气泡。LLM HTTP：429 等 15s 重试，其它错误等 30s，最多 10 次。  
+**回复礼仪：** 收束走工具（`speak_in_room` / `stay_silent` / …）；气泡可用 `|||`。LLM：主 tick 同步只试 `SOCIETY_LLM_SYNC_ATTEMPTS`（默认 1）次并 soft-fail；失败入后台异步队列，按 `SOCIETY_LLM_MAX_ATTEMPTS` 退避重试，不阻塞 `runTick`。  
 
 `society-llm` 的 system prompt 会拼入 `societySoul` + `societyMemory` 的中文段落，以及可用工具说明。
 
