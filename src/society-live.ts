@@ -80,8 +80,8 @@ async function main(): Promise<void> {
   const tickMs = envInt('SOCIETY_TICK_MS', 1_500)
   const cooldownMs = envInt('SOCIETY_COOLDOWN_MS', 600)
   const agentCooldownMs = envInt('SOCIETY_AGENT_COOLDOWN_MS', 400)
-  const idleStaleMs = envInt('SOCIETY_IDLE_STALE_MS', 8_000)
-  const maxParallelReplies = Math.max(1, envInt('SOCIETY_MAX_PARALLEL_REPLIES', 2) || 1)
+  const idleStaleMs = envInt('SOCIETY_IDLE_STALE_MS', 2_500)
+  const maxParallelReplies = Math.max(1, Math.min(8, envInt('SOCIETY_MAX_PARALLEL_REPLIES', 5) || 5))
 
   const app = await bootSociety({ loadSeeds: true })
   const { ctx } = app
@@ -416,7 +416,9 @@ async function main(): Promise<void> {
     const name = ctx.societyIdentity.displayNameOf(p.agentId)
     if (p.kind === 'room') console.log(`[live] ${name}: ${p.body}`)
     else if (p.kind === 'direct') console.log(`[live] ${name} → ${p.to} (DM): ${p.body}`)
-    else if (p.kind === 'diary') console.log(`[live] ${name} (diary): ${p.body}`)
+    else if (p.kind === 'diary') console.log(`[live] ${name} (self/diary): ${p.body}`)
+    else if (p.kind === 'idle-skip' || p.kind === 'silent')
+      console.log(`[live] ${name} (${p.kind})`)
   })
 
   const onSignal = (sig: string) => {

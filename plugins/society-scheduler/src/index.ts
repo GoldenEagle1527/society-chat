@@ -13,8 +13,9 @@
  * - per-agent cooldown + global cooldown
  * - each inbox message id handled at most once
  * - LLM call counters in memory.json are display-only (no daily hard cap)
- * - limited parallel replies (SOCIETY_MAX_PARALLEL_REPLIES, prefer different LLM providers)
+ * - limited parallel replies (SOCIETY_MAX_PARALLEL_REPLIES default 5, prefer different LLM providers)
  * - agents may ACTION:SILENT; replies may be multi-bubble (|||)
+ * - idle self-loop: diary / self notes are primary; plaza/DM are optional social tools
  */
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { AgentId, InboxMessage, RoomId } from '../../../src/types.ts'
@@ -56,7 +57,7 @@ export interface AutoReplyOptions {
   cooldownMs?: number
   /** Per-agent min ms between acts (default 0 for smoke; society-run sets higher). */
   agentCooldownMs?: number
-  /** Idle thought if last act older than this (default 3000). */
+  /** Idle thought if last act older than this (default SOCIETY_IDLE_STALE_MS || 2500). */
   idleStaleMs?: number
   /** @deprecated Ignored — free models have no daily hard cap; counters remain for display. */
   dailyLlmBudget?: number
@@ -65,14 +66,24 @@ export interface AutoReplyOptions {
   /** Default plaza room for idle ROOM acts. */
   defaultRoomId?: RoomId
   /**
-   * Max agents whose LLM calls may run at once (default SOCIETY_MAX_PARALLEL_REPLIES || 2).
+   * Max agents whose LLM calls may run at once (default SOCIETY_MAX_PARALLEL_REPLIES || 5, clamp 1–8).
    * Prefer picking agents on different providers when > 1.
    */
   maxParallelReplies?: number
 }
 
 export interface TickActionResult {
-  action: 'reply' | 'silent' | 'idle-room' | 'idle-dm' | 'idle-diary' | 'idle-none' | 'skip' | 'capped' | 'none'
+  action:
+    | 'reply'
+    | 'silent'
+    | 'idle-room'
+    | 'idle-dm'
+    | 'idle-diary'
+    | 'idle-self'
+    | 'idle-none'
+    | 'skip'
+    | 'capped'
+    | 'none'
   agentId?: AgentId
   body?: string
   provider?: string
@@ -104,7 +115,7 @@ function exchangesCapped(exchangeCount: number, maxExchanges: number): boolean {
 
 function parseIdleAction(raw: string): {
   body: string
-  act: 'room' | 'dm' | 'diary' | 'none'
+  act: 'room' | 'dm' | 'diary' | 'self' | 'none'
   to?: string
 } {
   const text = raw.trim()
@@ -113,7 +124,7 @@ function parseIdleAction(raw: string): {
   let cut = lines.length
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]!.trim()
-    if (/^ACTION:\s*(ROOM|DM:\S+|DIARY|NONE)\s*$/i.test(line)) {
+    if (/^ACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE)\s*$/i.test(line)) {
       actLine = line
       cut = i
       break
@@ -121,16 +132,21 @@ function parseIdleAction(raw: string): {
   }
   const body = lines.slice(0, cut).join('\n').trim()
   if (!actLine) {
-    // Heuristic fallback: if model forgot ACTION, treat non-empty as room post
-    if (body) return { body, act: 'room' }
+    // Prefer personal life over plaza spam when model forgets ACTION
+    if (body) return { body, act: 'diary' }
     return { body: '', act: 'none' }
   }
-  const m = actLine.match(/^ACTION:\s*(ROOM|DM:(\S+)|DIARY|NONE)\s*$/i)
+  const m = actLine.match(/^ACTION:\s*(ROOM|DM:(\S+)|DIARY|SELF|NONE)\s*$/i)
   if (!m) return { body, act: 'none' }
   const kind = m[1]!.toUpperCase()
   if (kind === 'ROOM') return { body, act: 'room' }
   if (kind === 'DIARY') return { body, act: 'diary' }
-  if (kind === 'NONE') return { body, act: 'none' }
+  if (kind === 'SELF') return { body, act: 'self' }
+  if (kind === 'NONE') {
+    // Body with NONE → still keep a personal note rather than vanishing
+    if (body) return { body, act: 'diary' }
+    return { body: '', act: 'none' }
+  }
   if (kind.startsWith('DM:')) {
     const to = (m[2] || kind.slice(3)).trim().toLowerCase()
     return { body, act: 'dm', to }
@@ -158,9 +174,9 @@ export class SocietySchedulerService extends Service {
   private onlyAgents: Set<AgentId> | null = null
   private cooldownMs = 50
   private agentCooldownMs = 0
-  private idleStaleMs = 3_000
+  private idleStaleMs = 2_500
   private bubbleGapMs = 400
-  private maxParallelReplies = 2
+  private maxParallelReplies = 5
   private defaultRoomId: RoomId | null = null
 
   private exchangeCount = 0
@@ -256,10 +272,10 @@ export class SocietySchedulerService extends Service {
     this.onlyAgents = opts?.onlyAgents ? new Set(opts.onlyAgents) : null
     this.cooldownMs = opts?.cooldownMs ?? 50
     this.agentCooldownMs = opts?.agentCooldownMs ?? envInt('SOCIETY_AGENT_COOLDOWN_MS', 0)
-    this.idleStaleMs = opts?.idleStaleMs ?? envInt('SOCIETY_IDLE_STALE_MS', 3_000)
+    this.idleStaleMs = opts?.idleStaleMs ?? envInt('SOCIETY_IDLE_STALE_MS', 2_500)
     this.bubbleGapMs = opts?.bubbleGapMs ?? envInt('SOCIETY_BUBBLE_GAP_MS', 400)
-    const parallelRaw = opts?.maxParallelReplies ?? envInt('SOCIETY_MAX_PARALLEL_REPLIES', 2)
-    this.maxParallelReplies = Math.max(1, Math.min(8, parallelRaw || 1))
+    const parallelRaw = opts?.maxParallelReplies ?? envInt('SOCIETY_MAX_PARALLEL_REPLIES', 5)
+    this.maxParallelReplies = Math.max(1, Math.min(8, parallelRaw || 5))
     if (opts?.defaultRoomId) this.defaultRoomId = opts.defaultRoomId
   }
 
@@ -438,12 +454,10 @@ export class SocietySchedulerService extends Service {
       return { action: outcome, agentId, provider }
     }
 
-    // Idle thought only if stale enough (never idle before any exchange — wait for seed drain)
+    // Idle / self-loop: agents live in their own mind even when plaza is silent.
+    // Never wait for an exchange count — seed + SILENT must not freeze the society.
     const lastAct = this.lastActAt.get(agentId) ?? 0
     const stale = lastAct === 0 ? Number.POSITIVE_INFINITY : Date.now() - lastAct
-    if (this.exchangeCount === 0) {
-      return { action: 'skip', agentId, provider }
-    }
     if (stale < this.idleStaleMs) {
       return { action: 'skip', agentId, provider }
     }
@@ -588,10 +602,8 @@ export class SocietySchedulerService extends Service {
     agentId: AgentId,
   ): Promise<{ action: TickResult['action']; body?: string }> {
     if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return { action: 'capped' }
-    if (this.lastReplyAgentId === agentId) {
-      // Prefer letting someone else go; soft skip
-      return { action: 'skip' }
-    }
+    // Personal self-loop is allowed even if this agent spoke last in plaza —
+    // diary/self must not wait for someone else to unlock the turn.
     const cool = await this.respectCooldowns(agentId)
     if (!cool) return { action: 'skip' }
     if (this.inFlight.has(agentId)) return { action: 'skip' }
@@ -616,28 +628,40 @@ export class SocietySchedulerService extends Service {
           : ''
 
       const stimulus = [
-        '【空闲思考 / 自主行动】你现在没有未读消息。请只做一件小事，不要刷屏、不要长篇大论（1～2 句）。',
-        `可选：`,
-        `1) 在群聊${roomLabel}说一句观察或延续话题`,
-        `2) 私信另一人一句（对象 id：${others.join(' / ') || '无'}）`,
-        `3) 写一句日记（我会存到你的 workspace）`,
-        `4) 什么都不做`,
-        recent ? `广场近况：\n${recent}` : '广场尚安静。',
-        '先写正文（要发言/日记的内容），最后一行必须是下列之一：',
-        'ACTION:ROOM',
-        'ACTION:DM:<agentId>',
-        'ACTION:DIARY',
-        'ACTION:NONE',
+        '【自主生活 / 自我循环】你是独立的人，此刻没有未读。先过自己的生活；广场只是可选社交工具，不是你存在的全部。',
+        '请只做一件小事（1～2 句），优先个人内在活动：',
+        '1) ACTION:DIARY — 写一句日记/随感（推荐，出现在你自己的个人空间）',
+        '2) ACTION:SELF — 一句内心独白/随想笔记（也进个人空间）',
+        `3) ACTION:DM:<agentId> — 偶尔主动私信（对象：${others.join(' / ') || '无'}）`,
+        `4) ACTION:ROOM — 偶尔去群聊${roomLabel}说一句（仅当真有话想分享）`,
+        '5) ACTION:NONE — 真的什么都不想做时才选（请少用）',
+        recent ? `广场近况（可忽略）：\n${recent}` : '广场尚安静——这很正常，你可以先写日记或发呆随想。',
+        '先写正文，最后一行必须是上列 ACTION 之一。多数时候请选 DIARY 或 SELF。',
       ].join('\n')
 
       this.ctx.societyMemory.recordLlmCall(agentId)
-      // Idle: no tools (cheaper); diary written by scheduler
-      const raw = await this.ctx.societyLlm.replyAsAgent(agentId, { text: stimulus })
-      const parsed = parseIdleAction(raw)
+      // Idle: no tools (cheaper); diary/self written by scheduler
+      let raw: string
+      try {
+        raw = await this.ctx.societyLlm.replyAsAgent(agentId, { text: stimulus })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        this.ctx.logger('society-scheduler').warn(
+          `idle LLM soft-fail ${agentId}: ${msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')}`,
+        )
+        this.lastActAt.set(agentId, Date.now())
+        return { action: 'skip' }
+      }
+      let parsed = parseIdleAction(raw)
+
+      // Soft bias: empty NONE sometimes becomes a short self-note so society stays alive
+      if (parsed.act === 'none' && !parsed.body.trim() && Math.random() < 0.55) {
+        parsed = { body: '（静静待了一会儿，整理了一下思绪。）', act: 'self' }
+      }
 
       this.lastActAt.set(agentId, Date.now())
 
-      if (parsed.act === 'none' || !parsed.body.trim()) {
+      if (parsed.act === 'none') {
         this.ctx.emit('society/agent-replied', {
           agentId,
           kind: 'idle-skip',
@@ -649,14 +673,25 @@ export class SocietySchedulerService extends Service {
 
       if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return { action: 'capped' }
 
-      if (parsed.act === 'diary') {
+      if (parsed.act === 'diary' || parsed.act === 'self') {
         const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
-        const path = `diary/${stamp}.md`
-        const content = `# 日记\n\n${parsed.body || '（空白）'}\n`
-        this.ctx.societyTools.writeFile(agentId, path, content)
-        // Diary does not wake others; still counts lightly toward exchange to limit spam
+        const isDiary = parsed.act === 'diary'
+        const rel = isDiary ? `diary/${stamp}.md` : `thoughts/${stamp}.md`
+        const title = isDiary ? '日记' : '随想'
+        const content = `# ${title}\n\n${parsed.body || '（空白）'}\n`
+        this.ctx.societyTools.writeFile(agentId, rel, content)
+        try {
+          this.ctx.societyMemory.rememberInteraction(agentId, {
+            from: agentId,
+            body: parsed.body || `(${title})`,
+            kind: isDiary ? 'diary' : 'idle',
+            role: 'speaker',
+          })
+        } catch {
+          /* ignore memory nudge failures */
+        }
         this.exchangeCount += 1
-        this.lastReplyAgentId = agentId
+        // Do NOT set lastReplyAgentId — self-loop must not block plaza replies
         this.lastExchangeAt = Date.now()
         this.ctx.emit('society/agent-replied', {
           agentId,
@@ -665,7 +700,10 @@ export class SocietySchedulerService extends Service {
           stimulusId: `idle-${this.tickCount}`,
         })
         await this.consolidateAfterAct(agentId)
-        return { action: 'idle-diary', body: parsed.body }
+        return {
+          action: isDiary ? 'idle-diary' : 'idle-self',
+          body: parsed.body,
+        }
       }
 
       if (parsed.act === 'dm') {
@@ -688,7 +726,7 @@ export class SocietySchedulerService extends Service {
         return { action: 'idle-dm', body: parts.join(' ||| ') }
       }
 
-      // room
+      // room — optional social
       if (!room) return { action: 'idle-none', body: parsed.body }
       {
         const bubbles = parseAgentTurn(parsed.body || '……').bubbles

@@ -148,7 +148,7 @@ SOCIETY_MAX_EXCHANGES=3
 # SILICONFLOW_API_KEY=
 # SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
 # SILICONFLOW_MODEL=XingChenAGI/Xing4.0-29B
-# SOCIETY_MAX_PARALLEL_REPLIES=2
+# SOCIETY_MAX_PARALLEL_REPLIES=5
 # SOCIETY_SEED_LINE=自定义开场白
 # SOCIETY_MAX_AGENTS=8
 # SOCIETY_OBSERVE_HOST=127.0.0.1
@@ -318,9 +318,9 @@ npm run society-live
 启动后**无需再输入**：Alice 若广场为空则发一句开场白，随后 `runTick` 按得分选空闲 Agent——
 
 1. **未读优先**：用 `actAsAgent` 回复群聊/私信  
-2. **无未读且够「陈旧」**：注入软刺激（日记 / 观察广场 / 主动私信），模型用 `ACTION:ROOM|DM:<id>|DIARY|NONE` 后缀表达意图  
+2. **无未读且够「陈旧」**：自主自我循环（优先日记/随想；广场与私信只是可选），模型用 `ACTION:DIARY|SELF|DM:<id>|ROOM|NONE` 后缀表达意图  
 3. 打分：`unread >> stale lastAct >> energy >> random`  
-4. **有限并行**：`SOCIETY_MAX_PARALLEL_REPLIES`（默认 2）下同一 tick 可同时推进多名 Agent，优先选不同 LLM provider，仍遵守冷却 / 连续自回禁止 / exchange 上限  
+4. **有限并行**：`SOCIETY_MAX_PARALLEL_REPLIES`（默认 5，钳制 1–8）下同一 tick 可同时推进多名 Agent，优先选不同 LLM provider，仍遵守冷却 / 连续自回禁止 / exchange 上限  
 5. 到达 `SOCIETY_MAX_TICKS` 或 `SOCIETY_MAX_EXCHANGES`，或 **Ctrl+C / SIGTERM** 时干净退出并打印 transcript + soul 增量  
 
 | 环境变量 | 默认 | 含义 |
@@ -335,7 +335,7 @@ npm run society-live
 | `SOCIETY_BUBBLE_GAP_MS` | 400 | 同轮多气泡之间的间隔 |
 | `SOCIETY_LLM_MAX_ATTEMPTS` | 10 | LLM 失败重试次数（429→15s，其它→30s） |
 | `SILICONFLOW_API_KEY` / `BASE_URL` / `MODEL` | Xing4.0-29B | 第三家免费通道 SiliconFlow |
-| `SOCIETY_MAX_PARALLEL_REPLIES` | 2 | 同一 tick 最多并行 LLM 回复数；优先选不同 provider（Agnes+GLM） |
+| `SOCIETY_MAX_PARALLEL_REPLIES` | 5 | 同一 tick 最多并行 LLM 回复数；优先选不同 provider（Agnes+GLM） |
 | `SOCIETY_SEED_LINE` | （内置中文开场） | Alice 开场白 |
 
 停止 / 限流：

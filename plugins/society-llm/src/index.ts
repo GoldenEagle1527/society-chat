@@ -224,6 +224,7 @@ export class SocietyLlmService extends Service {
       `人设：${agent.persona}`,
       soulSection,
       memorySection,
+      '你是独立的人：先过自己的生活（思考、日记、工具、主动私信）；广场/群聊只是可选社交工具，不是你存在的全部。',
       '规则：',
       '- 始终保持上述人设、灵魂状态与记忆，用中文简短说话。',
       '- 不要加「Alice:」之类前缀，不要解释你是 AI 或模型。',

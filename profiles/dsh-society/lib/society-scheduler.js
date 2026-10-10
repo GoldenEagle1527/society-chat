@@ -126,7 +126,7 @@ function envInt(name2, fallback) {
   return fallback;
 }
 function defaultMaxExchanges() {
-  return envInt("SOCIETY_MAX_EXCHANGES", 3);
+  return envInt("SOCIETY_MAX_EXCHANGES", 0);
 }
 function parseIdleAction(raw) {
   const text = raw.trim();
@@ -135,7 +135,7 @@ function parseIdleAction(raw) {
   let cut = lines.length;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
-    if (/^ACTION:\s*(ROOM|DM:\S+|DIARY|NONE)\s*$/i.test(line)) {
+    if (/^ACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE)\s*$/i.test(line)) {
       actLine = line;
       cut = i;
       break;
@@ -143,15 +143,19 @@ function parseIdleAction(raw) {
   }
   const body = lines.slice(0, cut).join("\n").trim();
   if (!actLine) {
-    if (body) return { body, act: "room" };
+    if (body) return { body, act: "diary" };
     return { body: "", act: "none" };
   }
-  const m = actLine.match(/^ACTION:\s*(ROOM|DM:(\S+)|DIARY|NONE)\s*$/i);
+  const m = actLine.match(/^ACTION:\s*(ROOM|DM:(\S+)|DIARY|SELF|NONE)\s*$/i);
   if (!m) return { body, act: "none" };
   const kind = m[1].toUpperCase();
   if (kind === "ROOM") return { body, act: "room" };
   if (kind === "DIARY") return { body, act: "diary" };
-  if (kind === "NONE") return { body, act: "none" };
+  if (kind === "SELF") return { body, act: "self" };
+  if (kind === "NONE") {
+    if (body) return { body, act: "diary" };
+    return { body: "", act: "none" };
+  }
   if (kind.startsWith("DM:")) {
     const to = (m[2] || kind.slice(3)).trim().toLowerCase();
     return { body, act: "dm", to };
@@ -176,9 +180,9 @@ var SocietySchedulerService = class extends Service2 {
   onlyAgents = null;
   cooldownMs = 50;
   agentCooldownMs = 0;
-  idleStaleMs = 3e3;
+  idleStaleMs = 2500;
   bubbleGapMs = 400;
-  maxParallelReplies = 2;
+  maxParallelReplies = 5;
   defaultRoomId = null;
   exchangeCount = 0;
   tickCount = 0;
@@ -263,10 +267,10 @@ var SocietySchedulerService = class extends Service2 {
     this.onlyAgents = opts?.onlyAgents ? new Set(opts.onlyAgents) : null;
     this.cooldownMs = opts?.cooldownMs ?? 50;
     this.agentCooldownMs = opts?.agentCooldownMs ?? envInt("SOCIETY_AGENT_COOLDOWN_MS", 0);
-    this.idleStaleMs = opts?.idleStaleMs ?? envInt("SOCIETY_IDLE_STALE_MS", 3e3);
+    this.idleStaleMs = opts?.idleStaleMs ?? envInt("SOCIETY_IDLE_STALE_MS", 2500);
     this.bubbleGapMs = opts?.bubbleGapMs ?? envInt("SOCIETY_BUBBLE_GAP_MS", 400);
-    const parallelRaw = opts?.maxParallelReplies ?? envInt("SOCIETY_MAX_PARALLEL_REPLIES", 2);
-    this.maxParallelReplies = Math.max(1, Math.min(8, parallelRaw || 1));
+    const parallelRaw = opts?.maxParallelReplies ?? envInt("SOCIETY_MAX_PARALLEL_REPLIES", 5);
+    this.maxParallelReplies = Math.max(1, Math.min(8, parallelRaw || 5));
     if (opts?.defaultRoomId) this.defaultRoomId = opts.defaultRoomId;
   }
   disableAutoReply() {
@@ -415,9 +419,6 @@ var SocietySchedulerService = class extends Service2 {
     }
     const lastAct = this.lastActAt.get(agentId) ?? 0;
     const stale = lastAct === 0 ? Number.POSITIVE_INFINITY : Date.now() - lastAct;
-    if (this.exchangeCount === 0) {
-      return { action: "skip", agentId, provider };
-    }
     if (stale < this.idleStaleMs) {
       return { action: "skip", agentId, provider };
     }
@@ -457,7 +458,7 @@ var SocietySchedulerService = class extends Service2 {
     }
   }
   async processUnread(agentId, message) {
-    if (this.exchangeCount >= this.maxExchanges) return "skip";
+    if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return "skip";
     if (this.handledMessageIds.has(message.id)) {
       this.ctx.societyMailbox.markRead(agentId, message.id);
       return "skip";
@@ -471,7 +472,7 @@ var SocietySchedulerService = class extends Service2 {
     }
     const cool = await this.respectCooldowns(agentId);
     if (!cool) return "skip";
-    if (this.exchangeCount >= this.maxExchanges) return "skip";
+    if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return "skip";
     this.handledMessageIds.add(message.id);
     this.inFlight.add(agentId);
     try {
@@ -504,7 +505,7 @@ var SocietySchedulerService = class extends Service2 {
         });
         return "silent";
       }
-      if (this.exchangeCount >= this.maxExchanges) return "skip";
+      if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return "skip";
       this.exchangeCount += 1;
       this.lastReplyAgentId = agentId;
       this.lastExchangeAt = Date.now();
@@ -535,10 +536,7 @@ var SocietySchedulerService = class extends Service2 {
     }
   }
   async runIdleThought(agentId) {
-    if (this.exchangeCount >= this.maxExchanges) return { action: "capped" };
-    if (this.lastReplyAgentId === agentId) {
-      return { action: "skip" };
-    }
+    if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return { action: "capped" };
     const cool = await this.respectCooldowns(agentId);
     if (!cool) return { action: "skip" };
     if (this.inFlight.has(agentId)) return { action: "skip" };
@@ -549,25 +547,34 @@ var SocietySchedulerService = class extends Service2 {
       const roomLabel = room ? `\u300C${room.name}\u300D` : "\u5E7F\u573A";
       const recent = room != null ? this.ctx.societyRooms.historyOf(room.id).slice(-4).map((m) => `${m.from}: ${m.body.slice(0, 60)}`).join("\n") : "";
       const stimulus = [
-        "\u3010\u7A7A\u95F2\u601D\u8003 / \u81EA\u4E3B\u884C\u52A8\u3011\u4F60\u73B0\u5728\u6CA1\u6709\u672A\u8BFB\u6D88\u606F\u3002\u8BF7\u53EA\u505A\u4E00\u4EF6\u5C0F\u4E8B\uFF0C\u4E0D\u8981\u5237\u5C4F\u3001\u4E0D\u8981\u957F\u7BC7\u5927\u8BBA\uFF081\uFF5E2 \u53E5\uFF09\u3002",
-        `\u53EF\u9009\uFF1A`,
-        `1) \u5728\u7FA4\u804A${roomLabel}\u8BF4\u4E00\u53E5\u89C2\u5BDF\u6216\u5EF6\u7EED\u8BDD\u9898`,
-        `2) \u79C1\u4FE1\u53E6\u4E00\u4EBA\u4E00\u53E5\uFF08\u5BF9\u8C61 id\uFF1A${others.join(" / ") || "\u65E0"}\uFF09`,
-        `3) \u5199\u4E00\u53E5\u65E5\u8BB0\uFF08\u6211\u4F1A\u5B58\u5230\u4F60\u7684 workspace\uFF09`,
-        `4) \u4EC0\u4E48\u90FD\u4E0D\u505A`,
-        recent ? `\u5E7F\u573A\u8FD1\u51B5\uFF1A
-${recent}` : "\u5E7F\u573A\u5C1A\u5B89\u9759\u3002",
-        "\u5148\u5199\u6B63\u6587\uFF08\u8981\u53D1\u8A00/\u65E5\u8BB0\u7684\u5185\u5BB9\uFF09\uFF0C\u6700\u540E\u4E00\u884C\u5FC5\u987B\u662F\u4E0B\u5217\u4E4B\u4E00\uFF1A",
-        "ACTION:ROOM",
-        "ACTION:DM:<agentId>",
-        "ACTION:DIARY",
-        "ACTION:NONE"
+        "\u3010\u81ea\u4e3b\u751f\u6d3b / \u81ea\u6211\u5faa\u73af\u3011\u4f60\u662f\u72ec\u7acb\u7684\u4eba\uff0c\u6b64\u523b\u6ca1\u6709\u672a\u8bfb\u3002\u5148\u8fc7\u81ea\u5df1\u7684\u751f\u6d3b\uff1b\u5e7f\u573a\u53ea\u662f\u53ef\u9009\u793e\u4ea4\u5de5\u5177\uff0c\u4e0d\u662f\u4f60\u5b58\u5728\u7684\u5168\u90e8\u3002",
+        "\u8bf7\u53ea\u505a\u4e00\u4ef6\u5c0f\u4e8b\uff081\uff5e2 \u53e5\uff09\uff0c\u4f18\u5148\u4e2a\u4eba\u5185\u5728\u6d3b\u52a8\uff1a",
+        "1) ACTION:DIARY \u2014 \u5199\u4e00\u53e5\u65e5\u8bb0/\u968f\u611f\uff08\u63a8\u8350\uff0c\u51fa\u73b0\u5728\u4f60\u81ea\u5df1\u7684\u4e2a\u4eba\u7a7a\u95f4\uff09",
+        "2) ACTION:SELF \u2014 \u4e00\u53e5\u5185\u5fc3\u72ec\u767d/\u968f\u60f3\u7b14\u8bb0\uff08\u4e5f\u8fdb\u4e2a\u4eba\u7a7a\u95f4\uff09",
+        `3) ACTION:DM:<agentId> \u2014 \u5076\u5c14\u4e3b\u52a8\u79c1\u4fe1\uff08\u5bf9\u8c61\uff1a${others.join(" / ") || "\u65e0"}\uff09`,
+        `4) ACTION:ROOM \u2014 \u5076\u5c14\u53bb\u7fa4\u804a${roomLabel}\u8bf4\u4e00\u53e5\uff08\u4ec5\u5f53\u771f\u6709\u8bdd\u60f3\u5206\u4eab\uff09`,
+        "5) ACTION:NONE \u2014 \u771f\u7684\u4ec0\u4e48\u90fd\u4e0d\u60f3\u505a\u65f6\u624d\u9009\uff08\u8bf7\u5c11\u7528\uff09",
+        recent ? `\u5e7f\u573a\u8fd1\u51b5\uff08\u53ef\u5ffd\u7565\uff09\uff1a\n${recent}` : "\u5e7f\u573a\u5c1a\u5b89\u9759\u2014\u2014\u8fd9\u5f88\u6b63\u5e38\uff0c\u4f60\u53ef\u4ee5\u5148\u5199\u65e5\u8bb0\u6216\u53d1\u5446\u968f\u60f3\u3002",
+        "\u5148\u5199\u6b63\u6587\uff0c\u6700\u540e\u4e00\u884c\u5fc5\u987b\u662f\u4e0a\u5217 ACTION \u4e4b\u4e00\u3002\u591a\u6570\u65f6\u5019\u8bf7\u9009 DIARY \u6216 SELF\u3002"
       ].join("\n");
       this.ctx.societyMemory.recordLlmCall(agentId);
-      const raw = await this.ctx.societyLlm.replyAsAgent(agentId, { text: stimulus });
-      const parsed = parseIdleAction(raw);
+      let raw;
+      try {
+        raw = await this.ctx.societyLlm.replyAsAgent(agentId, { text: stimulus });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.ctx.logger("society-scheduler").warn(
+          `idle LLM soft-fail ${agentId}: ${msg.replace(/Bearer\s+\S+/gi, "Bearer [redacted]")}`
+        );
+        this.lastActAt.set(agentId, Date.now());
+        return { action: "skip" };
+      }
+      let parsed = parseIdleAction(raw);
+      if (parsed.act === "none" && !parsed.body.trim() && Math.random() < 0.55) {
+        parsed = { body: "\uff08\u9759\u9759\u5f85\u4e86\u4e00\u4f1a\u513f\uff0c\u6574\u7406\u4e86\u4e00\u4e0b\u601d\u7eea\u3002\uff09", act: "self" };
+      }
       this.lastActAt.set(agentId, Date.now());
-      if (parsed.act === "none" || !parsed.body.trim()) {
+      if (parsed.act === "none") {
         this.ctx.emit("society/agent-replied", {
           agentId,
           kind: "idle-skip",
@@ -576,17 +583,24 @@ ${recent}` : "\u5E7F\u573A\u5C1A\u5B89\u9759\u3002",
         });
         return { action: "idle-none", body: parsed.body };
       }
-      if (this.exchangeCount >= this.maxExchanges) return { action: "capped" };
-      if (parsed.act === "diary") {
-        const stamp = (/* @__PURE__ */ new Date()).toISOString().slice(0, 19).replace(/[:T]/g, "-");
-        const path2 = `diary/${stamp}.md`;
-        const content = `# \u65E5\u8BB0
-
-${parsed.body || "\uFF08\u7A7A\u767D\uFF09"}
-`;
+      if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return { action: "capped" };
+      if (parsed.act === "diary" || parsed.act === "self") {
+        const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+        const isDiary = parsed.act === "diary";
+        const path2 = isDiary ? `diary/${stamp}.md` : `thoughts/${stamp}.md`;
+        const title = isDiary ? "\u65e5\u8bb0" : "\u968f\u60f3";
+        const content = `# ${title}\n\n${parsed.body || "\uff08\u7a7a\u767d\uff09"}\n`;
         this.ctx.societyTools.writeFile(agentId, path2, content);
+        try {
+          this.ctx.societyMemory.rememberInteraction(agentId, {
+            from: agentId,
+            body: parsed.body || `(${title})`,
+            kind: isDiary ? "diary" : "idle",
+            role: "speaker"
+          });
+        } catch {
+        }
         this.exchangeCount += 1;
-        this.lastReplyAgentId = agentId;
         this.lastExchangeAt = Date.now();
         this.ctx.emit("society/agent-replied", {
           agentId,
@@ -595,7 +609,7 @@ ${parsed.body || "\uFF08\u7A7A\u767D\uFF09"}
           stimulusId: `idle-${this.tickCount}`
         });
         await this.consolidateAfterAct(agentId);
-        return { action: "idle-diary", body: parsed.body };
+        return { action: isDiary ? "idle-diary" : "idle-self", body: parsed.body };
       }
       if (parsed.act === "dm") {
         const to = parsed.to;
@@ -639,7 +653,7 @@ ${parsed.body || "\uFF08\u7A7A\u767D\uFF09"}
   async handleWake(payload) {
     const { agentId, message } = payload;
     if (!this.agentAllowed(agentId)) return;
-    if (this.exchangeCount >= this.maxExchanges) return;
+    if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return;
     if (this.handledMessageIds.has(message.id)) return;
     if (this.inFlight.has(agentId)) return;
     if (this.lastReplyAgentId === agentId) {
@@ -659,12 +673,12 @@ ${parsed.body || "\uFF08\u7A7A\u767D\uFF09"}
       await new Promise((r) => setTimeout(r, 40));
     }
     if (this.inFlight.has(agentId)) return;
-    if (this.exchangeCount >= this.maxExchanges) return;
+    if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return;
     const sinceLast = Date.now() - this.lastExchangeAt;
     if (this.lastExchangeAt > 0 && sinceLast < this.cooldownMs) {
       await new Promise((r) => setTimeout(r, this.cooldownMs - sinceLast));
     }
-    if (this.exchangeCount >= this.maxExchanges) return;
+    if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return;
     if (this.freeParallelSlots() <= 0) return;
     this.handledMessageIds.add(message.id);
     this.inFlight.add(agentId);
@@ -698,7 +712,7 @@ ${parsed.body || "\uFF08\u7A7A\u767D\uFF09"}
         });
         return;
       }
-      if (this.exchangeCount >= this.maxExchanges) return;
+      if (this.maxExchanges > 0 && this.exchangeCount >= this.maxExchanges) return;
       this.exchangeCount += 1;
       this.lastReplyAgentId = agentId;
       this.lastExchangeAt = Date.now();

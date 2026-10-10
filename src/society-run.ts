@@ -37,7 +37,7 @@ async function main() {
   const cooldownMs = envInt('SOCIETY_COOLDOWN_MS', 800)
   const agentCooldownMs = envInt('SOCIETY_AGENT_COOLDOWN_MS', 400)
   const idleStaleMs = envInt('SOCIETY_IDLE_STALE_MS', 2_500)
-  const maxParallelReplies = Math.max(1, envInt('SOCIETY_MAX_PARALLEL_REPLIES', 2) || 1)
+  const maxParallelReplies = Math.max(1, Math.min(8, envInt('SOCIETY_MAX_PARALLEL_REPLIES', 5) || 5))
 
   console.log(
     `✓ caps: maxTicks=${maxTicks} maxExchanges=${maxExchanges} tickMs=${tickMs} cooldownMs=${cooldownMs} agentCooldownMs=${agentCooldownMs} idleStaleMs=${idleStaleMs} maxParallelReplies=${maxParallelReplies} (LLM budget unlimited)`,

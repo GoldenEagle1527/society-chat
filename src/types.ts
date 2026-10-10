@@ -86,7 +86,7 @@ export interface DeliverMailRequest {
 
 /** One interaction fact for society-memory. */
 export interface MemoryInteraction {
-  kind: 'room' | 'direct' | 'system'
+  kind: 'room' | 'direct' | 'system' | 'diary' | 'idle' | 'self'
   from: AgentId | 'system' | 'room'
   body: string
   roomId?: RoomId
