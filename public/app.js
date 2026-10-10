@@ -236,6 +236,43 @@
     放松: '😎',
   };
 
+
+  const STAT_ICONS = {
+    openness: { icon: '🌐', label: '开放' },
+    trust: { icon: '🤝', label: '信任' },
+    energy: { icon: '⚡', label: '精力' },
+  };
+
+  function parseStatDeltas(raw) {
+    const out = [];
+    const re = /(openness|trust|energy)\s*([+-]\d+(?:\.\d+)?)/gi;
+    let m;
+    while ((m = re.exec(String(raw || '')))) {
+      const key = m[1].toLowerCase();
+      const meta = STAT_ICONS[key];
+      if (!meta) continue;
+      const num = Number(m[2]);
+      out.push({
+        key,
+        icon: meta.icon,
+        label: meta.label,
+        text: `${m[2]}`,
+        up: num >= 0,
+      });
+    }
+    return out;
+  }
+
+  function deltaPillsHtml(deltas) {
+    if (!deltas || !deltas.length) return '';
+    return deltas
+      .map(
+        (d) =>
+          `<span class="tg-delta-pill ${d.up ? 'up' : 'down'}" title="${esc(d.key)}">${d.icon}<span class="tg-delta-lab">${esc(d.label)}</span><span class="tg-delta-val">${esc(d.text)}</span></span>`,
+      )
+      .join('');
+  }
+
   const KIND_ICONS = {
     soul: '✨',
     tool: '🔧',
@@ -259,6 +296,7 @@
   function parseSystemBanner(m) {
     const kind = String(m.kind || 'system');
     const raw = String(m.body || '').replace(/\s+/g, ' ').trim();
+    let deltas = [];
     const moodMatch = raw.match(/心情\s*([^\s·]+)/);
     const mood = moodMatch ? moodMatch[1] : '';
     const hasRoom = /群聊|room:/.test(raw);
@@ -281,15 +319,17 @@
       else parts.push('性格微调');
       if (hasRoom) parts.push('群聊');
       else if (hasDm) parts.push('私信');
-      const deltas = raw.match(/(?:openness|trust|energy)[+-][\d.]+(?:\s*·\s*(?:openness|trust|energy)[+-][\d.]+)*/);
-      if (deltas) parts.push(deltas[0].replace(/\s+/g, ''));
-      else {
+      const statDeltas = parseStatDeltas(raw);
+      deltas = statDeltas;
+      if (!statDeltas.length) {
         const other = raw
           .replace(/^✦\s*/, '')
           .replace(/性格微调/g, '')
           .replace(/心情\s*[^\s·]+/g, '')
           .replace(/群聊|私信(?:·\S+)?|room:\S+|dm-from:\S+|原因[：:]\s*/g, '')
+          .replace(/(?:openness|trust|energy)\s*[+-][\d.]+/gi, '')
           .replace(/^[·•\s]+|[·•\s]+$/g, '')
+          .replace(/[·•]\s*[·•]/g, '·')
           .trim();
         if (other) parts.push(other.slice(0, 36));
       }
@@ -313,7 +353,8 @@
     }
 
     if (label.length > 96) label = label.slice(0, 95) + '…';
-    return { lead, kindGlyph, kind, label, title: String(m.body || '').trim() };
+    if (!deltas.length) deltas = parseStatDeltas(raw);
+    return { lead, kindGlyph, kind, label, deltas, title: String(m.body || '').trim() };
   }
 
   function renderSystemBanner(m) {
@@ -323,6 +364,7 @@
         <div class="tg-bubble tg-sys-banner">
           <span class="tg-sys-icon" aria-hidden="true">${b.lead}</span>
           <span class="tg-sys-text">${esc(b.label)}</span>
+          <span class="tg-sys-deltas">${deltaPillsHtml(b.deltas || [])}</span>
           <span class="tg-sys-kind" title="${esc(b.kind)}" aria-label="${esc(b.kind)}">${b.kindGlyph}</span>
         </div>
         <time class="tg-msg-time" datetime="${esc(m.createdAt || '')}">${esc(fmtClock(m.createdAt))}</time>
