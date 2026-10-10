@@ -185,6 +185,17 @@
     </div>
   </div>
 
+  <!-- Journal / diary viewer -->
+  <div class="tg-modal hidden" id="journalModal" aria-hidden="true">
+    <div class="tg-modal-backdrop" id="journalBackdrop"></div>
+    <div class="tg-modal-card tg-modal-card-wide tg-journal-card" role="dialog" aria-labelledby="journalTitle">
+      <button type="button" class="tg-modal-close" id="journalClose" aria-label="关闭">×</button>
+      <h2 id="journalTitle" class="tg-modal-heading">日记</h2>
+      <p class="tg-muted tg-journal-meta" id="journalMeta"></p>
+      <pre class="tg-journal-body" id="journalBody">加载中…</pre>
+    </div>
+  </div>
+
   <!-- Settings drawer -->
   <div class="tg-drawer hidden" id="settingsDrawer" aria-hidden="true">
     <div class="tg-drawer-backdrop" id="settingsBackdrop"></div>

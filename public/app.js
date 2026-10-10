@@ -69,6 +69,12 @@
     settingsBackdrop: document.getElementById('settingsBackdrop'),
     settingsClose: document.getElementById('settingsClose'),
     settingsBody: document.getElementById('settingsBody'),
+    journalModal: document.getElementById('journalModal'),
+    journalBackdrop: document.getElementById('journalBackdrop'),
+    journalClose: document.getElementById('journalClose'),
+    journalTitle: document.getElementById('journalTitle'),
+    journalMeta: document.getElementById('journalMeta'),
+    journalBody: document.getElementById('journalBody'),
   };
 
   /** @type {any} */
@@ -337,8 +343,21 @@
       }
       label = parts.filter(Boolean).join(' · ');
     } else if (hasDiary) {
-      lead = KIND_ICONS.diary;
+      const isThought = String(m.journalPath || '').startsWith('thoughts/');
+      lead = isThought ? '💭' : KIND_ICONS.diary;
       kindGlyph = KIND_ICONS.diary;
+      // Show clock + latest snippet; drop redundant filename-only labels
+      if (m.journalTitle || m.journalClock) {
+        const bits = [];
+        bits.push(isThought ? '随想' : '日记');
+        if (m.journalClock) bits.push(m.journalClock);
+        let snippet = raw;
+        const parts = raw.split(' · ');
+        if (parts.length >= 3) snippet = parts.slice(2).join(' · ');
+        else if (parts.length === 2) snippet = parts[1];
+        if (snippet && snippet !== m.journalTitle) bits.push(snippet);
+        label = bits.filter(Boolean).join(' · ');
+      }
     } else if (hasFile) {
       lead = '📄';
       kindGlyph = KIND_ICONS.tool;
@@ -361,13 +380,23 @@
 
   function renderSystemBanner(m) {
     const b = parseSystemBanner(m);
-    return `<div class="tg-row system" title="${esc(b.title)}">
+    const jPath = String(m.journalPath || '').trim();
+    const jAgent = String(m.from || '').trim();
+    const clickable = !!(jPath && jAgent && jAgent !== 'system');
+    const dataAttrs = clickable
+      ? ` data-journal-agent="${esc(jAgent)}" data-journal-path="${esc(jPath)}" role="button" tabindex="0"`
+      : '';
+    const clickClass = clickable ? ' tg-journal-click' : '';
+    const openHint = clickable ? '<span class="tg-sys-open" title="打开全文">›</span>' : '';
+    const tip = clickable ? `${b.title || b.label}（点击查看全文）` : b.title;
+    return `<div class="tg-row system" title="${esc(tip)}">
       <div class="tg-msg-wrap">
-        <div class="tg-bubble tg-sys-banner">
+        <div class="tg-bubble tg-sys-banner${clickClass}"${dataAttrs}>
           <span class="tg-sys-icon" aria-hidden="true">${b.lead}</span>
           <span class="tg-sys-text">${esc(b.label)}</span>
           <span class="tg-sys-deltas">${deltaPillsHtml(b.deltas || [])}</span>
           <span class="tg-sys-kind" title="${esc(b.kind)}" aria-label="${esc(b.kind)}">${b.kindGlyph}</span>
+          ${openHint}
         </div>
         <time class="tg-msg-time" datetime="${esc(m.createdAt || '')}">${esc(fmtClock(m.createdAt))}</time>
       </div>
@@ -467,6 +496,20 @@
       node.addEventListener('click', (e) => {
         e.stopPropagation();
         openProfile(node.getAttribute('data-agent'));
+      });
+    });
+    el.messages.querySelectorAll('[data-journal-path]').forEach((node) => {
+      const open = () =>
+        openJournal(node.getAttribute('data-journal-agent'), node.getAttribute('data-journal-path'));
+      node.addEventListener('click', (e) => {
+        e.stopPropagation();
+        open();
+      });
+      node.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          open();
+        }
       });
     });
   }
@@ -739,6 +782,39 @@
     el.birthModel.placeholder = def ? `默认 ${def}` : '该通道免费默认模型';
     if (!el.birthModel.value.trim() && def) {
       el.birthModel.dataset.defaultModel = def;
+    }
+  }
+
+  function closeJournal() {
+    el.journalModal.classList.add('hidden');
+    el.journalModal.setAttribute('aria-hidden', 'true');
+  }
+
+  async function openJournal(agentId, journalPath) {
+    const aid = String(agentId || '').trim();
+    const jp = String(journalPath || '').trim();
+    if (!aid || !jp) return;
+    el.journalModal.classList.remove('hidden');
+    el.journalModal.setAttribute('aria-hidden', 'false');
+    el.journalTitle.textContent = jp.startsWith('thoughts/') ? '随想' : '日记';
+    el.journalMeta.textContent = `${aid} · ${jp}`;
+    el.journalBody.textContent = '加载中…';
+    try {
+      const q = new URLSearchParams({ agentId: aid, path: jp });
+      const res = await fetch('/api/journal?' + q.toString());
+      const data = await res.json();
+      if (!res.ok) {
+        el.journalBody.textContent = '无法打开：' + (data.error || res.status);
+        return;
+      }
+      el.journalTitle.textContent = data.title || el.journalTitle.textContent;
+      const bits = [data.path];
+      if (data.mtime) bits.push('更新 ' + fmtTime(data.mtime));
+      if (data.clock) bits.push('最新 ' + data.clock);
+      el.journalMeta.textContent = bits.join(' · ');
+      el.journalBody.textContent = data.text || '（空白）';
+    } catch (e) {
+      el.journalBody.textContent = '加载失败：' + e;
     }
   }
 
@@ -1032,7 +1108,10 @@
   el.dmPickClose.addEventListener('click', closeDmPickModal);
   el.dmPickBackdrop.addEventListener('click', closeDmPickModal);
 
-  el.birthClose.addEventListener('click', closeBirthModal);
+    el.journalClose.addEventListener('click', closeJournal);
+  el.journalBackdrop.addEventListener('click', closeJournal);
+
+el.birthClose.addEventListener('click', closeBirthModal);
   el.birthCancel.addEventListener('click', closeBirthModal);
   el.birthBackdrop.addEventListener('click', closeBirthModal);
   el.birthCreate.addEventListener('click', birthAgent);

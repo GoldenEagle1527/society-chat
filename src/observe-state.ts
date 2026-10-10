@@ -75,6 +75,12 @@ export interface ObserveChatMessage {
   createdAt: string
   /** text | diary | soul | tool | system */
   kind: string
+  /** Relative path under agent workspace, e.g. diary/2026-10-10.md */
+  journalPath?: string
+  /** Latest ## HH:MM clock from the daily file, if any */
+  journalClock?: string
+  /** Banner title e.g. 日记 2026-10-10 */
+  journalTitle?: string
 }
 
 export interface ObserveChat {
@@ -177,19 +183,117 @@ function todayKeyLocal(): string {
 }
 
 
-function cleanJournalPreview(text: string): string {
-  let t = String(text || '')
-  // Prefer the latest ## HH:MM entry when daily journals append sections
-  const parts = t.split(/^##\s+/m).filter(Boolean)
-  if (parts.length > 1) {
-    const last = parts[parts.length - 1] || ''
-    t = last.replace(/^\d{1,2}:\d{2}\s*/, '')
+export interface JournalPreview {
+  preview: string
+  clock?: string
+  title?: string
+}
+
+/** Extract latest ## HH:MM body; preserve meaning even when only headers exist. */
+export function cleanJournalPreview(text: string): JournalPreview {
+  const raw = String(text || '').replace(/\r\n/g, '\n')
+  const titleMatch = raw.match(/^#+\s*((?:日记|随想)[^\n#]*)/m)
+  const title = titleMatch ? titleMatch[1]!.trim() : undefined
+
+  const sectionRe = /^##\s+(\d{1,2}:\d{2})\s*\n([\s\S]*?)(?=^##\s+\d{1,2}:\d{2}\s*$|$)/gm
+  let clock: string | undefined
+  let body = ''
+  for (const m of raw.matchAll(sectionRe)) {
+    clock = m[1]
+    body = m[2] || ''
   }
-  t = t.replace(/^#+\s*(日记|随想)[^\n]*\n?/gm, '')
-  t = t.replace(/^ACTION:\s*(DIARY|SELF|ROOM|NONE|DM:\S+)\s*$/gim, '')
-  t = t.replace(/\|{3}/g, ' ')
-  t = t.replace(/\s+/g, ' ').trim()
-  return clip(t, 220)
+
+  let preview = body
+  if (!preview.trim()) {
+    preview = raw
+      .replace(/^#+\s*(?:日记|随想)[^\n]*\n?/gm, '')
+      .replace(/^##\s+\d{1,2}:\d{2}\s*$/gm, '')
+  }
+  preview = preview
+    .replace(/^ACTION:\s*(DIARY|SELF|ROOM|NONE|DM:\S+)\s*$/gim, '')
+    .replace(/\|{3}/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  if (!preview) {
+    if (clock) preview = `（${clock} 更新）`
+    else if (title) preview = title
+    else preview = '（空白日记）'
+  }
+  return { preview: clip(preview, 220), clock, title }
+}
+
+/** Read diary/thoughts markdown preserving newlines (needed for ## HH:MM sections). */
+function readJournalRaw(file: string, maxChars = 120_000): string {
+  try {
+    let raw = fs.readFileSync(file, 'utf8')
+    if (raw.length > maxChars) {
+      // Keep a short head (title) + recent tail so latest entries survive
+      const head = raw.slice(0, 500)
+      const tail = raw.slice(-(maxChars - 600))
+      raw = `${head}\n\n…\n\n${tail}`
+    }
+    return raw
+  } catch {
+    return ''
+  }
+}
+
+const JOURNAL_PATH_RE = /^(diary|thoughts)\/[A-Za-z0-9._-]+\.(md|txt)$/i
+const AGENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/
+
+export interface AgentJournalFile {
+  ok: true
+  agentId: string
+  path: string
+  title: string
+  text: string
+  mtime: string
+  preview: string
+  clock?: string
+}
+
+/** Safe read of one agent diary/thoughts file for GET /api/journal. */
+export function readAgentJournal(
+  agentId: string,
+  relPath: string,
+): AgentJournalFile | { ok: false; error: string } {
+  const id = String(agentId || '').trim()
+  const rel = String(relPath || '').trim().replace(/\\/g, '/')
+  if (!AGENT_ID_RE.test(id)) return { ok: false, error: 'invalid agentId' }
+  if (!JOURNAL_PATH_RE.test(rel) || rel.includes('..')) {
+    return { ok: false, error: 'path must be diary/*.md or thoughts/*.md' }
+  }
+  const ws = agentWorkspaceDir(id)
+  const full = path.normalize(path.join(ws, rel))
+  if (!full.startsWith(path.normalize(ws + path.sep)) && full !== path.normalize(ws)) {
+    return { ok: false, error: 'path escapes workspace' }
+  }
+  if (!fs.existsSync(full) || !fs.statSync(full).isFile()) {
+    return { ok: false, error: 'not found' }
+  }
+  let text = ''
+  try {
+    text = fs.readFileSync(full, 'utf8')
+  } catch {
+    return { ok: false, error: 'read failed' }
+  }
+  if (text.length > 500_000) text = text.slice(0, 500_000) + '\n\n…(truncated)'
+  const st = fs.statSync(full)
+  const cleaned = cleanJournalPreview(text)
+  const base = path.basename(rel).replace(/\.(md|txt)$/i, '')
+  const isDiary = rel.startsWith('diary/')
+  const title = cleaned.title || (isDiary ? `日记 ${base}` : `随想 ${base}`)
+  return {
+    ok: true,
+    agentId: id,
+    path: rel,
+    title,
+    text,
+    mtime: st.mtime.toISOString(),
+    preview: cleaned.preview,
+    clock: cleaned.clock,
+  }
 }
 
 function clip(s: string, n: number): string {
@@ -357,7 +461,7 @@ export function readObserveState(opts?: {
       const selfId = selfChatId(id)
       const selfMsgs: ObserveChatMessage[] = []
 
-      // Diary files
+      // Diary files (one banner per daily md; body = latest ## HH:MM snippet)
       const diaryDir = path.join(agentWorkspaceDir(id), 'diary')
       if (fs.existsSync(diaryDir)) {
         try {
@@ -365,16 +469,25 @@ export function readObserveState(opts?: {
             if (!/\.(md|txt)$/i.test(name)) continue
             const full = path.join(diaryDir, name)
             const st = fs.statSync(full)
-            const preview = readTextPreview(full, 500)
-            const cleaned = cleanJournalPreview(preview)
+            const raw = readJournalRaw(full)
+            const cleaned = cleanJournalPreview(raw)
+            const day = name.replace(/\.(md|txt)$/i, '')
+            const title = cleaned.title || `日记 ${day}`
+            const snippet = cleaned.preview
+            const body = cleaned.clock
+              ? `${title} · ${cleaned.clock} · ${snippet}`
+              : `${title} · ${snippet}`
             selfMsgs.push({
               id: `diary:${id}:${name}`,
               chatId: selfId,
               from: id,
               fromName: displayName,
-              body: cleaned || `日记 ${name}`,
+              body,
               createdAt: st.mtime.toISOString(),
               kind: 'diary',
+              journalPath: `diary/${name}`,
+              journalClock: cleaned.clock,
+              journalTitle: title,
             })
           }
         } catch {
@@ -471,7 +584,7 @@ export function readObserveState(opts?: {
         }
       }
 
-      // Thoughts / 随想 files (one banner per file; not also from working memory)
+      // Thoughts / 随想 files (one banner per daily file; clickable via journalPath)
       const thoughtsDir = path.join(agentWorkspaceDir(id), 'thoughts')
       if (fs.existsSync(thoughtsDir)) {
         try {
@@ -479,16 +592,25 @@ export function readObserveState(opts?: {
             if (!/\.(md|txt)$/i.test(name)) continue
             const full = path.join(thoughtsDir, name)
             const st = fs.statSync(full)
-            const preview = readTextPreview(full, 500)
-            const cleaned = cleanJournalPreview(preview)
+            const raw = readJournalRaw(full)
+            const cleaned = cleanJournalPreview(raw)
+            const day = name.replace(/\.(md|txt)$/i, '')
+            const title = cleaned.title || `随想 ${day}`
+            const snippet = cleaned.preview
+            const body = cleaned.clock
+              ? `${title} · ${cleaned.clock} · ${snippet}`
+              : `${title} · ${snippet}`
             selfMsgs.push({
               id: `thought:${id}:${name}`,
               chatId: selfId,
               from: id,
               fromName: displayName,
-              body: cleaned || `随想 ${name}`,
+              body,
               createdAt: st.mtime.toISOString(),
               kind: 'diary',
+              journalPath: `thoughts/${name}`,
+              journalClock: cleaned.clock,
+              journalTitle: title,
             })
           }
         } catch {

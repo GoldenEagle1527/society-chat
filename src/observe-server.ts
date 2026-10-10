@@ -10,7 +10,7 @@ import http from 'node:http'
 import path from 'node:path'
 import type { RoomMessage } from './types.ts'
 import { HUMAN_SPEAKER_ID, speakerLabel } from './types.ts'
-import { isForbiddenObservePath, readObserveState } from './observe-state.ts'
+import { isForbiddenObservePath, readAgentJournal, readObserveState } from './observe-state.ts'
 import { readObserveSettings, type ObserveSettings } from './observe-settings.ts'
 import { PROJECT_ROOT } from './paths.ts'
 
@@ -251,6 +251,31 @@ export function createObserveServer(opts: ObserveServerOptions): ObserveServer {
       try {
         const settings = opts.getSettings ? opts.getSettings() : readObserveSettings()
         sendJson(res, 200, { ok: true, mode: opts.mode, ...settings })
+      } catch (err) {
+        sendJson(res, 500, {
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+      return
+    }
+
+    // Full daily diary / thoughts markdown (read-only; same gate as /api/state)
+    if (req.method === 'GET' && pathname === '/api/journal') {
+      try {
+        const agentId = String(url.searchParams.get('agentId') || '').trim()
+        const rel =
+          String(url.searchParams.get('path') || url.searchParams.get('journalPath') || '').trim()
+        if (!agentId || !rel) {
+          sendJson(res, 400, { error: 'agentId and path required' })
+          return
+        }
+        const result = readAgentJournal(agentId, rel)
+        if (!result.ok) {
+          const status = result.error === 'not found' ? 404 : 400
+          sendJson(res, status, { error: result.error })
+          return
+        }
+        sendJson(res, 200, result)
       } catch (err) {
         sendJson(res, 500, {
           error: err instanceof Error ? err.message : String(err),

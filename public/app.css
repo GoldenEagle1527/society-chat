@@ -952,3 +952,47 @@ button { cursor: pointer; border: none; background: none; }
 .tg-delta-val {
   font-variant-numeric: tabular-nums;
 }
+
+
+/* ——— Journal viewer ——— */
+.tg-journal-card {
+  width: min(640px, 100%);
+  max-height: min(90vh, 820px);
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 16px;
+}
+.tg-journal-meta {
+  margin: -4px 0 12px;
+  font-size: 12px;
+}
+.tg-journal-body {
+  flex: 1 1 auto;
+  margin: 0;
+  padding: 14px 16px;
+  max-height: min(68vh, 620px);
+  overflow: auto;
+  background: #15202b;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  color: #e7ecf1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tg-sys-banner.tg-journal-click {
+  cursor: pointer;
+}
+.tg-sys-banner.tg-journal-click:hover {
+  background: rgba(36, 52, 68, 0.95);
+  border-color: rgba(100, 169, 220, 0.25);
+}
+.tg-sys-banner .tg-sys-open {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: #64a9dc;
+  opacity: 0.85;
+  margin-left: 4px;
+}
