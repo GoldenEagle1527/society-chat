@@ -1,0 +1,39 @@
+# Windows Docker Desktop: copy .env.example → .env, then:
+#   docker compose up -d --build
+# Open http://localhost:8787
+services:
+  society:
+    build: .
+    image: society-chat:local
+    container_name: society-chat
+    ports:
+      - "8787:8787"
+    env_file:
+      - .env
+    environment:
+      # Outer container isolation; per-agent still path-isolated in workspace
+      SOCIETY_SANDBOX_MODE: docker
+      SOCIETY_OBSERVE_HOST: "0.0.0.0"
+      SOCIETY_OBSERVE_PORT: "8787"
+      # Browser → Docker published port is not 127.0.0.1 inside the container
+      SOCIETY_OBSERVE_ALLOW_REMOTE_SAY: "1"
+      # 0 = unlimited ticks while live UI is up
+      SOCIETY_MAX_TICKS: "0"
+      SOCIETY_MAX_EXCHANGES: "${SOCIETY_MAX_EXCHANGES:-200}"
+      SOCIETY_TICK_MS: "${SOCIETY_TICK_MS:-2000}"
+    volumes:
+      # Persist agents / rooms / memory / soul / workspaces on the host
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8787/api/state').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s

@@ -1,0 +1,30 @@
+# Society profile composition (Cordis loader format).
+# smoke/boot/*-smoke mount these via src/boot.ts.
+# When integrating with real dsh, point a profile cordis.patch.yml insert at the same modules.
+
+- id: society-identity
+  name: './plugins/society-identity/src/index.ts'
+
+- id: society-mailbox
+  name: './plugins/society-mailbox/src/index.ts'
+
+- id: society-rooms
+  name: './plugins/society-rooms/src/index.ts'
+
+- id: society-memory
+  name: './plugins/society-memory/src/index.ts'
+
+- id: society-soul
+  name: './plugins/society-soul/src/index.ts'
+
+- id: society-sandbox
+  name: './plugins/society-sandbox/src/index.ts'
+
+- id: society-tools
+  name: './plugins/society-tools/src/index.ts'
+
+- id: society-llm
+  name: './plugins/society-llm/src/index.ts'
+
+- id: society-scheduler
+  name: './plugins/society-scheduler/src/index.ts'

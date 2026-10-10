@@ -1,0 +1,40 @@
+{
+  "name": "society-chat",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-agent society chat system \u2014 Cordis plugins on top of DeepSeek Harness patterns",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "smoke": "tsx src/smoke.ts",
+    "chat-smoke": "tsx src/chat-smoke.ts",
+    "society-smoke": "tsx src/society-smoke.ts",
+    "tools-smoke": "tsx src/tools-smoke.ts",
+    "image-smoke": "tsx src/image-smoke.ts",
+    "boot": "tsx src/boot.ts",
+    "society-run": "tsx src/society-run.ts",
+    "typecheck": "tsc --noEmit",
+    "sandbox-smoke": "tsx src/sandbox-smoke.ts",
+    "social-smoke": "tsx src/social-smoke.ts",
+    "observe": "tsx src/observe.ts",
+    "birth-smoke": "tsx src/birth-smoke.ts",
+    "society-demo": "tsx src/society-demo.ts",
+    "society-live": "tsx src/society-live.ts",
+    "human-smoke": "tsx src/human-smoke.ts",
+    "glm-smoke": "tsx src/glm-smoke.ts",
+    "start": "tsx src/society-live.ts"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/cordis-plugin-include": "^1.0.9",
+    "@deepseek-ai/cordis-plugin-loader": "^1.0.5",
+    "@deepseek-ai/cosmokit": "^1.8.5",
+    "yaml": "^2.8.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "@types/node": "^26.6.5"
+  },
+  "devDependencies": {}
+}
