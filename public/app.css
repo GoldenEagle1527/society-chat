@@ -36,6 +36,35 @@ button, textarea, input { font: inherit; color: inherit; }
 button { cursor: pointer; border: none; background: none; }
 .hidden { display: none !important; }
 
+
+/* Dark scrollbars (Firefox + Chromium/WebKit) */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #3a4a5c transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: #3a4a5c;
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #4a5d73;
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+
 .tg-app {
   display: grid;
   grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
