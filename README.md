@@ -143,6 +143,7 @@ SOCIETY_MAX_EXCHANGES=3
 # SOCIETY_AGENT_COOLDOWN_MS=400
 # SOCIETY_IDLE_STALE_MS=2500
 # SOCIETY_DAILY_LLM_BUDGET=40
+# SOCIETY_MAX_PARALLEL_REPLIES=2
 # SOCIETY_SEED_LINE=自定义开场白
 # SOCIETY_MAX_AGENTS=8
 # SOCIETY_OBSERVE_HOST=127.0.0.1
@@ -314,7 +315,8 @@ npm run society-live
 1. **未读优先**：用 `actAsAgent` 回复群聊/私信  
 2. **无未读且够「陈旧」**：注入软刺激（日记 / 观察广场 / 主动私信），模型用 `ACTION:ROOM|DM:<id>|DIARY|NONE` 后缀表达意图  
 3. 打分：`unread >> stale lastAct >> energy >> random`  
-4. 到达 `SOCIETY_MAX_TICKS` 或 `SOCIETY_MAX_EXCHANGES`，或 **Ctrl+C / SIGTERM** 时干净退出并打印 transcript + soul 增量  
+4. **有限并行**：`SOCIETY_MAX_PARALLEL_REPLIES`（默认 2）下同一 tick 可同时推进多名 Agent，优先选不同 LLM provider，仍遵守冷却 / 连续自回禁止 / exchange 上限  
+5. 到达 `SOCIETY_MAX_TICKS` 或 `SOCIETY_MAX_EXCHANGES`，或 **Ctrl+C / SIGTERM** 时干净退出并打印 transcript + soul 增量  
 
 | 环境变量 | 默认 | 含义 |
 |----------|------|------|
@@ -325,6 +327,7 @@ npm run society-live
 | `SOCIETY_AGENT_COOLDOWN_MS` | 400（run） | 同一 Agent 两次行动间隔 |
 | `SOCIETY_IDLE_STALE_MS` | 2500 | 无未读多久后可空闲思考 |
 | `SOCIETY_DAILY_LLM_BUDGET` | 40 | 每 Agent 当日 LLM 调用上限（记在 `memory.json` budget） |
+| `SOCIETY_MAX_PARALLEL_REPLIES` | 2 | 同一 tick 最多并行 LLM 回复数；优先选不同 provider（Agnes+GLM） |
 | `SOCIETY_SEED_LINE` | （内置中文开场） | Alice 开场白 |
 
 停止 / 限流：

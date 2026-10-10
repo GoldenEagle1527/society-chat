@@ -12,6 +12,7 @@
  *   SOCIETY_AGENT_COOLDOWN_MS=400
  *   SOCIETY_IDLE_STALE_MS=2500
  *   SOCIETY_DAILY_LLM_BUDGET=40
+ *   SOCIETY_MAX_PARALLEL_REPLIES=2
  *   AGNES_MODEL=agnes-3.0-flash (free only)
  *
  * Never logs API keys. Ctrl+C / SIGTERM stops cleanly.
@@ -48,9 +49,10 @@ async function main() {
   const agentCooldownMs = envInt('SOCIETY_AGENT_COOLDOWN_MS', 400)
   const idleStaleMs = envInt('SOCIETY_IDLE_STALE_MS', 2_500)
   const dailyLlmBudget = envInt('SOCIETY_DAILY_LLM_BUDGET', 40)
+  const maxParallelReplies = Math.max(1, envInt('SOCIETY_MAX_PARALLEL_REPLIES', 2) || 1)
 
   console.log(
-    `✓ caps: maxTicks=${maxTicks} maxExchanges=${maxExchanges} tickMs=${tickMs} cooldownMs=${cooldownMs} agentCooldownMs=${agentCooldownMs} idleStaleMs=${idleStaleMs} dailyLlmBudget=${dailyLlmBudget}`,
+    `✓ caps: maxTicks=${maxTicks} maxExchanges=${maxExchanges} tickMs=${tickMs} cooldownMs=${cooldownMs} agentCooldownMs=${agentCooldownMs} idleStaleMs=${idleStaleMs} dailyLlmBudget=${dailyLlmBudget} maxParallelReplies=${maxParallelReplies}`,
   )
   console.log('  stop: Ctrl+C / SIGINT / SIGTERM, or wait for caps')
 
@@ -79,6 +81,7 @@ async function main() {
     agentCooldownMs,
     idleStaleMs,
     dailyLlmBudget,
+    maxParallelReplies,
   })
 
   let room = ctx.societyRooms.listRooms().find((r) => r.name === 'plaza')
@@ -150,9 +153,18 @@ async function main() {
     }
 
     const result = await ctx.societyScheduler.runTick()
+    const parallelBits =
+      result.parallel && result.parallel.length > 1
+        ? ` parallel=[${result.parallel
+            .map((p) => `${p.agentId || '?'}:${p.action}${p.provider ? `@${p.provider}` : ''}`)
+            .join(', ')}]`
+        : result.provider
+          ? ` provider=${result.provider}`
+          : ''
     console.log(
       `[tick ${result.tick}/${maxTicks}] action=${result.action}` +
         (result.agentId ? ` agent=${result.agentId}` : '') +
+        parallelBits +
         ` exchanges=${result.exchanges}/${result.maxExchanges}`,
     )
 

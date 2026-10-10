@@ -345,11 +345,13 @@ button { cursor: pointer; border: none; background: none; }
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 16px 18px 12px;
+  padding: 16px 20px 12px;
   display: flex;
   flex-direction: column;
   gap: 2px;
   -webkit-overflow-scrolling: touch;
+  /* Full-width list; bubbles cap themselves (Telegram-style). */
+  width: 100%;
 }
 
 .tg-day {
@@ -363,16 +365,30 @@ button { cursor: pointer; border: none; background: none; }
   font-weight: 600;
 }
 
+/* Row spans the full pane; bubble width is capped below. */
 .tg-row {
   display: flex;
   gap: 8px;
-  max-width: min(680px, 92%);
+  width: 100%;
+  max-width: 100%;
   margin: 2px 0;
   align-items: flex-end;
+  align-self: stretch;
+  box-sizing: border-box;
 }
-.tg-row.out { align-self: flex-end; flex-direction: row-reverse; }
-.tg-row.in { align-self: flex-start; }
-.tg-row.system { align-self: center; max-width: min(560px, 90%); }
+.tg-row.out {
+  justify-content: flex-end;
+  flex-direction: row-reverse;
+}
+.tg-row.in {
+  justify-content: flex-start;
+}
+.tg-row.system {
+  justify-content: center;
+  width: auto;
+  max-width: min(560px, 90%);
+  align-self: center;
+}
 
 .tg-bubble {
   padding: 8px 12px 6px;
@@ -381,9 +397,11 @@ button { cursor: pointer; border: none; background: none; }
   box-shadow: 0 1px 1px rgba(0,0,0,0.15);
   position: relative;
   word-wrap: break-word;
+  overflow-wrap: anywhere;
   white-space: pre-wrap;
   line-height: 1.4;
   font-size: 14.5px;
+  max-width: 100%;
 }
 .tg-row.out .tg-bubble {
   background: var(--bubble-out);
@@ -416,8 +434,10 @@ button { cursor: pointer; border: none; background: none; }
   display: flex;
   align-items: flex-end;
   gap: 6px;
-  max-width: 100%;
+  /* Telegram-ish bubble column: ~65–72% of pane, soft cap ~640px */
+  max-width: min(72%, 640px);
   min-width: 0;
+  flex: 0 1 auto;
 }
 .tg-row.in .tg-msg-wrap { flex-direction: row; }
 .tg-row.out .tg-msg-wrap { flex-direction: row-reverse; }

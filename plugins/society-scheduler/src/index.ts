@@ -13,6 +13,7 @@
  * - per-agent cooldown + global cooldown
  * - each inbox message id handled at most once
  * - daily-ish LLM call budget in memory.json
+ * - limited parallel replies (SOCIETY_MAX_PARALLEL_REPLIES, prefer different LLM providers)
  */
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { AgentId, InboxMessage, RoomId } from '../../../src/types.ts'
@@ -58,15 +59,26 @@ export interface AutoReplyOptions {
   dailyLlmBudget?: number
   /** Default plaza room for idle ROOM acts. */
   defaultRoomId?: RoomId
+  /**
+   * Max agents whose LLM calls may run at once (default SOCIETY_MAX_PARALLEL_REPLIES || 2).
+   * Prefer picking agents on different providers when > 1.
+   */
+  maxParallelReplies?: number
 }
 
-export interface TickResult {
-  tick: number
+export interface TickActionResult {
   action: 'reply' | 'idle-room' | 'idle-dm' | 'idle-diary' | 'idle-none' | 'skip' | 'capped' | 'none'
   agentId?: AgentId
   body?: string
+  provider?: string
+}
+
+export interface TickResult extends TickActionResult {
+  tick: number
   exchanges: number
   maxExchanges: number
+  /** When parallel > 1, every sub-act in this tick (includes the primary). */
+  parallel?: TickActionResult[]
 }
 
 function envInt(name: string, fallback: number): number {
@@ -146,6 +158,7 @@ export class SocietySchedulerService extends Service {
   private agentCooldownMs = 0
   private idleStaleMs = 3_000
   private dailyLlmBudget = 40
+  private maxParallelReplies = 2
   private defaultRoomId: RoomId | null = null
 
   private exchangeCount = 0
@@ -243,6 +256,8 @@ export class SocietySchedulerService extends Service {
     this.agentCooldownMs = opts?.agentCooldownMs ?? envInt('SOCIETY_AGENT_COOLDOWN_MS', 0)
     this.idleStaleMs = opts?.idleStaleMs ?? envInt('SOCIETY_IDLE_STALE_MS', 3_000)
     this.dailyLlmBudget = opts?.dailyLlmBudget ?? envInt('SOCIETY_DAILY_LLM_BUDGET', 40)
+    const parallelRaw = opts?.maxParallelReplies ?? envInt('SOCIETY_MAX_PARALLEL_REPLIES', 2)
+    this.maxParallelReplies = Math.max(1, Math.min(8, parallelRaw || 1))
     if (opts?.defaultRoomId) this.defaultRoomId = opts.defaultRoomId
   }
 
@@ -316,22 +331,66 @@ export class SocietySchedulerService extends Service {
     return unread * 10_000 + staleMs / 100 + energy * 100 + explore
   }
 
-  private pickAgent(): AgentId | null {
-    const agents = this.ctx.societyIdentity.list().map((a) => a.id)
-    let best: AgentId | null = null
-    let bestScore = -1
-    for (const id of agents) {
-      const s = this.scoreAgent(id)
-      if (s > bestScore) {
-        bestScore = s
-        best = id
-      }
+  private providerOf(agentId: AgentId): string {
+    try {
+      return this.ctx.societyLlm.resolveConfig(agentId).provider
+    } catch {
+      return 'unknown'
     }
-    return bestScore >= 0 ? best : null
+  }
+
+  private pickAgent(): AgentId | null {
+    const picked = this.pickAgents(1)
+    return picked[0] ?? null
   }
 
   /**
-   * One heartbeat tick: pick agent by score, drain one unread or idle-think.
+   * Pick up to `limit` agents by score, preferring different LLM providers
+   * so Agnes + GLM can answer in the same tick without stacking one RPM bucket.
+   */
+  private pickAgents(limit: number): AgentId[] {
+    const n = Math.max(0, limit)
+    if (n === 0) return []
+    const agents = this.ctx.societyIdentity.list().map((a) => a.id)
+    const ranked = agents
+      .map((id) => ({ id, score: this.scoreAgent(id), provider: this.providerOf(id) }))
+      .filter((x) => x.score >= 0)
+      .sort((a, b) => b.score - a.score)
+    if (ranked.length === 0) return []
+
+    const chosen: AgentId[] = []
+    const usedProviders = new Set<string>()
+
+    // Pass 1: take best agent per unused provider (spreads Agnes vs GLM)
+    for (const cand of ranked) {
+      if (chosen.length >= n) break
+      if (usedProviders.has(cand.provider)) continue
+      chosen.push(cand.id)
+      usedProviders.add(cand.provider)
+    }
+
+    // Pass 2: fill remaining by score (may repeat providers)
+    for (const cand of ranked) {
+      if (chosen.length >= n) break
+      if (chosen.includes(cand.id)) continue
+      chosen.push(cand.id)
+    }
+
+    return chosen
+  }
+
+  /** How many more LLM acts may start right now. */
+  private freeParallelSlots(): number {
+    return Math.max(0, this.maxParallelReplies - this.inFlight.size)
+  }
+
+  maxParallelRepliesOf(): number {
+    return this.maxParallelReplies
+  }
+
+  /**
+   * One heartbeat tick: pick up to maxParallelReplies agents (prefer different
+   * providers), drain unread or idle-think in parallel.
    * Used by society-run; does not rely on enableAutoReply.
    */
   async runTick(): Promise<TickResult> {
@@ -346,42 +405,55 @@ export class SocietySchedulerService extends Service {
       return { ...base, action: 'capped' }
     }
 
-    const agentId = this.pickAgent()
-    if (!agentId) {
+    const slots = this.freeParallelSlots()
+    if (slots <= 0) {
+      return { ...base, action: 'skip' }
+    }
+
+    const agentIds = this.pickAgents(slots)
+    if (agentIds.length === 0) {
       return { ...base, action: 'none' }
+    }
+
+    const subResults = await Promise.all(agentIds.map((id) => this.runOneAgentTick(id)))
+    const primary = subResults.find((r) => r.action !== 'skip' && r.action !== 'none') ?? subResults[0]!
+    return {
+      ...base,
+      exchanges: this.exchangeCount,
+      action: primary.action,
+      agentId: primary.agentId,
+      body: primary.body,
+      provider: primary.provider,
+      parallel: subResults,
+    }
+  }
+
+  /** Single-agent slice of a tick (unread drain or idle). */
+  private async runOneAgentTick(agentId: AgentId): Promise<TickActionResult> {
+    const provider = this.providerOf(agentId)
+    if (this.exchangeCount >= this.maxExchanges) {
+      return { action: 'capped', agentId, provider }
     }
 
     const unread = this.ctx.societyMailbox.list(agentId, { unreadOnly: true })
     if (unread.length > 0) {
       const msg = unread[0]!
       const ok = await this.processUnread(agentId, msg)
-      return {
-        ...base,
-        exchanges: this.exchangeCount,
-        action: ok ? 'reply' : 'skip',
-        agentId,
-        body: ok ? undefined : undefined,
-      }
+      return { action: ok ? 'reply' : 'skip', agentId, provider }
     }
 
     // Idle thought only if stale enough (never idle before any exchange — wait for seed drain)
     const lastAct = this.lastActAt.get(agentId) ?? 0
     const stale = lastAct === 0 ? Number.POSITIVE_INFINITY : Date.now() - lastAct
     if (this.exchangeCount === 0) {
-      return { ...base, action: 'skip', agentId }
+      return { action: 'skip', agentId, provider }
     }
     if (stale < this.idleStaleMs) {
-      return { ...base, action: 'skip', agentId }
+      return { action: 'skip', agentId, provider }
     }
 
     const idle = await this.runIdleThought(agentId)
-    return {
-      ...base,
-      exchanges: this.exchangeCount,
-      action: idle.action,
-      agentId,
-      body: idle.body,
-    }
+    return { action: idle.action, agentId, body: idle.body, provider }
   }
 
   private async processUnread(agentId: AgentId, message: InboxMessage): Promise<boolean> {
@@ -621,11 +693,26 @@ export class SocietySchedulerService extends Service {
     }
     if (!this.budgetOk(agentId)) return
 
+    // Wait briefly for a parallel slot (Agnes+GLM can share the cap).
+    const slotDeadline = Date.now() + 30_000
+    while (this.freeParallelSlots() <= 0) {
+      if (Date.now() > slotDeadline) {
+        this.ctx.logger('society-scheduler').info(
+          `skip ${agentId}: parallel reply slots full (max=${this.maxParallelReplies})`,
+        )
+        return
+      }
+      await new Promise((r) => setTimeout(r, 40))
+    }
+    if (this.inFlight.has(agentId)) return
+    if (this.exchangeCount >= this.maxExchanges) return
+
     const sinceLast = Date.now() - this.lastExchangeAt
     if (this.lastExchangeAt > 0 && sinceLast < this.cooldownMs) {
       await new Promise((r) => setTimeout(r, this.cooldownMs - sinceLast))
     }
     if (this.exchangeCount >= this.maxExchanges) return
+    if (this.freeParallelSlots() <= 0) return
 
     this.handledMessageIds.add(message.id)
     this.inFlight.add(agentId)

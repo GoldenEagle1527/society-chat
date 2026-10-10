@@ -64,6 +64,7 @@ async function main(): Promise<void> {
   const agentCooldownMs = envInt('SOCIETY_AGENT_COOLDOWN_MS', 400)
   const idleStaleMs = envInt('SOCIETY_IDLE_STALE_MS', 8_000)
   const dailyLlmBudget = envInt('SOCIETY_DAILY_LLM_BUDGET', 80)
+  const maxParallelReplies = Math.max(1, envInt('SOCIETY_MAX_PARALLEL_REPLIES', 2) || 1)
 
   const app = await bootSociety({ loadSeeds: true })
   const { ctx } = app
@@ -89,6 +90,7 @@ async function main(): Promise<void> {
     agentCooldownMs,
     idleStaleMs,
     dailyLlmBudget,
+    maxParallelReplies,
   })
 
   let room = ctx.societyRooms.listRooms().find((r) => r.name === 'plaza')
