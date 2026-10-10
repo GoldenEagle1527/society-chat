@@ -155,51 +155,183 @@ function idleBiasFor(agentId: string): { preferSearch: boolean; socialPrefer: nu
   }
 }
 
-function cleanIdleBody(raw: string): string {
-  return String(raw || '')
-    .split(/\r?\n/)
-    .filter((line) => !/^ACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE|SILENT|SEARCH)\s*$/i.test(line.trim()))
-    .join('\n')
-    .replace(/\|{3}/g, '\n')
-    .trim()
-}
+/** Loose ACTION control line (optional trailing junk on same line). */
+const ACTION_LINE_LOOSE_RE =
+  /^ACTION:\s*(ROOM|DM:(\S+)|DIARY|SELF|NONE|SILENT|SEARCH|REPLY)\b/i
 
-function parseIdleAction(raw: string): {
+export interface IdleActionParse {
   body: string
   act: 'room' | 'dm' | 'diary' | 'self' | 'none'
   to?: string
-} {
-  const text = raw.trim()
+  /** True when the model echoed a multi-ACTION menu instead of choosing one. */
+  malformed?: boolean
+}
+
+/** Strip ACTION control tokens/lines so they never reach room / DM / diary. */
+export function stripActionMarkup(raw: string): string {
+  return String(raw || '')
+    .split(/\r?\n/)
+    .map((line) => {
+      const t = line.trim()
+      if (ACTION_LINE_LOOSE_RE.test(t)) return ''
+      return line.replace(/\bACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE|SILENT|SEARCH|REPLY)\b/gi, '')
+    })
+    .filter((line) => line.trim().length > 0)
+    .join('\n')
+    .replace(/\|{3}/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .trim()
+}
+
+/** Count distinct ACTION directives (menu detection). */
+export function countActionDirectives(text: string): number {
+  const matches = String(text || '').match(
+    /(?:^|\n)\s*ACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE|SILENT|SEARCH|REPLY)\b/gi,
+  )
+  return matches?.length ?? 0
+}
+
+/** True if text still looks like an instruction / option menu, not speech. */
+export function looksLikeInstructionMenu(text: string): boolean {
+  const t = String(text || '')
+  if (countActionDirectives(t) >= 2) return true
+  if (/ACTION:\s*ROOM[\s\S]*ACTION:\s*DM:[\s\S]*ACTION:\s*DIARY/i.test(t)) return true
+  const dashLines = (t.match(/^[-—–─]{1,3}.+$/gm) || []).length
+  if (dashLines >= 2 && /ACTION:\s*(ROOM|DM|DIARY)/i.test(t)) return true
+  // echoed numbered menu remnants without clean ACTION lines left
+  if (
+    dashLines >= 2 &&
+    /(去群聊|主动私信|写一句日记|内心独白)/.test(t) &&
+    /(「plaza」|agentId|随感)/i.test(t)
+  ) {
+    return true
+  }
+  return false
+}
+
+function isPlaceholderQuote(s: string): boolean {
+  const t = s.trim()
+  if (!t) return true
+  if (/^ACTION:/i.test(t)) return true
+  if (/^(ROOM|DM:|DIARY|SELF|NONE|SILENT|SEARCH|REPLY)$/i.test(t)) return true
+  // room names / ids / placeholders echoed from the prompt
+  if (/^(plaza|agentId|<agentId>|agnes|glm|xingchen[_a-z0-9]*)$/i.test(t)) return true
+  if (t.length <= 12 && /^[A-Za-z0-9_.<>-]+$/.test(t)) return true
+  return false
+}
+
+/** Pull a single concrete utterance from menu-ish model dumps. */
+export function extractConcreteIdleBody(text: string): string {
+  const t = String(text || '').trim()
+  if (!t) return ''
+
+  const quoteRe = /「([^」]{1,160})」|"([^"]{1,160})"|“([^”]{1,160})”/g
+  const quotes: string[] = []
+  let m: RegExpExecArray | null
+  while ((m = quoteRe.exec(t)) !== null) {
+    const s = (m[1] || m[2] || m[3] || '').trim()
+    if (isPlaceholderQuote(s)) continue
+    quotes.push(s)
+  }
+  // First concrete quoted utterance in document order (skip 「plaza」 placeholders)
+  if (quotes.length) return quotes[0]!.slice(0, 500)
+
+  for (const line of t.split(/\r?\n/)) {
+    let lineT = line.trim()
+    if (!lineT) continue
+    if (/^ACTION:/i.test(lineT)) continue
+    if (/^\d+[).、]\s*ACTION:/i.test(lineT)) continue
+    if (/^\d+[).、]/.test(lineT) && /ACTION:/.test(lineT)) continue
+    if (/^(请只做|先写正文|然后|优先|必须|不要|先用工具)/.test(lineT)) continue
+    if (/^[-—–─]{1,3}/.test(lineT)) {
+      const inner = lineT.replace(/^[-—–─]+\s*/, '')
+      const qm = inner.match(/「([^」]+)」|"([^"]+)"|“([^”]+)”/)
+      if (qm) {
+        const s = (qm[1] || qm[2] || qm[3] || '').trim()
+        if (s && !isPlaceholderQuote(s)) return s.slice(0, 500)
+      }
+      if (/^(在|主动|写一句|内容|对象|去群聊|分享)/.test(inner)) continue
+      lineT = inner
+    }
+    if (lineT.length >= 2) return lineT.slice(0, 500)
+  }
+  return ''
+}
+
+/** @deprecated prefer stripActionMarkup */
+function cleanIdleBody(raw: string): string {
+  return stripActionMarkup(raw)
+}
+
+/**
+ * Parse idle LLM output: body is text above the final ACTION line only.
+ * Multi-ACTION menus are malformed → pick ROOM (if socialPrefer) or DIARY,
+ * using the first concrete sentence, or none/SILENT if nothing recoverable.
+ */
+export function parseIdleAction(
+  raw: string,
+  opts?: { socialPrefer?: number },
+): IdleActionParse {
+  const text = String(raw ?? '').trim()
+  const socialPrefer = opts?.socialPrefer ?? 0
+  const preferRoom = socialPrefer > 0
+  if (!text) return { body: '', act: 'none' }
+
   const lines = text.split(/\r?\n/)
-  let actLine = ''
+  const actionIdxs: number[] = []
+  for (let i = 0; i < lines.length; i++) {
+    if (ACTION_LINE_LOOSE_RE.test(lines[i]!.trim())) actionIdxs.push(i)
+  }
+
+  const malformedMenu = actionIdxs.length >= 2 || countActionDirectives(text) >= 2
+
+  if (malformedMenu) {
+    const cleaned = stripActionMarkup(text)
+    const body = extractConcreteIdleBody(cleaned)
+    if (!body) return { body: '', act: 'none', malformed: true }
+    return { body, act: preferRoom ? 'room' : 'diary', malformed: true }
+  }
+
   let cut = lines.length
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i]!.trim()
-    if (/^ACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE|SILENT|SEARCH)\s*$/i.test(line)) {
-      actLine = line
-      cut = i
-      break
+  let actLine = ''
+  if (actionIdxs.length === 1) {
+    cut = actionIdxs[0]!
+    actLine = lines[cut]!.trim()
+  }
+
+  let body = stripActionMarkup(lines.slice(0, cut).join('\n'))
+
+  // Soft-fail / recover if body still looks like an instruction menu
+  if (looksLikeInstructionMenu(body) || (body && looksLikeInstructionMenu(text))) {
+    const recovered = extractConcreteIdleBody(stripActionMarkup(text))
+    if (!recovered) return { body: '', act: 'none', malformed: true }
+    return {
+      body: recovered,
+      act: preferRoom ? 'room' : 'diary',
+      malformed: true,
     }
   }
-  const body = lines.slice(0, cut).join('\n').trim()
+
   if (!actLine) {
-    // Balanced default: keep a personal note rather than vanishing
     if (body) return { body, act: 'diary' }
     return { body: '', act: 'none' }
   }
-  const m = actLine.match(/^ACTION:\s*(ROOM|DM:(\S+)|DIARY|SELF|NONE|SILENT|SEARCH)\s*$/i)
-  if (!m) return { body, act: 'none' }
+
+  const m = actLine.match(ACTION_LINE_LOOSE_RE)
+  if (!m) {
+    if (body) return { body, act: 'diary' }
+    return { body: '', act: 'none' }
+  }
   const kind = m[1]!.toUpperCase()
   if (kind === 'ROOM' || kind === 'SEARCH') return { body, act: 'room' }
   if (kind === 'DIARY') return { body, act: 'diary' }
   if (kind === 'SELF') return { body, act: 'self' }
-  if (kind === 'NONE' || kind === 'SILENT') {
-    // Body with NONE/SILENT → still keep a personal note rather than vanishing
+  if (kind === 'NONE' || kind === 'SILENT' || kind === 'REPLY') {
     if (body) return { body, act: 'diary' }
     return { body: '', act: 'none' }
   }
   if (kind.startsWith('DM:')) {
-    const to = (m[2] || kind.slice(3)).trim().toLowerCase()
+    const to = (m[2] || kind.slice(3)).trim().toLowerCase().replace(/^<|>$/g, '')
     return { body, act: 'dm', to }
   }
   return { body, act: 'none' }
@@ -531,9 +663,22 @@ export class SocietySchedulerService extends Service {
     dmTo?: AgentId
   }): Promise<void> {
     const { agentId, bubbles, stimulusId, roomId, dmTo } = opts
+    let posted = 0
     for (let i = 0; i < bubbles.length; i++) {
-      const body = bubbles[i]!
-      if (i > 0 && this.bubbleGapMs > 0) await sleep(this.bubbleGapMs)
+      let body = stripActionMarkup(bubbles[i]!)
+      if (!body.trim()) continue
+      if (looksLikeInstructionMenu(body) || countActionDirectives(body) >= 1) {
+        // Never post ACTION menus / leftover control lines as chat
+        body = extractConcreteIdleBody(body)
+        if (!body.trim() || looksLikeInstructionMenu(body)) {
+          this.ctx.logger('society-scheduler').warn(
+            `drop menu-like bubble from ${agentId}`,
+          )
+          continue
+        }
+      }
+      if (posted > 0 && this.bubbleGapMs > 0) await sleep(this.bubbleGapMs)
+      posted += 1
       if (roomId) {
         this.ctx.societyRooms.post({ roomId, from: agentId, body })
         this.ctx.emit('society/agent-replied', {
@@ -711,7 +856,7 @@ export class SocietySchedulerService extends Service {
           ...actionMenu.slice(0, 4),
           '优先 ACTION:ROOM 去广场分享短评；若此刻更想沉淀就 ACTION:DIARY。',
           recent ? `广场近况：\n${recent}` : '广场尚安静——正好适合你带一条新热点过去。',
-          '先用工具，再写正文，最后一行必须是上列 ACTION 之一。不要 SILENT，不要空搜不写。',
+          '先用工具，再写正文，最后一行必须是上列 ACTION 之一（只选一个）。不要 SILENT，不要空搜不写，不要抄整份菜单。',
         ].join('\n')
       } else if (useTools) {
         stimulus = [
@@ -724,7 +869,7 @@ export class SocietySchedulerService extends Service {
           ...actionMenu,
           recent ? `广场近况：\n${recent}` : '广场尚安静——你可以去打招呼，或先记一笔。',
           `社交与日记要混合：大约 ${Math.round(bias.socialPrefer * 100)}% 时候选 ROOM/DM，其余 DIARY/SELF。`,
-          '先写正文（若用了工具就根据结果写），最后一行必须是上列 ACTION 之一。',
+          '先写正文（若用了工具就根据结果写），最后一行必须是上列 ACTION 之一。只选一个，禁止列出多个 ACTION 菜单。',
         ].join('\n')
       } else {
         stimulus = [
@@ -732,7 +877,7 @@ export class SocietySchedulerService extends Service {
           '请只做一件小事（1～3 句），社交与日记要混合，别只会闷头写日记：',
           ...actionMenu,
           recent ? `广场近况：\n${recent}` : '广场尚安静——你可以主动去说一句，或先写日记。',
-          `先写正文，最后一行必须是上列 ACTION 之一。大约 ${Math.round(bias.socialPrefer * 100)}% 时候请选 ROOM 或 DM。`,
+          `先写正文，最后一行必须是上列 ACTION 之一（只选一个，禁止把 1)2)3) 整份菜单抄回来）。大约 ${Math.round(bias.socialPrefer * 100)}% 时候请选 ROOM 或 DM。`,
         ].join('\n')
       }
 
@@ -755,7 +900,21 @@ export class SocietySchedulerService extends Service {
       if (steerSearch) {
         this.lastSearchIdleAt.set(agentId, Date.now())
       }
-      let parsed = parseIdleAction(raw)
+      let parsed = parseIdleAction(raw, { socialPrefer: bias.socialPrefer })
+      parsed = { ...parsed, body: stripActionMarkup(parsed.body || '') }
+      if (parsed.malformed) {
+        this.ctx.logger('society-scheduler').warn(
+          `idle malformed ACTION menu from ${agentId}; recovered act=${parsed.act}`,
+        )
+      }
+      // Soft-fail: still looks like an instruction menu after recovery
+      if (parsed.body && (looksLikeInstructionMenu(parsed.body) || countActionDirectives(parsed.body) >= 2)) {
+        this.ctx.logger('society-scheduler').warn(
+          `idle soft-fail ${agentId}: body still looks like ACTION menu`,
+        )
+        this.lastActAt.set(agentId, Date.now())
+        return { action: 'idle-none', body: '' }
+      }
 
       // Soft bias: empty NONE sometimes becomes a short self-note so society stays alive
       if (parsed.act === 'none' && !parsed.body.trim() && Math.random() < 0.55) {
@@ -793,7 +952,16 @@ export class SocietySchedulerService extends Service {
         const clock = localClock(now)
         const rel = isDiary ? `diary/${day}.md` : `thoughts/${day}.md`
         const title = isDiary ? `日记 ${day}` : `随想 ${day}`
-        const cleanedBody = cleanIdleBody(parsed.body || '') || '（空白）'
+        let cleanedBody = stripActionMarkup(parsed.body || '')
+        if (looksLikeInstructionMenu(cleanedBody) || countActionDirectives(cleanedBody) >= 1) {
+          cleanedBody = extractConcreteIdleBody(cleanedBody)
+        }
+        if (!cleanedBody.trim() || looksLikeInstructionMenu(cleanedBody)) {
+          this.ctx.logger('society-scheduler').warn(
+            `idle soft-fail ${isDiary ? 'diary' : 'self'} ${agentId}: menu body`,
+          )
+          return { action: 'idle-none', body: '' }
+        }
         const entry = `## ${clock}\n\n${cleanedBody}\n`
         let content = ''
         try {
@@ -838,8 +1006,16 @@ export class SocietySchedulerService extends Service {
         if (!to || !this.ctx.societyIdentity.get(to) || to === agentId) {
           return { action: 'idle-none', body: parsed.body }
         }
-        const bubbles = parseAgentTurn(parsed.body || '……').bubbles
-        const parts = bubbles.length ? bubbles : [parsed.body || '……']
+        const safeBody = stripActionMarkup(parsed.body || '') || '……'
+        if (looksLikeInstructionMenu(safeBody)) {
+          this.ctx.logger('society-scheduler').warn(`idle soft-fail DM ${agentId}: menu body`)
+          return { action: 'idle-none', body: '' }
+        }
+        const bubbles = parseAgentTurn(safeBody).bubbles
+        const parts = (bubbles.length ? bubbles : [safeBody])
+          .map((b) => stripActionMarkup(b))
+          .filter((b) => b.trim() && !looksLikeInstructionMenu(b))
+        if (!parts.length) return { action: 'idle-none', body: '' }
         this.exchangeCount += 1
         this.lastReplyAgentId = agentId
         this.lastExchangeAt = Date.now()
@@ -856,8 +1032,16 @@ export class SocietySchedulerService extends Service {
       // room — optional social
       if (!room) return { action: 'idle-none', body: parsed.body }
       {
-        const bubbles = parseAgentTurn(parsed.body || '……').bubbles
-        const parts = bubbles.length ? bubbles : [parsed.body || '……']
+        const safeBody = stripActionMarkup(parsed.body || '') || '……'
+        if (looksLikeInstructionMenu(safeBody)) {
+          this.ctx.logger('society-scheduler').warn(`idle soft-fail ROOM ${agentId}: menu body`)
+          return { action: 'idle-none', body: '' }
+        }
+        const bubbles = parseAgentTurn(safeBody).bubbles
+        const parts = (bubbles.length ? bubbles : [safeBody])
+          .map((b) => stripActionMarkup(b))
+          .filter((b) => b.trim() && !looksLikeInstructionMenu(b))
+        if (!parts.length) return { action: 'idle-none', body: '' }
         this.exchangeCount += 1
         this.lastReplyAgentId = agentId
         this.lastExchangeAt = Date.now()
