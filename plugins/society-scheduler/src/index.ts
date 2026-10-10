@@ -113,6 +113,15 @@ function exchangesCapped(exchangeCount: number, maxExchanges: number): boolean {
   return maxExchanges > 0 && exchangeCount >= maxExchanges
 }
 
+function cleanIdleBody(raw: string): string {
+  return String(raw || '')
+    .split(/\r?\n/)
+    .filter((line) => !/^ACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE)\s*$/i.test(line.trim()))
+    .join('\n')
+    .replace(/\|{3}/g, '\n')
+    .trim()
+}
+
 function parseIdleAction(raw: string): {
   body: string
   act: 'room' | 'dm' | 'diary' | 'self' | 'none'
@@ -678,12 +687,13 @@ export class SocietySchedulerService extends Service {
         const isDiary = parsed.act === 'diary'
         const rel = isDiary ? `diary/${stamp}.md` : `thoughts/${stamp}.md`
         const title = isDiary ? '日记' : '随想'
-        const content = `# ${title}\n\n${parsed.body || '（空白）'}\n`
+        const cleanedBody = cleanIdleBody(parsed.body || '') || '（空白）'
+        const content = `# ${title}\n\n${cleanedBody}\n`
         this.ctx.societyTools.writeFile(agentId, rel, content)
         try {
           this.ctx.societyMemory.rememberInteraction(agentId, {
             from: agentId,
-            body: parsed.body || `(${title})`,
+            body: cleanedBody,
             kind: isDiary ? 'diary' : 'idle',
             role: 'speaker',
           })
@@ -696,7 +706,7 @@ export class SocietySchedulerService extends Service {
         this.ctx.emit('society/agent-replied', {
           agentId,
           kind: 'diary',
-          body: parsed.body || '',
+          body: cleanedBody,
           stimulusId: `idle-${this.tickCount}`,
         })
         await this.consolidateAfterAct(agentId)

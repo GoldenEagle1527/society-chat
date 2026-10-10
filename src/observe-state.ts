@@ -176,6 +176,16 @@ function todayKeyLocal(): string {
   return `${y}-${m}-${day}`
 }
 
+
+function cleanJournalPreview(text: string): string {
+  let t = String(text || '')
+  t = t.replace(/^#+\s*(日记|随想)\s*/gm, '')
+  t = t.replace(/^ACTION:\s*(DIARY|SELF|ROOM|NONE|DM:\S+)\s*$/gim, '')
+  t = t.replace(/\|{3}/g, ' ')
+  t = t.replace(/\s+/g, ' ').trim()
+  return clip(t, 220)
+}
+
 function clip(s: string, n: number): string {
   const t = String(s ?? '')
   return t.length <= n ? t : t.slice(0, n) + '…'
@@ -350,12 +360,13 @@ export function readObserveState(opts?: {
             const full = path.join(diaryDir, name)
             const st = fs.statSync(full)
             const preview = readTextPreview(full, 500)
+            const cleaned = cleanJournalPreview(preview)
             selfMsgs.push({
               id: `diary:${id}:${name}`,
               chatId: selfId,
               from: id,
               fromName: displayName,
-              body: preview ? `📔 日记 ${name}\n${preview}` : `📔 日记 ${name}`,
+              body: cleaned || `日记 ${name}`,
               createdAt: st.mtime.toISOString(),
               kind: 'diary',
             })
@@ -439,24 +450,50 @@ export function readObserveState(opts?: {
                 kind: 'text',
               })
             }
-          } else if (kind === 'diary' || kind === 'system' || kind === 'idle' || kind === 'tool') {
+          } else if (kind === 'tool' || kind === 'system') {
+            // diary/idle are shown from diary/ and thoughts/ files — skip here to avoid duplicates
             selfMsgs.push({
               id: `mem:${id}:${ts}:${hashHue(body) % 1e6}`,
               chatId: selfId,
               from: kind === 'tool' ? 'system' : from === id ? id : from,
               fromName: kind === 'tool' ? '工具' : nameById.get(from) || from,
-              body: kind === 'tool' ? body : body,
+              body,
               createdAt: ts,
-              kind: kind === 'tool' ? 'tool' : kind === 'diary' ? 'diary' : 'system',
+              kind: kind === 'tool' ? 'tool' : 'system',
             })
           }
         }
       }
 
-      // Workspace note files (tool writes) as self activity
+      // Thoughts / 随想 files (one banner per file; not also from working memory)
+      const thoughtsDir = path.join(agentWorkspaceDir(id), 'thoughts')
+      if (fs.existsSync(thoughtsDir)) {
+        try {
+          for (const name of fs.readdirSync(thoughtsDir).sort()) {
+            if (!/\.(md|txt)$/i.test(name)) continue
+            const full = path.join(thoughtsDir, name)
+            const st = fs.statSync(full)
+            const preview = readTextPreview(full, 500)
+            const cleaned = cleanJournalPreview(preview)
+            selfMsgs.push({
+              id: `thought:${id}:${name}`,
+              chatId: selfId,
+              from: id,
+              fromName: displayName,
+              body: cleaned || `随想 ${name}`,
+              createdAt: st.mtime.toISOString(),
+              kind: 'diary',
+            })
+          }
+        } catch {
+          /* skip */
+        }
+      }
+
+      // Workspace note files (tool writes) as self activity — exclude diary/thoughts
       const ws = agentWorkspaceDir(id)
       const files = listTextFiles(ws, 3)
-        .filter((f) => !f.rel.startsWith('diary/'))
+        .filter((f) => !f.rel.startsWith('diary/') && !f.rel.startsWith('thoughts/'))
         .sort((a, b) => a.mtime.localeCompare(b.mtime))
         .slice(-12)
       for (const f of files) {
