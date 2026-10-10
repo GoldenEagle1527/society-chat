@@ -25,3 +25,6 @@ data/agents/carol/
 
 data/agents/dana/
 data/agents/erin/
+
+# Machine-absolute dsh overlay patch (regenerate: npm run build:dsh-overlay)
+profiles/dsh-society/cordis.patch.yml

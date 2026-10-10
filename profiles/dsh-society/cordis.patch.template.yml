@@ -1,0 +1,35 @@
+# Generated / template for DeepSeek Harness out-of-tree society layer.
+# root: __SOCIETY_ROOT__ (replace via npm run build:dsh-overlay)
+#
+# Mount:
+#   export SOCIETY_PROJECT_ROOT=<society-chat checkout>
+#   npm run build:dsh-overlay
+#   dsh --profile headless --dump-config --patch <this-file>
+#
+# Absolute paths required for file: plugins. Re-run build after clone.
+# Default product path: docker compose / npm run society-live
+
+- insert:
+    - id: society-identity
+      name: './lib/society-identity.js'
+    - id: society-mailbox
+      name: './lib/society-mailbox.js'
+    - id: society-rooms
+      name: './lib/society-rooms.js'
+    - id: society-memory
+      name: './lib/society-memory.js'
+    - id: society-soul
+      name: './lib/society-soul.js'
+    - id: society-sandbox
+      name: './lib/society-sandbox.js'
+    - id: society-tools
+      name: './lib/society-tools.js'
+    - id: society-llm
+      name: './lib/society-llm.js'
+    - id: society-scheduler
+      name: './lib/society-scheduler.js'
+    - id: society-dsh-bridge
+      name: './lib/society-dsh-bridge.js'
+      config:
+        loadSeeds: true
+        autoStartScheduler: false

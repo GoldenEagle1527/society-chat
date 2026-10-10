@@ -1,23 +1,5 @@
-# Profile overlay sketch for future DeepSeek Harness (dsh) integration.
-# Apply on top of a headless/sdk base profile. Absolute paths required by dsh loader.
+# Sketch only. Prefer the generated absolute-path overlay:
+#   profiles/dsh-society/cordis.patch.yml  (npm run build:dsh-overlay)
 #
-# Example (after installing/building dsh):
-#   dsh --profile society
-#
-# - insert:
-#     - id: society-identity
-#       name: '/absolute/path/to/society-chat/plugins/society-identity/src/index.ts'
-#     - id: society-mailbox
-#       name: '/absolute/path/to/society-chat/plugins/society-mailbox/src/index.ts'
-#     - id: society-rooms
-#       name: '/absolute/path/to/society-chat/plugins/society-rooms/src/index.ts'
-#     - id: society-memory
-#       name: '/absolute/path/to/society-chat/plugins/society-memory/src/index.ts'
-#     - id: society-soul
-#       name: '/absolute/path/to/society-chat/plugins/society-soul/src/index.ts'
-#     - id: society-llm
-#       name: '/absolute/path/to/society-chat/plugins/society-llm/src/index.ts'
-#     - id: society-scheduler
-#       name: '/absolute/path/to/society-chat/plugins/society-scheduler/src/index.ts'
-
+# Relative names work only when the loader baseUrl is the society-chat root.
 - insert: []

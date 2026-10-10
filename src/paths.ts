@@ -2,8 +2,14 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
-/** Project root: /workspace/society-chat */
-export const PROJECT_ROOT = path.resolve(here, '..')
+
+/**
+ * Project root. Prefer SOCIETY_PROJECT_ROOT when plugins are bundled/loaded
+ * from another tree (dsh overlay, Docker image path remaps).
+ */
+export const PROJECT_ROOT = path.resolve(
+  process.env.SOCIETY_PROJECT_ROOT?.trim() || path.resolve(here, '..'),
+)
 export const DATA_ROOT = path.join(PROJECT_ROOT, 'data')
 export const AGENTS_DATA_ROOT = path.join(DATA_ROOT, 'agents')
 export const AGENTS_SEED_ROOT = path.join(PROJECT_ROOT, 'agents')

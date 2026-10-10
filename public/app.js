@@ -283,11 +283,14 @@
       const out = isOutgoing(m.from);
       const rowClass = out ? 'out' : 'in';
       const agent = agentById(m.from);
-      const modelLabel = (agent && (agent.llmModel || agent.llmProvider)) || '';
+      const modelLabel = (agent && agent.llmModel) || '';
+      const modelTitle = agent?.llmProvider
+        ? `${agent.llmProvider} · ${modelLabel || agent.llmProvider}`
+        : modelLabel;
       const showNameRow = !out && (showNames || chat.kind === 'self' || !!modelLabel);
       const nameHtml = showNameRow
           ? `<div class="tg-name-row"><span class="name" style="color:${esc(bubbleNameColor(m.from))}">${esc(m.fromName || agent?.displayName || m.from)}</span>${
-              modelLabel ? `<span class="tg-model-pill" title="${esc(agent?.llmProvider ? agent.llmProvider + ' · ' + modelLabel : modelLabel)}">${esc(modelLabel)}</span>` : ''
+              modelLabel ? `<span class="tg-model-pill" title="${esc(modelTitle)}">${esc(modelLabel)}</span>` : ''
             }</div>`
           : '';
       const avatarHtml =

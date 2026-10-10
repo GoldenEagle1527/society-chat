@@ -27,17 +27,21 @@
     "start": "tsx src/society-live.ts",
     "memory-smoke": "tsx src/memory-smoke.ts",
     "spawn-route-smoke": "tsx src/spawn-route-smoke.ts",
-    "api-smoke": "tsx src/api-smoke.ts"
+    "api-smoke": "tsx src/api-smoke.ts",
+    "build:dsh-overlay": "node scripts/build-dsh-overlay.mjs",
+    "dsh-overlay-smoke": "tsx src/dsh-overlay-smoke.ts"
   },
   "dependencies": {
     "@deepseek-ai/cordis": "^4.0.4",
     "@deepseek-ai/cordis-plugin-include": "^1.0.9",
     "@deepseek-ai/cordis-plugin-loader": "^1.0.5",
     "@deepseek-ai/cosmokit": "^1.8.5",
-    "yaml": "^2.8.1",
+    "@types/node": "^26.6.5",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2",
-    "@types/node": "^26.6.5"
+    "yaml": "^2.8.1"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
 }

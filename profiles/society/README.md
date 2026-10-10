@@ -1,9 +1,6 @@
-# society profile
+# society profile (sketch)
 
-Out-of-tree profile for multi-agent society chat.
+Use the generated absolute-path overlay instead:
 
-Runtime today: `npm run smoke` / `chat-smoke` / `society-smoke` / `tools-smoke` / `image-smoke` / `boot` via `src/boot.ts` (real `@deepseek-ai/cordis`).
-
-Plugins: identity, mailbox, rooms, memory, soul, tools, llm, scheduler.
-
-Future: mount the same plugins through `cordis.patch.yml` onto a DeepSeek Harness `headless`/`sdk` base.
+- `profiles/dsh-society/` — real `dsh --patch` target
+- See root `INTEGRATION.md`

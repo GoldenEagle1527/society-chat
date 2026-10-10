@@ -391,11 +391,21 @@ npm run memory-smoke        # 强制溢出 → episodic 增长（1 次免费 LLM
 npm run spawn-route-smoke   # 连续 spawn 两人 → 双密钥下 provider 不同
 ```
 
-## 接真实 dsh（后续）
+## 接真实 dsh（可选 overlay）
 
-1. 构建或安装 `@deepseek-ai/dsh`。  
-2. 按 `profiles/society/cordis.patch.yml` 把本仓库插件 `insert` 进 headless/sdk profile。  
-3. 本机已用 bwrap + 网络白名单；若日后有容器运行时可再叠加。
+**日常用法仍是 Docker / `npm run society-live`。** 若要把同一套 `society-*` Cordis 服务挂进官方 DeepSeek Harness：
+
+```bash
+npm run build:dsh-overlay          # 生成绝对路径 patch + lib/*.js
+export SOCIETY_PROJECT_ROOT="$PWD"
+npx @deepseek-ai/dsh@0.2.0-rc.2 \
+  --profile headless \
+  --dump-config \
+  --patch "$PWD/profiles/dsh-society/cordis.patch.yml"
+```
+
+需要 **Node ≥ 22.19**。验证加载：`dsh … --help` 应出现 `[society-dsh-bridge] ready`。  
+多 Agent 对话与电报 UI **仍**由本仓库进程提供；细节与缺口见 [INTEGRATION.md](./INTEGRATION.md)。
 
 ## 权限隔离（bubblewrap，无 Docker）
 

@@ -1,0 +1,26 @@
+{
+  "name": "dsh-society-chat",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Out-of-tree society-chat layer for DeepSeek Harness (dsh)",
+  "type": "module",
+  "files": [
+    "lib/*.js",
+    "lib/*.js.map",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "society-chat",
+    "multi-agent"
+  ]
+}
