@@ -17,6 +17,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { loadDotEnv, requireAgnesConfig } from './env.ts'
 import { bootSociety } from './boot.ts'
+import { ensureSmokeAliceBob } from './smoke-fixtures.ts'
 import { agentDataDir } from './paths.ts'
 
 async function main() {
@@ -43,6 +44,7 @@ async function main() {
 
   const app = await bootSociety({ loadSeeds: true })
   const { ctx } = app
+  ensureSmokeAliceBob(ctx)
 
   const alice = ctx.societyIdentity.require('alice')
   const bob = ctx.societyIdentity.require('bob')

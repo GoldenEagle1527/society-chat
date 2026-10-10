@@ -208,3 +208,66 @@ export function societyWorkingMax(defaultValue = 20): number {
 export function societyConsolidateCooldownMs(defaultValue = 300_000): number {
   return societyEnvInt('SOCIETY_CONSOLIDATE_COOLDOWN_MS', defaultValue)
 }
+
+/** Known free providers (keys may or may not be present). */
+export function isKnownFreeProvider(raw: unknown): boolean {
+  const s = String(raw ?? '')
+    .trim()
+    .toLowerCase()
+  return (
+    s === 'agnes' ||
+    s === 'glm' ||
+    s === 'zhipu' ||
+    s === 'zhipuai' ||
+    s === 'siliconflow' ||
+    s === 'silicon' ||
+    s === 'sf' ||
+    s === 'silicon-flow'
+  )
+}
+
+/**
+ * Validate an explicit spawn LLM route:
+ * - provider must be a known free id AND currently configured (API key present)
+ * - model must pass that provider's free allowlist (defaulted when omitted)
+ * Never logs keys.
+ */
+export function resolveExplicitFreeLlm(
+  providerRaw: unknown,
+  modelRaw?: unknown,
+): { provider: LlmProviderId; model: string } {
+  loadDotEnv()
+  if (!isKnownFreeProvider(providerRaw)) {
+    throw new Error(
+      `Unknown or paid provider "${String(providerRaw)}": use agnes | glm | siliconflow`,
+    )
+  }
+  const provider = normalizeProviderId(providerRaw)
+  const configured = configuredFreeProviders()
+  if (!configured.includes(provider)) {
+    throw new Error(
+      `Provider "${provider}" is not configured (missing API key in .env). Configured: ${configured.join(',') || '(none)'}`,
+    )
+  }
+  const model =
+    modelRaw != null && String(modelRaw).trim()
+      ? String(modelRaw).trim()
+      : defaultFreeModelFor(provider)
+  if (provider === 'glm') assertGlmFreeModel(model)
+  else if (provider === 'siliconflow') assertSiliconflowFreeModel(model)
+  else assertAgnesFreeModel(model)
+  return { provider, model }
+}
+
+/** Parse spawn/API llm field: { provider, model? } or flat provider + model. */
+export function parseSpawnLlmInput(input: {
+  llm?: { provider?: unknown; model?: unknown } | null
+  provider?: unknown
+  model?: unknown
+}): { provider: LlmProviderId; model: string } | undefined {
+  const fromObj = input.llm && typeof input.llm === 'object' ? input.llm : null
+  const provider = fromObj?.provider ?? input.provider
+  if (provider == null || String(provider).trim() === '') return undefined
+  const model = fromObj?.model ?? input.model
+  return resolveExplicitFreeLlm(provider, model)
+}

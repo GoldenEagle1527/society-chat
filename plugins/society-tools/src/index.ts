@@ -12,7 +12,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { AgentId, RoomId } from '../../../src/types.ts'
-import { requireAgnesConfig } from '../../../src/env.ts'
+import { parseSpawnLlmInput, requireAgnesConfig } from '../../../src/env.ts'
 import { assertUrlAllowed } from '../../society-sandbox/src/index.ts'
 
 declare module '@deepseek-ai/cordis' {
@@ -273,6 +273,22 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
             description: 'Interest tags (optional)',
           },
           mood: { type: 'string', description: 'Initial mood label (optional)' },
+          provider: {
+            type: 'string',
+            description: 'Free LLM provider: agnes | glm | siliconflow (optional; omit to auto-balance)',
+          },
+          model: {
+            type: 'string',
+            description: 'Free model id for that provider (optional; defaults to provider free flash)',
+          },
+          llm: {
+            type: 'object',
+            description: 'Optional { provider, model? } same as provider/model fields',
+            properties: {
+              provider: { type: 'string' },
+              model: { type: 'string' },
+            },
+          },
         },
         required: ['id', 'displayName', 'persona'],
       },
@@ -398,24 +414,35 @@ export class SocietyToolsService extends Service {
     if (Array.isArray(args.interests)) {
       soul.interests = args.interests.map((x) => String(x)).slice(0, 8)
     }
+    let llm
+    try {
+      llm = parseSpawnLlmInput({
+        llm: args.llm && typeof args.llm === 'object' ? (args.llm as { provider?: unknown; model?: unknown }) : undefined,
+        provider: args.provider,
+        model: args.model,
+      })
+    } catch (err) {
+      return `Error: ${err instanceof Error ? err.message : String(err)}`
+    }
     try {
       const profile = this.ctx.societyIdentity.spawn({
         id,
         displayName,
         persona,
         soul,
+        ...(llm ? { llm } : {}),
       })
       // Seed durable soul + memory files
       this.ctx.societySoul.load(profile.id)
       this.ctx.societyMemory.load(profile.id)
-      const llm = this.ctx.societyIdentity.getLlmPreference(profile.id)
+      const pref = this.ctx.societyIdentity.getLlmPreference(profile.id)
       return JSON.stringify({
         id: profile.id,
         displayName: profile.displayName,
         persona: profile.persona,
         workspacePath: profile.workspacePath,
         bornBy: agentId,
-        llm,
+        llm: pref,
         soul: {
           openness: profile.soul.openness,
           trust: profile.soul.trust,

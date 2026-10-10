@@ -105,14 +105,32 @@ async function main(): Promise<void> {
         throw new Error(`agent already exists: ${id}`)
       }
       const max = readObserveSettings().maxAgents
-      // Simulate cap: seeds alice+bob count as 2 in this mock when checking
       if (agentsSpawned + 2 >= max && max <= 2) {
         throw new Error(`max agents (${max}) reached; set SOCIETY_MAX_AGENTS to raise`)
       }
       agentsSpawned += 1
       spawnedIds.add(id)
+      const explicit =
+        (req.llm && req.llm.provider) || req.provider
+          ? String((req.llm && req.llm.provider) || req.provider).trim().toLowerCase()
+          : ''
+      if (explicit && !['agnes', 'glm', 'siliconflow'].includes(explicit)) {
+        throw new Error(`Unknown or paid provider "${explicit}": use agnes | glm | siliconflow`)
+      }
       const providerCycle = (['agnes', 'glm', 'siliconflow'] as const)[(agentsSpawned - 1) % 3]!
-      const provider = providerCycle
+      const provider = (explicit || providerCycle) as 'agnes' | 'glm' | 'siliconflow'
+      const modelExplicit = (req.llm && req.llm.model) || req.model
+      const model =
+        modelExplicit && String(modelExplicit).trim()
+          ? String(modelExplicit).trim()
+          : provider === 'glm'
+            ? 'glm-4-flash'
+            : provider === 'siliconflow'
+              ? 'XingChenAGI/Xing4.0-29B'
+              : 'agnes-3.0-flash'
+      if (provider === 'agnes' && !/^agnes-[23]\.5-flash$/i.test(model) && !/^agnes-3\.0-flash$/i.test(model) && !/^agnes-2\.5-flash$/i.test(model)) {
+        // keep mock permissive for free flash names already set above
+      }
       return {
         ok: true,
         agent: {
@@ -129,15 +147,7 @@ async function main(): Promise<void> {
           workspacePath: `/tmp/${id}`,
           createdAt: new Date().toISOString(),
         },
-        llm: {
-          provider,
-          model:
-            provider === 'glm'
-              ? 'glm-4-flash'
-              : provider === 'siliconflow'
-                ? 'XingChenAGI/Xing4.0-29B'
-                : 'agnes-3.0-flash',
-        },
+        llm: { provider, model },
         chatIds: { self: `self:${id}`, plaza: 'room:plaza-mock' },
       }
     },
@@ -275,6 +285,50 @@ async function main(): Promise<void> {
   })
   assert.equal(dupBirth.status, 409)
   console.log('✓ POST /api/agents duplicate → 409')
+
+  const explicitBirth = await jsonFetch(base, '/api/agents', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      displayName: 'Erin',
+      persona: '指定硅基流动通道的测试角色。',
+      id: 'erin-sf',
+      llm: { provider: 'siliconflow', model: 'XingChenAGI/Xing4.0-29B' },
+    }),
+  })
+  assert.equal(explicitBirth.status, 200, JSON.stringify(explicitBirth.body))
+  assert.equal(explicitBirth.body.llm.provider, 'siliconflow')
+  assert.equal(explicitBirth.body.llm.model, 'XingChenAGI/Xing4.0-29B')
+  console.log('✓ POST /api/agents explicit llm=siliconflow')
+
+  const flatBirth = await jsonFetch(base, '/api/agents', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      displayName: 'Finn',
+      persona: 'flat provider 字段。',
+      id: 'finn-glm',
+      provider: 'glm',
+      model: 'glm-4-flash',
+    }),
+  })
+  assert.equal(flatBirth.status, 200, JSON.stringify(flatBirth.body))
+  assert.equal(flatBirth.body.llm.provider, 'glm')
+  assert.equal(flatBirth.body.llm.model, 'glm-4-flash')
+  console.log('✓ POST /api/agents flat provider=glm')
+
+  const badProv = await jsonFetch(base, '/api/agents', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      displayName: 'Bad',
+      persona: 'paid',
+      id: 'bad-paid',
+      provider: 'openai',
+    }),
+  })
+  assert.equal(badProv.status, 400)
+  console.log('✓ POST /api/agents rejects unknown provider')
 
   // Forbidden paths
   const envLeak = await new Promise<{ status: number }>((resolve, reject) => {

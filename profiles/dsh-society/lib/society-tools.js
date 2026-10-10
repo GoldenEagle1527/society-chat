@@ -45,10 +45,35 @@ function loadDotEnv(filePath = path2.join(PROJECT_ROOT, ".env")) {
   }
 }
 var AGNES_FREE_FLASH = /^(agnes-2\.5-flash|agnes-3\.0-flash)$/i;
+var GLM_FREE_FLASH = /glm-4-flash/i;
+var SILICONFLOW_FREE = /^XingChenAGI\/Xing4\.0-29B$/i;
+var SILICONFLOW_DEFAULT_MODEL = "XingChenAGI/Xing4.0-29B";
+function normalizeProviderId(raw) {
+  const s = String(raw ?? "").trim().toLowerCase();
+  if (s === "glm" || s === "zhipu" || s === "zhipuai") return "glm";
+  if (s === "siliconflow" || s === "silicon" || s === "sf" || s === "silicon-flow") {
+    return "siliconflow";
+  }
+  return "agnes";
+}
 function assertAgnesFreeModel(model) {
   if (!AGNES_FREE_FLASH.test(model)) {
     throw new Error(
       `Refusing Agnes model "${model}": must use free agnes-3.0-flash or agnes-2.5-flash.`
+    );
+  }
+}
+function assertGlmFreeModel(model) {
+  if (!GLM_FREE_FLASH.test(model)) {
+    throw new Error(
+      `Refusing GLM model "${model}": society-chat only allows free flash ids matching /glm-4-flash/i (e.g. glm-4-flash, glm-4-flash-250414).`
+    );
+  }
+}
+function assertSiliconflowFreeModel(model) {
+  if (!SILICONFLOW_FREE.test(model.trim())) {
+    throw new Error(
+      `Refusing SiliconFlow model "${model}": society-chat only allows free XingChenAGI/Xing4.0-29B.`
     );
   }
 }
@@ -67,6 +92,62 @@ function requireAgnesConfig(modelOverride) {
   const model = (modelOverride || process.env.AGNES_MODEL?.trim() || "agnes-3.0-flash").trim();
   assertAgnesFreeModel(model);
   return { provider: "agnes", apiKey, baseUrl, model };
+}
+function configuredFreeProviders() {
+  loadDotEnv();
+  const out = [];
+  if (process.env.AGNES_API_KEY?.trim()) out.push("agnes");
+  if (process.env.GLM_API_KEY?.trim()) out.push("glm");
+  if (process.env.SILICONFLOW_API_KEY?.trim()) out.push("siliconflow");
+  return out;
+}
+function defaultFreeModelFor(provider) {
+  loadDotEnv();
+  const p = normalizeProviderId(provider);
+  if (p === "glm") {
+    const m2 = (process.env.GLM_MODEL?.trim() || "glm-4-flash").trim();
+    assertGlmFreeModel(m2);
+    return m2;
+  }
+  if (p === "siliconflow") {
+    const m2 = (process.env.SILICONFLOW_MODEL?.trim() || SILICONFLOW_DEFAULT_MODEL).trim();
+    assertSiliconflowFreeModel(m2);
+    return m2;
+  }
+  const m = (process.env.AGNES_MODEL?.trim() || "agnes-3.0-flash").trim();
+  assertAgnesFreeModel(m);
+  return m;
+}
+function isKnownFreeProvider(raw) {
+  const s = String(raw ?? "").trim().toLowerCase();
+  return s === "agnes" || s === "glm" || s === "zhipu" || s === "zhipuai" || s === "siliconflow" || s === "silicon" || s === "sf" || s === "silicon-flow";
+}
+function resolveExplicitFreeLlm(providerRaw, modelRaw) {
+  loadDotEnv();
+  if (!isKnownFreeProvider(providerRaw)) {
+    throw new Error(
+      `Unknown or paid provider "${String(providerRaw)}": use agnes | glm | siliconflow`
+    );
+  }
+  const provider = normalizeProviderId(providerRaw);
+  const configured = configuredFreeProviders();
+  if (!configured.includes(provider)) {
+    throw new Error(
+      `Provider "${provider}" is not configured (missing API key in .env). Configured: ${configured.join(",") || "(none)"}`
+    );
+  }
+  const model = modelRaw != null && String(modelRaw).trim() ? String(modelRaw).trim() : defaultFreeModelFor(provider);
+  if (provider === "glm") assertGlmFreeModel(model);
+  else if (provider === "siliconflow") assertSiliconflowFreeModel(model);
+  else assertAgnesFreeModel(model);
+  return { provider, model };
+}
+function parseSpawnLlmInput(input) {
+  const fromObj = input.llm && typeof input.llm === "object" ? input.llm : null;
+  const provider = fromObj?.provider ?? input.provider;
+  if (provider == null || String(provider).trim() === "") return void 0;
+  const model = fromObj?.model ?? input.model;
+  return resolveExplicitFreeLlm(provider, model);
 }
 
 // plugins/society-sandbox/src/index.ts
@@ -323,7 +404,23 @@ var TOOL_DEFINITIONS = [
             items: { type: "string" },
             description: "Interest tags (optional)"
           },
-          mood: { type: "string", description: "Initial mood label (optional)" }
+          mood: { type: "string", description: "Initial mood label (optional)" },
+          provider: {
+            type: "string",
+            description: "Free LLM provider: agnes | glm | siliconflow (optional; omit to auto-balance)"
+          },
+          model: {
+            type: "string",
+            description: "Free model id for that provider (optional; defaults to provider free flash)"
+          },
+          llm: {
+            type: "object",
+            description: "Optional { provider, model? } same as provider/model fields",
+            properties: {
+              provider: { type: "string" },
+              model: { type: "string" }
+            }
+          }
         },
         required: ["id", "displayName", "persona"]
       }
@@ -435,23 +532,34 @@ var SocietyToolsService = class extends Service2 {
     if (Array.isArray(args.interests)) {
       soul.interests = args.interests.map((x) => String(x)).slice(0, 8);
     }
+    let llm;
+    try {
+      llm = parseSpawnLlmInput({
+        llm: args.llm && typeof args.llm === "object" ? args.llm : void 0,
+        provider: args.provider,
+        model: args.model
+      });
+    } catch (err) {
+      return `Error: ${err instanceof Error ? err.message : String(err)}`;
+    }
     try {
       const profile = this.ctx.societyIdentity.spawn({
         id,
         displayName,
         persona,
-        soul
+        soul,
+        ...llm ? { llm } : {}
       });
       this.ctx.societySoul.load(profile.id);
       this.ctx.societyMemory.load(profile.id);
-      const llm = this.ctx.societyIdentity.getLlmPreference(profile.id);
+      const pref = this.ctx.societyIdentity.getLlmPreference(profile.id);
       return JSON.stringify({
         id: profile.id,
         displayName: profile.displayName,
         persona: profile.persona,
         workspacePath: profile.workspacePath,
         bornBy: agentId,
-        llm,
+        llm: pref,
         soul: {
           openness: profile.soul.openness,
           trust: profile.soul.trust,

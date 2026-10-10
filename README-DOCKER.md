@@ -96,3 +96,20 @@ docker compose up -d --build
 - Windows Docker：本文件流程，`SOCIETY_SANDBOX_MODE=docker`  
 
 两边共用同一套插件代码；密钥始终只在 `.env`。
+
+
+## 重置并播种角色
+
+```powershell
+# 危险：清空对话与角色数据（不动 .env）
+docker compose exec society npm run reset-society
+# 或在宿主机：
+npm run reset-society
+
+# 播种四人阵容（阿宁=Agnes / 老码=GLM / 时辰+文心=SiliconFlow）
+npm run seed-cast
+# 或一并清空再播种：
+npm run seed-cast -- --reset
+```
+
+诞生新角色时可在 UI 指定 LLM 通道（Agnes / GLM / SiliconFlow）。

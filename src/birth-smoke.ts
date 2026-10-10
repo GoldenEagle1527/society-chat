@@ -8,6 +8,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { loadDotEnv, requireAgnesConfig } from './env.ts'
 import { bootSociety } from './boot.ts'
+import { ensureSmokeAliceBob } from './smoke-fixtures.ts'
 import { agentDataDir, agentWorkspaceDir } from './paths.ts'
 
 async function wipeCarol(): Promise<void> {
@@ -27,6 +28,7 @@ async function main() {
 
   const app = await bootSociety({ loadSeeds: true })
   const { ctx } = app
+  ensureSmokeAliceBob(ctx)
 
   assert.ok(ctx.societyIdentity.get('alice'), 'alice seed required')
   assert.ok(ctx.societyIdentity.get('bob'), 'bob seed required')

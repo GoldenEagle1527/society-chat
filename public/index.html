@@ -164,11 +164,24 @@
         <span>ID（可选）</span>
         <input type="text" id="birthId" maxlength="32" placeholder="留空则自动生成，如 dana" autocomplete="off" />
       </label>
+      <label class="tg-field">
+        <span>LLM 通道</span>
+        <select id="birthProvider">
+          <option value="">自动均衡（推荐）</option>
+          <option value="agnes">Agnes</option>
+          <option value="glm">GLM（智谱）</option>
+          <option value="siliconflow">SiliconFlow（硅基流动）</option>
+        </select>
+      </label>
+      <label class="tg-field">
+        <span>模型（可选）</span>
+        <input type="text" id="birthModel" maxlength="64" placeholder="留空则用该通道免费默认模型" autocomplete="off" />
+      </label>
       <div class="tg-modal-actions">
         <button type="button" class="tg-btn" id="birthCancel">取消</button>
         <button type="button" class="tg-btn primary" id="birthCreate">诞生</button>
       </div>
-      <p class="tg-muted tg-modal-hint" id="birthStatus">将自动均衡分配免费 LLM 通道，并加入广场。</p>
+      <p class="tg-muted tg-modal-hint" id="birthStatus">可指定免费 LLM 通道；留空则自动均衡。诞生后加入广场。</p>
     </div>
   </div>
 

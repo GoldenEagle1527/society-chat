@@ -9,12 +9,14 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { bootSociety } from './boot.ts'
+import { ensureSmokeAliceBob } from './smoke-fixtures.ts'
 import type { InboxMessage } from './types.ts'
 
 async function main() {
   console.log('=== society-chat smoke test ===')
   const app = await bootSociety({ loadSeeds: true })
   const { ctx } = app
+  ensureSmokeAliceBob(ctx)
 
   const alice = ctx.societyIdentity.require('alice')
   const bob = ctx.societyIdentity.require('bob')

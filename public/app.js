@@ -50,6 +50,8 @@
     birthInterests: document.getElementById('birthInterests'),
     birthMood: document.getElementById('birthMood'),
     birthId: document.getElementById('birthId'),
+    birthProvider: document.getElementById('birthProvider'),
+    birthModel: document.getElementById('birthModel'),
     birthStatus: document.getElementById('birthStatus'),
     newGroupModal: document.getElementById('newGroupModal'),
     newGroupBackdrop: document.getElementById('newGroupBackdrop'),
@@ -720,6 +722,26 @@
   }
 
 
+  const FREE_MODEL_DEFAULTS = {
+    agnes: 'agnes-3.0-flash',
+    glm: 'glm-4-flash',
+    siliconflow: 'XingChenAGI/Xing4.0-29B',
+  };
+
+  function syncBirthModelPlaceholder() {
+    const p = (el.birthProvider.value || '').trim();
+    if (!p) {
+      el.birthModel.placeholder = '自动均衡时无需填写';
+      return;
+    }
+    const fromSettings = (settingsCache?.providers || []).find((x) => x.id === p);
+    const def = (fromSettings && fromSettings.model) || FREE_MODEL_DEFAULTS[p] || '';
+    el.birthModel.placeholder = def ? `默认 ${def}` : '该通道免费默认模型';
+    if (!el.birthModel.value.trim() && def) {
+      el.birthModel.dataset.defaultModel = def;
+    }
+  }
+
   function openBirthModal() {
     closeNewMenu();
     closeSettings();
@@ -728,10 +750,13 @@
     el.birthInterests.value = '';
     el.birthMood.value = '';
     el.birthId.value = '';
+    el.birthProvider.value = '';
+    el.birthModel.value = '';
+    syncBirthModelPlaceholder();
     const max = settingsCache?.maxAgents || state?.agents?.length || '—';
     const cur = state?.agents?.length ?? 0;
     el.birthStatus.textContent =
-      `将自动均衡分配免费 LLM，并加入广场。当前 ${cur} / 上限 ${max}`;
+      `可指定 Agnes / GLM / SiliconFlow；留空则自动均衡。当前 ${cur} / 上限 ${max}`;
     el.birthModal.classList.remove('hidden');
     el.birthModal.setAttribute('aria-hidden', 'false');
     setTimeout(() => el.birthDisplayName.focus(), 50);
@@ -749,6 +774,8 @@
     const interests = (el.birthInterests.value || '').trim();
     const mood = (el.birthMood.value || '').trim();
     const id = (el.birthId.value || '').trim();
+    const provider = (el.birthProvider.value || '').trim();
+    const model = (el.birthModel.value || '').trim();
     if (!displayName) {
       el.birthStatus.textContent = '请填写显示名';
       return;
@@ -765,6 +792,11 @@
       if (interests) payload.interests = interests;
       if (mood) payload.mood = mood;
       if (id) payload.id = id;
+      if (provider) {
+        payload.llm = { provider };
+        if (model) payload.llm.model = model;
+        else if (FREE_MODEL_DEFAULTS[provider]) payload.llm.model = FREE_MODEL_DEFAULTS[provider];
+      }
       const res = await fetch('/api/agents', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1004,6 +1036,16 @@
   el.birthCancel.addEventListener('click', closeBirthModal);
   el.birthBackdrop.addEventListener('click', closeBirthModal);
   el.birthCreate.addEventListener('click', birthAgent);
+  if (el.birthProvider) {
+    el.birthProvider.addEventListener('change', () => {
+      const p = (el.birthProvider.value || '').trim();
+      syncBirthModelPlaceholder();
+      if (p && FREE_MODEL_DEFAULTS[p] && !(el.birthModel.value || '').trim()) {
+        el.birthModel.value = FREE_MODEL_DEFAULTS[p];
+      }
+      if (!p) el.birthModel.value = '';
+    });
+  }
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {

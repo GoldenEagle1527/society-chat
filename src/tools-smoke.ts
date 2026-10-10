@@ -11,6 +11,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { loadDotEnv, requireAgnesConfig } from './env.ts'
 import { bootSociety } from './boot.ts'
+import { ensureSmokeAliceBob } from './smoke-fixtures.ts'
 import { agentWorkspaceDir } from './paths.ts'
 import { resolveInsideWorkspace } from '../plugins/society-tools/src/index.ts'
 
@@ -43,6 +44,7 @@ async function main() {
 
   const app = await bootSociety({ loadSeeds: true })
   const { ctx } = app
+  ensureSmokeAliceBob(ctx)
 
   // Direct tool rejection via service (bound to bob)
   const directReject = await ctx.societyTools.execute(

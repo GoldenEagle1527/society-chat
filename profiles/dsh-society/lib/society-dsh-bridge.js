@@ -33,8 +33,11 @@ function apply(ctx, config = {}) {
   const loadSeeds = config.loadSeeds !== false;
   const autoStart = config.autoStartScheduler === true;
   if (loadSeeds) {
-    ctx.societyIdentity.loadSeeds();
     ctx.societyIdentity.loadPersisted();
+    const noDefault = process.env.SOCIETY_NO_DEFAULT_SEEDS === "1" || /^true$/i.test(process.env.SOCIETY_NO_DEFAULT_SEEDS || "") || /^yes$/i.test(process.env.SOCIETY_NO_DEFAULT_SEEDS || "");
+    if (!noDefault && ctx.societyIdentity.list().length === 0) {
+      ctx.societyIdentity.loadSeeds();
+    }
   }
   const agents = ctx.societyIdentity.list().map((a) => a.id);
   console.log(

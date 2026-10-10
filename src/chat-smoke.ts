@@ -11,6 +11,7 @@
 import assert from 'node:assert/strict'
 import { loadDotEnv, requireAgnesConfig } from './env.ts'
 import { bootSociety } from './boot.ts'
+import { ensureSmokeAliceBob } from './smoke-fixtures.ts'
 
 async function main() {
   console.log('=== society-chat chat-smoke (Agnes) ===')
@@ -20,6 +21,7 @@ async function main() {
 
   const app = await bootSociety({ loadSeeds: true })
   const { ctx } = app
+  ensureSmokeAliceBob(ctx)
 
   const alice = ctx.societyIdentity.require('alice')
   const bob = ctx.societyIdentity.require('bob')

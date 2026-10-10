@@ -11,6 +11,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import { bootSociety } from './boot.ts'
+import { ensureSmokeAliceBob } from './smoke-fixtures.ts'
 import { agentWorkspaceDir, agentDataDir } from './paths.ts'
 import { resolveInsideWorkspace } from '../plugins/society-tools/src/index.ts'
 import { assertUrlAllowed, isHostAllowed } from '../plugins/society-sandbox/src/index.ts'
@@ -20,6 +21,7 @@ async function main() {
 
   const app = await bootSociety({ loadSeeds: true })
   const { ctx } = app
+  ensureSmokeAliceBob(ctx)
 
   assert.ok(ctx.societySandbox.bwrapAvailable(), 'bwrap must be available at /usr/bin/bwrap')
   console.log('✓ bwrap available')

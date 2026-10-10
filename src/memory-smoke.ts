@@ -7,6 +7,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { loadDotEnv, requireAgnesConfig, societyWorkingMax } from './env.ts'
 import { bootSociety } from './boot.ts'
+import { ensureSmokeAliceBob } from './smoke-fixtures.ts'
 import { agentDataDir } from './paths.ts'
 
 async function main() {
@@ -40,6 +41,7 @@ async function main() {
 
   const app = await bootSociety({ loadSeeds: true })
   const { ctx } = app
+  ensureSmokeAliceBob(ctx)
   assert.ok(ctx.societyIdentity.get('alice'), 'alice required')
 
   // Inject under high soft-cap to avoid async race

@@ -73,6 +73,11 @@ export interface SpawnAgentApiRequest {
   openness?: number
   trust?: number
   energy?: number
+  /** Explicit free LLM: { provider, model? } — omit for balanced routing. */
+  llm?: { provider: string; model?: string }
+  /** Flat aliases accepted by POST /api/agents */
+  provider?: string
+  model?: string
 }
 
 export interface SpawnAgentApiResult {
@@ -106,7 +111,7 @@ export interface ObserveServerOptions {
   onCreateRoom?: (req: CreateRoomApiRequest) => CreateRoomApiResult | Promise<CreateRoomApiResult>
   /** Live only: ensure human↔agent DM surface. */
   onCreateDm?: (req: CreateDmApiRequest) => CreateDmApiResult | Promise<CreateDmApiResult>
-  /** Live only: birth a new agent (balanced LLM routing). */
+  /** Live only: birth a new agent (explicit llm or balanced free routing). */
   onSpawnAgent?: (req: SpawnAgentApiRequest) => SpawnAgentApiResult | Promise<SpawnAgentApiResult>
   /** Optional live status line for /api/state note override. */
   liveNote?: () => string
@@ -456,6 +461,23 @@ export function createObserveServer(opts: ObserveServerOptions): ObserveServer {
           if (!Number.isFinite(n)) return undefined
           return Math.max(0, Math.min(1, n))
         }
+        let llm: { provider: string; model?: string } | undefined
+        if (parsed.llm && typeof parsed.llm === 'object' && parsed.llm.provider) {
+          llm = {
+            provider: String(parsed.llm.provider).trim(),
+            ...(parsed.llm.model != null && String(parsed.llm.model).trim()
+              ? { model: String(parsed.llm.model).trim() }
+              : {}),
+          }
+        }
+        const providerFlat =
+          parsed.provider != null && String(parsed.provider).trim()
+            ? String(parsed.provider).trim()
+            : undefined
+        const modelFlat =
+          parsed.model != null && String(parsed.model).trim()
+            ? String(parsed.model).trim()
+            : undefined
         const result = await opts.onSpawnAgent({
           displayName,
           persona,
@@ -465,6 +487,9 @@ export function createObserveServer(opts: ObserveServerOptions): ObserveServer {
           openness: clamp01(parsed.openness),
           trust: clamp01(parsed.trust),
           energy: clamp01(parsed.energy),
+          llm,
+          provider: providerFlat,
+          model: modelFlat,
         })
         sendJson(res, 200, result)
       } catch (err) {

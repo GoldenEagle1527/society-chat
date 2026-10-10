@@ -6,6 +6,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { configuredFreeProviders, loadDotEnv, requireAgnesConfig, requireGlmConfig } from './env.ts'
 import { bootSociety } from './boot.ts'
+import { ensureSmokeAliceBob } from './smoke-fixtures.ts'
 import { agentDataDir } from './paths.ts'
 
 async function wipe(id: string) {
@@ -27,11 +28,12 @@ async function main() {
 
   const app = await bootSociety({ loadSeeds: true })
   const { ctx } = app
+  ensureSmokeAliceBob(ctx)
 
-  // Ensure seeds keep expected routes
+  // Fixture pair routes
   assert.equal(ctx.societyIdentity.getLlmPreference('alice').provider, 'agnes')
   assert.equal(ctx.societyIdentity.getLlmPreference('bob').provider, 'glm')
-  console.log('✓ seeds: alice=agnes bob=glm')
+  console.log('✓ fixtures: alice=agnes bob=glm')
 
   const a = await ctx.societyTools.execute(
     'alice',
@@ -80,6 +82,29 @@ async function main() {
   assert.equal(danaDisk.provider, dana.llm!.provider)
   assert.equal(erinDisk.provider, erin.llm!.provider)
   console.log('✓ llm.json on disk matches spawn result')
+
+  if (providers.includes('siliconflow')) {
+    await wipe('fran')
+    const explicit = await ctx.societyTools.execute(
+      'alice',
+      'spawn_agent',
+      JSON.stringify({
+        id: 'fran',
+        displayName: 'Fran',
+        persona: '显式指定硅基流动。',
+        provider: 'siliconflow',
+        model: 'XingChenAGI/Xing4.0-29B',
+      }),
+    )
+    assert.ok(!explicit.startsWith('Error:'), explicit)
+    const fran = JSON.parse(explicit) as { id: string; llm?: { provider: string; model?: string } }
+    assert.equal(fran.llm?.provider, 'siliconflow')
+    assert.equal(fran.llm?.model, 'XingChenAGI/Xing4.0-29B')
+    console.log('✓ explicit spawn provider=siliconflow')
+    await wipe('fran')
+  } else {
+    console.log('⚠ skip explicit siliconflow spawn (no SILICONFLOW_API_KEY)')
+  }
 
   // Carol (if present) stays agnes unless wiped — birth-smoke sets default via spawn balance;
   // existing carol llm.json may already be agnes. Just note.

@@ -122,6 +122,30 @@ function defaultFreeModelFor(provider) {
   assertAgnesFreeModel(m);
   return m;
 }
+function isKnownFreeProvider(raw) {
+  const s = String(raw ?? "").trim().toLowerCase();
+  return s === "agnes" || s === "glm" || s === "zhipu" || s === "zhipuai" || s === "siliconflow" || s === "silicon" || s === "sf" || s === "silicon-flow";
+}
+function resolveExplicitFreeLlm(providerRaw, modelRaw) {
+  loadDotEnv();
+  if (!isKnownFreeProvider(providerRaw)) {
+    throw new Error(
+      `Unknown or paid provider "${String(providerRaw)}": use agnes | glm | siliconflow`
+    );
+  }
+  const provider = normalizeProviderId(providerRaw);
+  const configured = configuredFreeProviders();
+  if (!configured.includes(provider)) {
+    throw new Error(
+      `Provider "${provider}" is not configured (missing API key in .env). Configured: ${configured.join(",") || "(none)"}`
+    );
+  }
+  const model = modelRaw != null && String(modelRaw).trim() ? String(modelRaw).trim() : defaultFreeModelFor(provider);
+  if (provider === "glm") assertGlmFreeModel(model);
+  else if (provider === "siliconflow") assertSiliconflowFreeModel(model);
+  else assertAgnesFreeModel(model);
+  return { provider, model };
+}
 
 // plugins/society-identity/src/index.ts
 var DEFAULT_SOUL = {
@@ -294,7 +318,7 @@ var SocietyIdentityService = class extends Service {
     if (this.agents.size >= max) {
       throw new Error(`max agents (${max}) reached; set SOCIETY_MAX_AGENTS to raise`);
     }
-    const llm = input.llm || pickBalancedLlm(this.list().map((a) => this.getLlmPreference(a.id)));
+    let llm = input.llm ? resolveExplicitFreeLlm(input.llm.provider, input.llm.model) : pickBalancedLlm(this.list().map((a) => this.getLlmPreference(a.id)));
     const profile = this.register({ ...input, id, llm });
     writeLlmPreference(id, llm);
     profile.llm = llm;
@@ -371,6 +395,14 @@ var SocietyIdentityService = class extends Service {
     const a = this.agents.get(id);
     return a?.displayName || speakerLabel(id);
   }
+  /** True if any agent profile.json exists under data/agents. */
+  hasPersistedAgents() {
+    if (!fs2.existsSync(AGENTS_DATA_ROOT)) return false;
+    for (const id of fs2.readdirSync(AGENTS_DATA_ROOT)) {
+      if (fs2.existsSync(path3.join(AGENTS_DATA_ROOT, id, "profile.json"))) return true;
+    }
+    return false;
+  }
   /** Load seed JSON files from /agents/*.json into the registry. */
   loadSeeds() {
     if (!fs2.existsSync(AGENTS_SEED_ROOT)) return [];
@@ -378,6 +410,9 @@ var SocietyIdentityService = class extends Service {
     for (const file of fs2.readdirSync(AGENTS_SEED_ROOT)) {
       if (!file.endsWith(".json")) continue;
       const raw = JSON.parse(fs2.readFileSync(path3.join(AGENTS_SEED_ROOT, file), "utf8"));
+      if (raw.llm?.provider) {
+        raw.llm = resolveExplicitFreeLlm(raw.llm.provider, raw.llm.model);
+      }
       out.push(this.register(raw));
     }
     return out;

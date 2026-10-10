@@ -1,19 +1,8 @@
 /**
  * Autonomous society heartbeat daemon.
  *
- * Boot → plaza + alice/bob → Alice seeds one line if empty →
+ * Boot → plaza + agents on disk (seed-cast) → seed one line if empty →
  * loop runTick until maxTicks / maxExchanges / SIGINT.
- *
- * Env (defaults):
- *   SOCIETY_MAX_TICKS=8
- *   SOCIETY_MAX_EXCHANGES=6
- *   SOCIETY_TICK_MS=1000
- *   SOCIETY_COOLDOWN_MS=800
- *   SOCIETY_AGENT_COOLDOWN_MS=400
- *   SOCIETY_IDLE_STALE_MS=2500
- *   (no daily LLM hard cap; SOCIETY_DAILY_LLM_BUDGET ignored)
- *   SOCIETY_MAX_PARALLEL_REPLIES=2
- *   AGNES_MODEL=agnes-3.0-flash (free only)
  *
  * Never logs API keys. Ctrl+C / SIGTERM stops cleanly.
  */
@@ -58,21 +47,18 @@ async function main() {
   const app = await bootSociety({ loadSeeds: true })
   const { ctx } = app
 
-  const alice = ctx.societyIdentity.require('alice')
-  const bob = ctx.societyIdentity.require('bob')
   const allAgents = ctx.societyIdentity.list()
+  if (allAgents.length === 0) {
+    throw new Error('No agents on disk. Run: npm run seed-cast')
+  }
   const agentIds = allAgents.map((a) => a.id)
-  console.log(`✓ agents: ${allAgents.map((a) => a.displayName).join(', ')}`)
+  console.log(`✓ agents: ${allAgents.map((a) => `${a.displayName}(@${a.id})`).join(', ')}`)
 
-  const soul0: Record<string, ReturnType<typeof soulSnap>> = {
-    alice: soulSnap(ctx.societySoul.load('alice')),
-    bob: soulSnap(ctx.societySoul.load('bob')),
-  }
+  const soul0: Record<string, ReturnType<typeof soulSnap>> = {}
   for (const a of allAgents) {
-    if (!(a.id in soul0)) soul0[a.id] = soulSnap(ctx.societySoul.load(a.id))
+    soul0[a.id] = soulSnap(ctx.societySoul.load(a.id))
   }
 
-  // Event-driven OFF — ticks own the drain (cleaner caps). Smokes still use enableAutoReply.
   ctx.societyScheduler.configure({
     maxExchanges,
     onlyAgents: agentIds,
@@ -86,7 +72,7 @@ async function main() {
   if (!room) {
     room = ctx.societyRooms.create({
       name: 'plaza',
-      createdBy: 'alice',
+      createdBy: 'system',
       members: agentIds,
     })
   } else {
@@ -110,9 +96,10 @@ async function main() {
   if (history.length === 0) {
     const seed =
       process.env.SOCIETY_SEED_LINE?.trim() ||
-      '嗨 Bob，社会广场开机了。我们先随便聊聊：今天你最想先确认的隔离底线是什么？'
-    ctx.societyRooms.post({ roomId: room.id, from: 'alice', body: seed })
-    console.log(`[seed] Alice: ${seed}`)
+      '广场开机了。我们先随便聊聊：今天大家最想先确认什么？'
+    const from = agentIds[0]!
+    ctx.societyRooms.post({ roomId: room.id, from, body: seed })
+    console.log(`[seed] ${ctx.societyIdentity.displayNameOf(from)}: ${seed}`)
   } else {
     console.log(`✓ plaza already has ${history.length} message(s); skip seed`)
   }
@@ -127,7 +114,7 @@ async function main() {
   process.on('SIGTERM', () => onSignal('SIGTERM'))
 
   ctx.on('society/agent-replied', (p) => {
-    const name = p.agentId === 'alice' ? 'Alice' : p.agentId === 'bob' ? 'Bob' : p.agentId
+    const name = ctx.societyIdentity.displayNameOf(p.agentId)
     if (p.kind === 'room') {
       console.log(`[live] ${name}: ${p.body}`)
     } else if (p.kind === 'direct') {
@@ -176,7 +163,6 @@ async function main() {
       break
     }
 
-    // Delay between ticks (avoid hammering API)
     if (i + 1 < maxTicks && ctx.societyScheduler.exchangeCountOf() < maxExchanges) {
       await new Promise((r) => setTimeout(r, tickMs))
     }
@@ -192,15 +178,10 @@ async function main() {
   const finalHistory = ctx.societyRooms.historyOf(room.id)
   console.log('--- transcript ---')
   for (const m of finalHistory) {
-    const name = m.from === 'alice' ? 'Alice' : m.from === 'bob' ? 'Bob' : m.from
-    console.log(`${name}: ${m.body}`)
+    console.log(`${ctx.societyIdentity.displayNameOf(m.from)}: ${m.body}`)
   }
   console.log('------------------')
 
-  const soul1 = {
-    alice: soulSnap(ctx.societySoul.get('alice')),
-    bob: soulSnap(ctx.societySoul.get('bob')),
-  }
   const delta = (a: number, b: number) => (b - a).toFixed(4)
 
   console.log('--- summary ---')
@@ -208,15 +189,13 @@ async function main() {
   console.log(`ticks=${ctx.societyScheduler.tickCountOf()}/${maxTicks}`)
   console.log(`exchanges=${ctx.societyScheduler.exchangeCountOf()}/${maxExchanges}`)
   console.log(`roomMessages=${finalHistory.length}`)
-  console.log(
-    `alice soul Δopenness=${delta(soul0.alice.openness, soul1.alice.openness)} Δtrust=${delta(soul0.alice.trust, soul1.alice.trust)} Δenergy=${delta(soul0.alice.energy, soul1.alice.energy)} mood=${soul1.alice.mood}`,
-  )
-  console.log(
-    `bob soul Δopenness=${delta(soul0.bob.openness, soul1.bob.openness)} Δtrust=${delta(soul0.bob.trust, soul1.bob.trust)} Δenergy=${delta(soul0.bob.energy, soul1.bob.energy)} mood=${soul1.bob.mood}`,
-  )
-  console.log(
-    `llmCallsToday alice=${ctx.societyMemory.getLlmCallsToday('alice')} bob=${ctx.societyMemory.getLlmCallsToday('bob')}`,
-  )
+  for (const a of allAgents) {
+    const s0 = soul0[a.id]!
+    const s1 = soulSnap(ctx.societySoul.get(a.id))
+    console.log(
+      `${a.id} soul Δopenness=${delta(s0.openness, s1.openness)} Δtrust=${delta(s0.trust, s1.trust)} Δenergy=${delta(s0.energy, s1.energy)} mood=${s1.mood} llmCalls=${ctx.societyMemory.getLlmCallsToday(a.id)}`,
+    )
+  }
 
   await app.dispose()
   console.log('=== SOCIETY-RUN DONE ===')

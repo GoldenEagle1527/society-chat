@@ -10,6 +10,7 @@
 import { randomUUID } from 'node:crypto'
 import {
   loadDotEnv,
+  parseSpawnLlmInput,
   providerModelLabel,
   requireAgnesConfig,
   requireGlmConfig,
@@ -86,12 +87,15 @@ async function main(): Promise<void> {
   const { ctx } = app
 
   const human = ctx.societyIdentity.registerHuman()
-  const alice = ctx.societyIdentity.require('alice')
-  const bob = ctx.societyIdentity.require('bob')
   const allAgents = ctx.societyIdentity.list()
+  if (allAgents.length === 0) {
+    console.warn(
+      '⚠ no agents on disk — run: npm run seed-cast  (or birth in UI). Live will idle until someone exists.',
+    )
+  }
   console.log(
     `✓ speakers: ${human.displayName}(${human.id}), ` +
-      allAgents.map((a) => a.displayName).join(', '),
+      (allAgents.map((a) => a.displayName).join(', ') || '(none)'),
   )
   console.log(
     '✓ LLM routes: ' +
@@ -112,7 +116,7 @@ async function main(): Promise<void> {
   if (!room) {
     room = ctx.societyRooms.create({
       name: 'plaza',
-      createdBy: 'alice',
+      createdBy: 'system',
       members: agentIds,
     })
   } else {
@@ -121,7 +125,7 @@ async function main(): Promise<void> {
     }
   }
   ctx.societyScheduler.setDefaultRoom(room.id)
-  console.log(`✓ room: ${room.name} (${room.id.slice(0, 8)}…) members=${room.members.join(',')}`)
+  console.log(`✓ room: ${room.name} (${room.id.slice(0, 8)}…) members=${room.members.join(',') || '(empty)'}`)
 
   // New births during live: join plaza + allowlist so they show up and can act
   ctx.on('society/agent-born', (profile) => {
@@ -136,12 +140,13 @@ async function main(): Promise<void> {
     }
   })
 
-  if (ctx.societyRooms.historyOf(room.id).length === 0) {
+  if (agentIds.length && ctx.societyRooms.historyOf(room.id).length === 0) {
     const seed =
       process.env.SOCIETY_SEED_LINE?.trim() ||
       '广场开机了。人类随时可以插话；我们先打个招呼。'
-    ctx.societyRooms.post({ roomId: room.id, from: 'alice', body: seed })
-    console.log(`[seed] Alice: ${seed}`)
+    const from = agentIds[0]!
+    ctx.societyRooms.post({ roomId: room.id, from, body: seed })
+    console.log(`[seed] ${ctx.societyIdentity.displayNameOf(from)}: ${seed}`)
   }
 
   let tickRunning = false
@@ -349,12 +354,14 @@ async function main(): Promise<void> {
         : []
     if (interestList.length) soul.interests = interestList.slice(0, 8)
     if (req.mood) soul.mood = req.mood
-    // Balanced LLM via spawn() when llm omitted; agent-born hook joins plaza + allowlist
+    // Explicit llm (provider/model) or balanced free routing; agent-born hook joins plaza
+    const llmOpt = parseSpawnLlmInput(req)
     const profile = ctx.societyIdentity.spawn({
       id,
       displayName: req.displayName,
       persona: req.persona,
       soul,
+      ...(llmOpt ? { llm: llmOpt } : {}),
     })
     ctx.societySoul.load(profile.id)
     ctx.societyMemory.load(profile.id)
@@ -406,8 +413,7 @@ async function main(): Promise<void> {
   console.log('  stop: Ctrl+C / SIGTERM')
 
   ctx.on('society/agent-replied', (p) => {
-    const name =
-      p.agentId === 'alice' ? 'Alice' : p.agentId === 'bob' ? 'Bob' : p.agentId
+    const name = ctx.societyIdentity.displayNameOf(p.agentId)
     if (p.kind === 'room') console.log(`[live] ${name}: ${p.body}`)
     else if (p.kind === 'direct') console.log(`[live] ${name} → ${p.to} (DM): ${p.body}`)
     else if (p.kind === 'diary') console.log(`[live] ${name} (diary): ${p.body}`)

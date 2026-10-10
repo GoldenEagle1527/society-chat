@@ -8,6 +8,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { loadDotEnv, requireAgnesConfig } from './env.ts'
 import { bootSociety } from './boot.ts'
+import { ensureSmokeAliceBob } from './smoke-fixtures.ts'
 import { agentWorkspaceDir } from './paths.ts'
 
 async function main() {
@@ -19,6 +20,7 @@ async function main() {
 
   const app = await bootSociety({ loadSeeds: true })
   const { ctx } = app
+  ensureSmokeAliceBob(ctx)
 
   const imagesDir = path.join(agentWorkspaceDir('bob'), 'images')
   fs.mkdirSync(imagesDir, { recursive: true })

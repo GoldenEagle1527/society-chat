@@ -39,8 +39,16 @@ export async function bootSociety(opts?: { loadSeeds?: boolean }): Promise<Socie
   await settle()
 
   if (opts?.loadSeeds !== false) {
-    ctx.societyIdentity.loadSeeds()
+    // Persist first. Default agents/*.json seeds only when disk is empty
+    // (seed-cast is source of truth for the user cast). SOCIETY_NO_DEFAULT_SEEDS=1 skips JSON seeds.
     ctx.societyIdentity.loadPersisted()
+    const noDefault =
+      process.env.SOCIETY_NO_DEFAULT_SEEDS === '1' ||
+      /^true$/i.test(process.env.SOCIETY_NO_DEFAULT_SEEDS || '') ||
+      /^yes$/i.test(process.env.SOCIETY_NO_DEFAULT_SEEDS || '')
+    if (!noDefault && ctx.societyIdentity.list().length === 0) {
+      ctx.societyIdentity.loadSeeds()
+    }
   }
 
   return {

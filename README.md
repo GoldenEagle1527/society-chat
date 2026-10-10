@@ -67,7 +67,9 @@ Cordis 核心 (@deepseek-ai/cordis)
 |------|------|
 | `plugins/society-*` | 各能力独立插件 |
 | `profiles/society/` | 未来挂 dsh 的 profile 补丁草稿 |
-| `agents/*.json` | Alice / Bob 种子人格 |
+| `agents/*.json` | 可选 JSON 种子（仅 disk 空且未设 SOCIETY_NO_DEFAULT_SEEDS 时加载） |
+| `npm run seed-cast` | **默认角色**：阿宁/老码/时辰/文心（可 `--reset`） |
+| `npm run reset-society` | **危险** 清空 `data/agents` + `data/society`（不动 `.env`） |
 | `data/agents/<id>/` | 运行时数据、memory/soul、私有 workspace |
 | `src/boot.ts` | Cordis 启动 |
 | `src/smoke.ts` | 无 LLM 烟雾测试 |

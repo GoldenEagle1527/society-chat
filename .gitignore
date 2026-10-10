@@ -28,3 +28,13 @@ data/agents/erin/
 
 # Machine-absolute dsh overlay patch (regenerate: npm run build:dsh-overlay)
 profiles/dsh-society/cordis.patch.yml
+
+# User cast + spawn test ids (runtime)
+data/agents/agnes/
+data/agents/glm/
+data/agents/xingchen_news/
+data/agents/xingchen_lit/
+data/agents/fran/
+data/agents/dana-api/
+data/agents/erin-sf/
+data/agents/finn-glm/

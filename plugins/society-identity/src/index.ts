@@ -12,6 +12,7 @@ import {
   defaultFreeModelFor,
   loadDotEnv,
   normalizeProviderId,
+  resolveExplicitFreeLlm,
   societyEnvInt,
   type LlmProviderId,
 } from '../../../src/env.ts'
@@ -242,10 +243,10 @@ export class SocietyIdentityService extends Service {
     if (this.agents.size >= max) {
       throw new Error(`max agents (${max}) reached; set SOCIETY_MAX_AGENTS to raise`)
     }
-    // Auto-route free providers unless caller set llm explicitly
-    const llm =
-      input.llm ||
-      pickBalancedLlm(this.list().map((a) => this.getLlmPreference(a.id)))
+    // Explicit llm must be configured free provider + free model; else balanced routing
+    let llm = input.llm
+      ? resolveExplicitFreeLlm(input.llm.provider, input.llm.model)
+      : pickBalancedLlm(this.list().map((a) => this.getLlmPreference(a.id)))
     const profile = this.register({ ...input, id, llm })
     // Always materialize llm.json for born agents
     writeLlmPreference(id, llm)
@@ -334,6 +335,15 @@ export class SocietyIdentityService extends Service {
   }
 
 
+  /** True if any agent profile.json exists under data/agents. */
+  hasPersistedAgents(): boolean {
+    if (!fs.existsSync(AGENTS_DATA_ROOT)) return false
+    for (const id of fs.readdirSync(AGENTS_DATA_ROOT)) {
+      if (fs.existsSync(path.join(AGENTS_DATA_ROOT, id, 'profile.json'))) return true
+    }
+    return false
+  }
+
   /** Load seed JSON files from /agents/*.json into the registry. */
   loadSeeds(): AgentProfile[] {
     if (!fs.existsSync(AGENTS_SEED_ROOT)) return []
@@ -341,6 +351,10 @@ export class SocietyIdentityService extends Service {
     for (const file of fs.readdirSync(AGENTS_SEED_ROOT)) {
       if (!file.endsWith('.json')) continue
       const raw = JSON.parse(fs.readFileSync(path.join(AGENTS_SEED_ROOT, file), 'utf8')) as RegisterAgentInput
+      // Validate explicit llm in seed if present
+      if (raw.llm?.provider) {
+        raw.llm = resolveExplicitFreeLlm(raw.llm.provider, raw.llm.model)
+      }
       out.push(this.register(raw))
     }
     return out

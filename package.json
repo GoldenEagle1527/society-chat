@@ -30,7 +30,9 @@
     "api-smoke": "tsx src/api-smoke.ts",
     "build:dsh-overlay": "node scripts/build-dsh-overlay.mjs",
     "dsh-overlay-smoke": "tsx src/dsh-overlay-smoke.ts",
-    "turn-parse-smoke": "tsx src/turn-parse-smoke.ts"
+    "turn-parse-smoke": "tsx src/turn-parse-smoke.ts",
+    "reset-society": "tsx src/reset-society.ts",
+    "seed-cast": "tsx src/seed-cast.ts"
   },
   "dependencies": {
     "@deepseek-ai/cordis": "^4.0.4",
