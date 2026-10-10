@@ -10,7 +10,8 @@ var ALLOWED_HOSTS_EXACT = [
   "apihub.agnes-ai.com",
   "api.duckduckgo.com",
   "html.duckduckgo.com",
-  "open.bigmodel.cn"
+  "open.bigmodel.cn",
+  "api.exa.ai"
 ];
 var ALLOWED_HOST_SUFFIXES = ["wikipedia.org", "wikimedia.org"];
 var BWRAP_BIN = "/usr/bin/bwrap";

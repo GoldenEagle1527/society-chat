@@ -189,6 +189,52 @@ async function withLlmRetries(label, attempt, log) {
   throw last instanceof Error ? last : new Error(String(last));
 }
 
+// src/beijing-time.ts
+var BEIJING_TZ = "Asia/Shanghai";
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+function beijingParts(at = Date.now()) {
+  const d = typeof at === "number" ? new Date(at) : at;
+  const fmt = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: BEIJING_TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    weekday: "long",
+    hour12: false
+  });
+  const parts = fmt.formatToParts(d);
+  const get = (type) => parts.find((p) => p.type === type)?.value ?? "";
+  let hour = get("hour");
+  if (hour === "24") hour = "00";
+  const year = get("year");
+  const month = pad2(get("month"));
+  const day = pad2(get("day"));
+  const minute = pad2(get("minute"));
+  const second = pad2(get("second"));
+  hour = pad2(hour);
+  const weekday = get("weekday") || "";
+  return {
+    year,
+    month,
+    day,
+    hour,
+    minute,
+    second,
+    weekday,
+    date: `${year}-${month}-${day}`,
+    clock: `${hour}:${minute}`,
+    clockWithSeconds: `${hour}:${minute}:${second}`
+  };
+}
+function beijingDayStamp(at = Date.now()) {
+  return beijingParts(at).date;
+}
+
 // plugins/society-memory/src/index.ts
 var EPISODIC_MAX = 40;
 var SEMANTIC_MAX = 30;
@@ -476,11 +522,7 @@ var SocietyMemoryService = class extends Service {
     return lines.join("\n");
   }
   todayKey() {
-    const d = /* @__PURE__ */ new Date();
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, "0");
-    const day = String(d.getDate()).padStart(2, "0");
-    return `${y}-${m}-${day}`;
+    return beijingDayStamp();
   }
   getLlmCallsToday(agentId) {
     const store = this.load(agentId);

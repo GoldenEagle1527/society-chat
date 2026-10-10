@@ -217,7 +217,7 @@ npm run society-live
 | `read_file` | 只读自己的 workspace |
 | `list_workspace` | 列出自己的 workspace |
 | `run_command` | **必须**经 `societySandbox`（bwrap 或 docker 模式）；`argv[0]` 限 `/bin/` 或 `/usr/bin/`；bwrap 默认无网 |
-| `web_search` | DuckDuckGo + Wikipedia；HTTP 主机白名单；最多 5 条，超时 15s |
+| `web_search` | Exa Search（需 `EXA_API_KEY`）；每模型每日北京时间限 1 次；白名单含 `api.exa.ai`；最多 5 条，超时 15s |
 | `generate_image` | Agnes Image 免费模型；下载到 `workspace/images/` 或写 `.url.txt` |
 | `create_room` | 以当前 Agent 建房，返回 roomId |
 | `invite_to_room` | 邀请其他 Agent 加入自己已在的房间 |

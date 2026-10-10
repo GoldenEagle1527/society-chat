@@ -29,6 +29,7 @@ export const ALLOWED_HOSTS_EXACT = [
   'api.duckduckgo.com',
   'html.duckduckgo.com',
   'open.bigmodel.cn',
+  'api.exa.ai',
 ] as const
 
 /** Suffix patterns: hostname === apex OR endsWith('.' + apex) for *.wikipedia.org etc. */

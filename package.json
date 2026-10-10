@@ -37,7 +37,8 @@
     "mention-reply-smoke": "tsx src/mention-reply-smoke.ts",
     "idle-diary-smoke": "tsx src/idle-diary-smoke.ts",
     "tool-closing-smoke": "tsx src/tool-closing-smoke.ts",
-    "llm-http-smoke": "tsx src/llm-http-smoke.ts"
+    "llm-http-smoke": "tsx src/llm-http-smoke.ts",
+    "exa-quota-smoke": "tsx src/exa-quota-smoke.ts"
   },
   "dependencies": {
     "@deepseek-ai/cordis": "^4.0.4",

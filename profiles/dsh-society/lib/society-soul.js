@@ -25,8 +25,13 @@ var MESSAGES_STATE_FILE = path.join(SOCIETY_STATE_ROOT, "messages.jsonl");
 var DM_THREADS_STATE_FILE = path.join(SOCIETY_STATE_ROOT, "dm-threads.json");
 
 // plugins/society-soul/src/index.ts
+var SUBJECTIVE_DELTA_CLAMP = 0.05;
 function clamp01(n) {
   return Math.max(0, Math.min(1, n));
+}
+function clampDelta(n, maxAbs = SUBJECTIVE_DELTA_CLAMP) {
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(-maxAbs, Math.min(maxAbs, n));
 }
 function soulPath(agentId) {
   return path2.join(agentDataDir(agentId), "soul.json");
@@ -44,63 +49,11 @@ function snapshot(s) {
     notes: s.notes
   };
 }
-function heuristicDeltas(body, role) {
-  const text = body;
-  let openness = 0;
-  let trust = 0;
-  let energy = 0;
-  let mood;
-  if (/谢谢|感谢|欢迎|开心|喜欢|棒|赞|有趣|期待|嗨|你好/.test(text)) {
-    trust += 0.012;
-    energy += 0.01;
-    mood = "\u53CB\u5584";
-  }
-  if (/好奇|探索|为什么|怎么|发现|想法|分享/.test(text)) {
-    openness += 0.015;
-    mood = mood || "\u597D\u5947";
-  }
-  if (/系统|隔离|安全|权限|细节|工程|工具/.test(text)) {
-    energy += role === "speaker" ? 8e-3 : 4e-3;
-    openness += 4e-3;
-  }
-  if (/累|烦|讨厌|生气|危险|炸|崩溃|拒绝/.test(text)) {
-    trust -= 0.01;
-    energy -= 0.015;
-    mood = "\u8B66\u60D5";
-  }
-  if (/吗\？|\?|？/.test(text)) {
-    openness += 8e-3;
-    energy -= 3e-3;
-  }
-  if (role === "speaker") energy -= 5e-3;
-  else energy -= 2e-3;
-  return { openness, trust, energy, mood };
-}
 var SocietySoulService = class extends Service {
-  static inject = ["societyIdentity", "societyRooms"];
+  static inject = ["societyIdentity"];
   cache = /* @__PURE__ */ new Map();
   constructor(ctx) {
     super(ctx, "societySoul");
-    ctx.on("society/room-message", (msg) => {
-      const room = ctx.societyRooms.get(msg.roomId);
-      const members = room?.members ?? [];
-      for (const member of members) {
-        const role = msg.from !== "system" && member === msg.from ? "speaker" : "listener";
-        try {
-          this.nudgeFromText(member, msg.body, role, `room:${msg.roomId.slice(0, 8)}`);
-        } catch (err) {
-          ctx.logger("society-soul").warn(String(err));
-        }
-      }
-    });
-    ctx.on("society/mail-delivered", (msg) => {
-      if (msg.kind !== "direct") return;
-      try {
-        this.nudgeFromText(msg.to, msg.body, "listener", `dm-from:${msg.from}`);
-      } catch (err) {
-        ctx.logger("society-soul").warn(String(err));
-      }
-    });
   }
   /** Load or seed soul.json from identity profile. */
   load(agentId) {
@@ -138,38 +91,33 @@ var SocietySoulService = class extends Service {
   get(agentId) {
     return this.load(agentId);
   }
-  /** Apply heuristic deltas; writes soul.json + soul-log.jsonl. */
-  nudgeFromText(agentId, body, role, reason) {
+  /**
+   * Apply the agent's own subjective feeling deltas (from reflect_feelings).
+   * Only updates THIS agentId. Each numeric delta clamped to ±0.05; result 0–1.
+   */
+  applySubjective(agentId, patch) {
     const before = this.load(agentId);
-    const d = heuristicDeltas(body, role);
-    if (d.openness === 0 && d.trust === 0 && d.energy === 0 && !d.mood) {
+    const dOpen = clampDelta(Number(patch.openness ?? 0));
+    const dTrust = clampDelta(Number(patch.trust ?? 0));
+    const dEnergy = clampDelta(Number(patch.energy ?? 0));
+    const moodIn = patch.mood != null && String(patch.mood).trim() ? String(patch.mood).trim().slice(0, 32) : void 0;
+    const reasonRaw = patch.reason != null && String(patch.reason).trim() ? String(patch.reason).trim().slice(0, 120) : "reflect_feelings";
+    if (dOpen === 0 && dTrust === 0 && dEnergy === 0 && !moodIn) {
       return before;
     }
     const after = {
-      openness: clamp01(before.openness + d.openness),
-      trust: clamp01(before.trust + d.trust),
-      energy: clamp01(before.energy + d.energy),
+      openness: clamp01(before.openness + dOpen),
+      trust: clamp01(before.trust + dTrust),
+      energy: clamp01(before.energy + dEnergy),
       interests: [...before.interests],
-      mood: d.mood || before.mood || "\u5E73\u9759",
+      mood: moodIn || before.mood || "\u5E73\u9759",
       notes: before.notes,
       updatedAt: (/* @__PURE__ */ new Date()).toISOString()
     };
-    const interestHints = [
-      [/探索|发现/, "\u63A2\u7D22"],
-      [/聊天|说话|交流/, "\u804A\u5929"],
-      [/系统|工程|工具/, "\u7CFB\u7EDF"],
-      [/隔离|安全|权限/, "\u9694\u79BB"],
-      [/笔记|记录/, "\u7B14\u8BB0"]
-    ];
-    for (const [re, tag] of interestHints) {
-      if (re.test(body) && !after.interests.includes(tag)) {
-        after.interests = [...after.interests, tag].slice(0, 8);
-      }
-    }
     this.persist(agentId, after);
     this.appendLog(agentId, {
       ts: after.updatedAt,
-      reason,
+      reason: reasonRaw,
       before: snapshot(before),
       after: snapshot(after),
       deltas: {
@@ -187,7 +135,8 @@ var SocietySoulService = class extends Service {
       "\u3010\u7075\u9B42 / \u6027\u683C\u3011",
       `- \u5F00\u653E\u5EA6=${s.openness.toFixed(2)}\uFF0C\u4FE1\u4EFB=${s.trust.toFixed(2)}\uFF0C\u7CBE\u529B=${s.energy.toFixed(2)}`,
       `- \u5FC3\u60C5\uFF1A${s.mood || "\u5E73\u9759"}`,
-      `- \u5174\u8DA3\uFF1A${s.interests.length ? s.interests.join("\u3001") : "\u65E0"}`
+      `- \u5174\u8DA3\uFF1A${s.interests.length ? s.interests.join("\u3001") : "\u65E0"}`,
+      "- \u4EE5\u4E0A\u6570\u503C\u662F\u4F60\u7684\u4E3B\u89C2\u72B6\u6001\uFF1B\u82E5\u672C\u56DE\u5408\u5FC3\u60C5/\u7CBE\u529B/\u4FE1\u4EFB\u786E\u6709\u53D8\u5316\uFF0C\u53EF\u53E6\u8C03\u4E00\u6B21 reflect_feelings\uFF08\u6BCF\u56DE\u5408\u6700\u591A\u4E00\u6B21\uFF0C\u4E0D\u5FC5\u6BCF\u6B21\u90FD\u8C03\uFF09\u3002"
     ];
     if (s.notes?.trim()) lines.push(`- \u5907\u6CE8\uFF1A${s.notes.trim().slice(0, 120)}`);
     return lines.join("\n");
@@ -219,11 +168,12 @@ function round4(n) {
   return Math.round(n * 1e4) / 1e4;
 }
 var name = "society-soul";
-var inject = ["societyIdentity", "societyRooms"];
+var inject = ["societyIdentity"];
 function apply(ctx) {
   ctx.plugin(SocietySoulService);
 }
 export {
+  SUBJECTIVE_DELTA_CLAMP,
   SocietySoulService,
   apply,
   inject,

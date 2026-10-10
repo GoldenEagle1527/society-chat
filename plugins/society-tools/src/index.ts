@@ -5,7 +5,7 @@
  * File tools only touch data/agents/<id>/workspace/...
  * Path traversal (.., absolute escape) is rejected.
  * run_command MUST go through societySandbox (bwrap or docker mode); no raw shell.
- * web_search / generate_image HTTP clients use host allowlist from society-sandbox.
+ * web_search (Exa; 1 call/model/Beijing-day) / generate_image HTTP clients use host allowlist from society-sandbox.
  * Social tools: create_room / invite_to_room / list_rooms / list_agents / post_room / speak_in_room / send_dm / spawn_agent.
  * Closing tools (idle/reply): speak_in_room / send_dm / write_diary / write_thought / do_nothing / stay_silent.
  * Side tool: reflect_feelings (subjective soul nudge; not a closing act).
@@ -14,10 +14,21 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { AgentId, RoomId } from '../../../src/types.ts'
-import { parseSpawnLlmInput, requireAgnesConfig } from '../../../src/env.ts'
+import {
+  loadDotEnv,
+  parseSpawnLlmInput,
+  requireAgnesConfig,
+  requireProviderConfig,
+  normalizeProviderId,
+} from '../../../src/env.ts'
 import { assertUrlAllowed } from '../../society-sandbox/src/index.ts'
 import { isChattyPrivateText, looksLikeOutboundChatLine } from './private-voice.ts'
 import { beijingClock, beijingDayStamp } from '../../../src/beijing-time.ts'
+import {
+  exaQuotaExhaustedMessage,
+  isExaQuotaExhausted,
+  tryConsumeExaQuota,
+} from './exa-quota.ts'
 
 export { looksLikeOutboundChatLine, classifyIdlePrivateBody, isChattyPrivateText } from './private-voice.ts'
 
@@ -328,7 +339,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: 'web_search',
       description:
-        'Search the public web (DuckDuckGo + Wikipedia opensearch fallback). Returns up to 5 short snippets. Use for factual lookups.',
+        'Search the public web via Exa (paid). Each LLM model may search at most once per Beijing calendar day; agents sharing a model share that quota. Returns up to 5 titles/urls/snippets. Use sparingly for factual lookups.',
       parameters: {
         type: 'object',
         properties: {
@@ -579,7 +590,7 @@ export class SocietyToolsService extends Service {
         case 'list_workspace':
           return this.listWorkspace(agentId, args.path != null ? String(args.path) : '')
         case 'web_search':
-          return await this.webSearch(String(args.query ?? ''))
+          return await this.webSearch(agentId, String(args.query ?? ''))
         case 'generate_image':
           return await this.generateImage(
             agentId,
@@ -1042,92 +1053,107 @@ export class SocietyToolsService extends Service {
   }
 
   /**
-   * DuckDuckGo Instant Answer JSON + optional HTML lite scrape.
-   * Caps to 3–5 short snippets. Network errors → friendly string.
+   * Exa Search API — one call per resolved LLM model id per Beijing calendar day.
+   * Requires EXA_API_KEY. No DuckDuckGo / Wikipedia fallback.
    */
-  async webSearch(query: string): Promise<string> {
+  async webSearch(agentId: AgentId, query: string): Promise<string> {
     const q = query.trim()
     if (!q) return 'Error: query must be non-empty'
 
-    const snippets: string[] = []
+    loadDotEnv()
+    const apiKey = process.env.EXA_API_KEY?.trim()
+    if (!apiKey) {
+      return 'Error: EXA_API_KEY is missing. Set it in .env (gitignored) or the process environment; Exa is required for web_search (no free fallback).'
+    }
+
+    let modelId: string
     try {
-      const instantUrl = `https://api.duckduckgo.com/?${new URLSearchParams({
-        q,
-        format: 'json',
-        no_redirect: '1',
-        no_html: '1',
-        skip_disambig: '1',
-      }).toString()}`
-      const instant = await fetchWithTimeout(instantUrl, WEB_SEARCH_TIMEOUT_MS, {
-        headers: { Accept: 'application/json', 'User-Agent': 'society-chat/0.1 (research agent)' },
-      })
-      if (instant.ok) {
-        const data = (await instant.json()) as {
-          AbstractText?: string
-          AbstractURL?: string
-          Heading?: string
-          RelatedTopics?: Array<{ Text?: string; FirstURL?: string; Topics?: unknown[] }>
-          Answer?: string
-          Definition?: string
-        }
-        if (data.Heading && data.AbstractText) {
-          snippets.push(`${data.Heading}: ${trimSnippet(data.AbstractText)}${data.AbstractURL ? ` (${data.AbstractURL})` : ''}`)
-        } else if (data.AbstractText) {
-          snippets.push(trimSnippet(data.AbstractText))
-        }
-        if (data.Answer) snippets.push(`Answer: ${trimSnippet(data.Answer)}`)
-        if (data.Definition) snippets.push(`Definition: ${trimSnippet(data.Definition)}`)
-        for (const t of data.RelatedTopics ?? []) {
-          if (snippets.length >= 5) break
-          if (t.Text) {
-            snippets.push(trimSnippet(t.Text) + (t.FirstURL ? ` (${t.FirstURL})` : ''))
-          }
-        }
-      }
+      const pref = this.ctx.societyIdentity.getLlmPreference(agentId)
+      const cfg = requireProviderConfig(normalizeProviderId(pref.provider), pref.model)
+      modelId = cfg.model
     } catch (err) {
-      // fall through to HTML lite
-      this.ctx.logger('society-tools').warn(`web_search instant failed: ${err instanceof Error ? err.message : err}`)
+      return `Error: cannot resolve LLM model for web_search quota — ${err instanceof Error ? err.message : String(err)}`
     }
 
-    if (snippets.length < 3) {
-      try {
-        const htmlUrl = `https://html.duckduckgo.com/html/?${new URLSearchParams({ q }).toString()}`
-        const htmlRes = await fetchWithTimeout(htmlUrl, WEB_SEARCH_TIMEOUT_MS, {
-          headers: {
-            Accept: 'text/html',
-            'User-Agent': 'society-chat/0.1 (research agent)',
-          },
-        })
-        if (htmlRes.ok) {
-          const html = await htmlRes.text()
-          const fromHtml = parseDuckDuckGoHtml(html, 5 - snippets.length)
-          snippets.push(...fromHtml)
-        }
-      } catch (err) {
-        if (snippets.length === 0) {
-          return `Error: web_search network failure — ${err instanceof Error ? err.message : String(err)}`
-        }
-      }
+    if (isExaQuotaExhausted(modelId)) {
+      return exaQuotaExhaustedMessage(modelId)
+    }
+    if (!tryConsumeExaQuota(modelId)) {
+      return exaQuotaExhaustedMessage(modelId)
     }
 
-    if (snippets.length < 3) {
+    const url = 'https://api.exa.ai/search'
+    let res: Response
+    try {
+      res = await fetchWithTimeout(url, WEB_SEARCH_TIMEOUT_MS, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'x-api-key': apiKey,
+          Authorization: `Bearer ${apiKey}`,
+          'User-Agent': 'society-chat/0.1 (research agent)',
+        },
+        body: JSON.stringify({
+          query: q,
+          type: 'auto',
+          numResults: 5,
+          contents: { highlights: true },
+        }),
+      })
+    } catch (err) {
+      return `Error: Exa web_search network failure — ${err instanceof Error ? err.message : String(err)}`
+    }
+
+    const rawText = await res.text()
+    if (!res.ok) {
+      let detail = rawText.slice(0, 400)
       try {
-        const wiki = await wikipediaSearch(q, 5 - snippets.length)
-        snippets.push(...wiki)
-      } catch (err) {
-        this.ctx.logger('society-tools').warn(
-          `web_search wikipedia failed: ${err instanceof Error ? err.message : err}`,
-        )
+        const j = JSON.parse(rawText) as { error?: string; message?: string }
+        detail = j.error || j.message || detail
+      } catch {
+        /* keep slice */
       }
+      return `Error: Exa web_search failed — HTTP ${res.status}: ${detail}`
+    }
+
+    let data: {
+      results?: Array<{
+        title?: string
+        url?: string
+        text?: string
+        highlights?: string[]
+        summary?: string
+      }>
+    }
+    try {
+      data = JSON.parse(rawText) as typeof data
+    } catch {
+      return `Error: Exa web_search returned non-JSON (HTTP ${res.status})`
+    }
+
+    const snippets: string[] = []
+    for (const r of data.results ?? []) {
+      if (snippets.length >= 5) break
+      const title = (r.title || '').trim()
+      const pageUrl = (r.url || '').trim()
+      const highlight = Array.isArray(r.highlights)
+        ? r.highlights.filter(Boolean).join(' … ')
+        : ''
+      const body = (highlight || r.summary || r.text || '').trim()
+      const line = [title, body ? trimSnippet(body) : '', pageUrl ? `(${pageUrl})` : '']
+        .filter(Boolean)
+        .join(' — ')
+      if (line) snippets.push(trimSnippet(line, 400))
     }
 
     if (snippets.length === 0) {
-      return `No useful results for: ${q}`
+      return `No useful Exa results for: ${q}`
     }
-    return snippets
-      .slice(0, 5)
-      .map((s, i) => `${i + 1}. ${s}`)
-      .join('\n')
+    return (
+      `Exa results for "${q}" (model ${modelId}, 1/day Beijing):\n` +
+      snippets.map((s, i) => `${i + 1}. ${s}`).join('\n')
+    )
   }
 
   async generateImage(agentId: AgentId, prompt: string, filename?: string): Promise<string> {
@@ -1232,105 +1258,6 @@ async function fetchWithTimeout(
   } finally {
     clearTimeout(timer)
   }
-}
-
-
-/** Wikipedia opensearch + page summary fallback when DDG is thin. */
-async function wikipediaSearch(query: string, limit: number): Promise<string[]> {
-  const out: string[] = []
-  if (limit <= 0) return out
-  const openUrl =
-    `https://en.wikipedia.org/w/api.php?` +
-    new URLSearchParams({
-      action: 'opensearch',
-      search: query,
-      limit: String(Math.min(5, Math.max(1, limit))),
-      namespace: '0',
-      format: 'json',
-    }).toString()
-  const openRes = await fetchWithTimeout(openUrl, WEB_SEARCH_TIMEOUT_MS, {
-    headers: {
-      Accept: 'application/json',
-      'User-Agent': 'society-chat/0.1 (research agent)',
-    },
-  })
-  if (!openRes.ok) return out
-  const data = (await openRes.json()) as [string, string[], string[], string[]]
-  const titles = data[1] ?? []
-  const descs = data[2] ?? []
-  const urls = data[3] ?? []
-  for (let i = 0; i < titles.length && out.length < limit; i++) {
-    const title = titles[i]!
-    let snip = (descs[i] || '').trim()
-    const pageUrl = urls[i] || ''
-    if (!snip) {
-      try {
-        const sumUrl = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`
-        const sumRes = await fetchWithTimeout(sumUrl, WEB_SEARCH_TIMEOUT_MS, {
-          headers: {
-            Accept: 'application/json',
-            'User-Agent': 'society-chat/0.1 (research agent)',
-          },
-        })
-        if (sumRes.ok) {
-          const sum = (await sumRes.json()) as { extract?: string }
-          snip = (sum.extract || '').trim()
-        }
-      } catch {
-        /* ignore summary failure */
-      }
-    }
-    const line = snip
-      ? `Wikipedia: ${title} — ${trimSnippet(snip)}${pageUrl ? ` (${pageUrl})` : ''}`
-      : `Wikipedia: ${title}${pageUrl ? ` (${pageUrl})` : ''}`
-    out.push(trimSnippet(line))
-  }
-  return out
-}
-
-/** Minimal scrape of DuckDuckGo HTML lite result titles/snippets. */
-function parseDuckDuckGoHtml(html: string, limit: number): string[] {
-  const out: string[] = []
-  // result__a href + result__snippet
-  const re =
-    /class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?(?:class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|td|div)>)?/gi
-  let m: RegExpExecArray | null
-  while ((m = re.exec(html)) && out.length < limit) {
-    const href = decodeBasicEntities(m[1] || '')
-    const title = decodeBasicEntities(stripTags(m[2] || '')).trim()
-    const snip = decodeBasicEntities(stripTags(m[3] || '')).trim()
-    if (!title && !snip) continue
-    const line = [title, snip].filter(Boolean).join(' — ')
-    out.push(trimSnippet(line + (href ? ` (${href})` : '')))
-  }
-  // Fallback: uddg redirect links
-  if (out.length === 0) {
-    const re2 = /uddg=([^&"]+)[^>]*>\s*([^<]{5,120})/gi
-    while ((m = re2.exec(html)) && out.length < limit) {
-      try {
-        const href = decodeURIComponent(m[1]!)
-        const title = decodeBasicEntities(m[2]!).trim()
-        out.push(trimSnippet(`${title} (${href})`))
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-  return out
-}
-
-function stripTags(s: string): string {
-  return s.replace(/<[^>]+>/g, ' ')
-}
-
-function decodeBasicEntities(s: string): string {
-  return s
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, ' ')
 }
 
 export const name = 'society-tools'

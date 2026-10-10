@@ -33,6 +33,67 @@ var ROOMS_STATE_FILE = path.join(SOCIETY_STATE_ROOT, "rooms.json");
 var MESSAGES_STATE_FILE = path.join(SOCIETY_STATE_ROOT, "messages.jsonl");
 var DM_THREADS_STATE_FILE = path.join(SOCIETY_STATE_ROOT, "dm-threads.json");
 
+// src/mentions.ts
+var BROADCAST_TOKENS = /* @__PURE__ */ new Set(["everyone", "all", "\u5168\u4F53", "\u5E7F\u573A", "\u5927\u5BB6", "\u6240\u6709\u4EBA"]);
+var MENTION_RE = /@([A-Za-z0-9_\-\u4e00-\u9fff]{1,32})/g;
+function parseMentions(body, agents) {
+  const text = String(body || "");
+  const found = /* @__PURE__ */ new Set();
+  let everyone = false;
+  const byId = /* @__PURE__ */ new Map();
+  const byName = /* @__PURE__ */ new Map();
+  for (const a of agents) {
+    const id = String(a.id || "").trim();
+    const name2 = String(a.displayName || "").trim();
+    if (!id) continue;
+    byId.set(id.toLowerCase(), id);
+    byId.set(id, id);
+    if (name2) {
+      byName.set(name2.toLowerCase(), id);
+      byName.set(name2, id);
+    }
+  }
+  const nameKeys = [...byName.keys()].sort((a, b) => b.length - a.length);
+  for (const m of text.matchAll(MENTION_RE)) {
+    const raw = m[1] || "";
+    if (!raw) continue;
+    if (BROADCAST_TOKENS.has(raw) || BROADCAST_TOKENS.has(raw.toLowerCase())) {
+      everyone = true;
+      continue;
+    }
+    const idHit = byId.get(raw) || byId.get(raw.toLowerCase());
+    if (idHit) {
+      found.add(idHit);
+      continue;
+    }
+    let matched;
+    for (const key of nameKeys) {
+      if (key === raw || key.toLowerCase() === raw.toLowerCase()) {
+        matched = byName.get(key);
+        break;
+      }
+    }
+    if (matched) found.add(matched);
+  }
+  return { mentions: [...found], everyone };
+}
+function mergeMentions(body, agents, explicit, opts) {
+  const parsed = parseMentions(body, agents);
+  const set = new Set(parsed.mentions);
+  for (const id of explicit ?? []) {
+    const t = String(id || "").trim();
+    if (t) set.add(t);
+  }
+  const everyone = parsed.everyone;
+  if (everyone && opts?.expandEveryone !== false) {
+    for (const a of agents) {
+      const id = String(a.id || "").trim();
+      if (id) set.add(id);
+    }
+  }
+  return { mentions: [...set], everyone };
+}
+
 // plugins/society-rooms/src/index.ts
 var MAX_HISTORY_PER_ROOM = 200;
 var MAX_MESSAGES_JSONL = 2e3;
@@ -98,6 +159,24 @@ var SocietyRoomsService = class extends Service {
     this.require(roomId);
     return [...this.history.get(roomId) ?? []];
   }
+  /** Look up a message by id within a room (or any room if roomId omitted). */
+  findMessage(messageId, roomId) {
+    if (roomId) {
+      return (this.history.get(roomId) ?? []).find((m) => m.id === messageId);
+    }
+    for (const msgs of this.history.values()) {
+      const hit = msgs.find((m) => m.id === messageId);
+      if (hit) return hit;
+    }
+    return void 0;
+  }
+  /** How many messages in this room were posted after `messageId` (0 if unknown). */
+  messagesAfter(roomId, messageId) {
+    const hist = this.history.get(roomId) ?? [];
+    const idx = hist.findIndex((m) => m.id === messageId);
+    if (idx < 0) return 0;
+    return hist.length - 1 - idx;
+  }
   /** All recent messages across rooms (newest last), for observers. */
   recentMessages(limit = 50) {
     const all = [];
@@ -107,6 +186,9 @@ var SocietyRoomsService = class extends Service {
   }
   /**
    * Post to a room and deliver a copy to every other member's mailbox.
+   * Parses @mentions from body (merged with explicit req.mentions).
+   * Fan-out still goes to all members for plaza continuity; mentioned recipients
+   * get mentioned=true so the scheduler can prioritize them.
    */
   post(req) {
     const room = this.require(req.roomId);
@@ -116,12 +198,28 @@ var SocietyRoomsService = class extends Service {
     const body = String(req.body || "").trim();
     if (!body) throw new Error("message body is empty");
     if (body.length > 4e3) throw new Error("message body too long (max 4000)");
+    let replyTo = req.replyTo ? String(req.replyTo).trim() : void 0;
+    if (replyTo) {
+      const target = this.findMessage(replyTo, req.roomId);
+      if (!target) {
+        throw new Error(`replyTo message ${replyTo} not found in room ${req.roomId}`);
+      }
+    } else {
+      replyTo = void 0;
+    }
+    const agents = this.ctx.societyIdentity.list();
+    const merged = mergeMentions(body, agents, req.mentions, { expandEveryone: true });
+    const memberSet = new Set(room.members);
+    const mentions = merged.mentions.filter((id) => memberSet.has(id));
+    const everyone = merged.everyone;
     const msg = {
       id: randomUUID(),
       roomId: req.roomId,
       from: req.from,
       body,
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+      createdAt: (/* @__PURE__ */ new Date()).toISOString(),
+      ...replyTo ? { replyTo } : {},
+      ...mentions.length ? { mentions } : {}
     };
     const hist = this.history.get(req.roomId);
     hist.push(msg);
@@ -136,12 +234,17 @@ var SocietyRoomsService = class extends Service {
     const fromLabel = req.from === HUMAN_SPEAKER_ID ? this.ctx.societyIdentity.displayNameOf(HUMAN_SPEAKER_ID) : req.from === "system" ? speakerLabel("system") : this.ctx.societyIdentity.get(req.from)?.displayName || req.from;
     for (const member of room.members) {
       if (member === req.from) continue;
+      const mentioned = everyone || mentions.includes(member);
       this.ctx.societyMailbox.deliver({
         to: member,
         from: "room",
         kind: "room",
         roomId: room.id,
-        body: `[${room.name}] ${fromLabel}: ${body}`
+        body: `[${room.name}] ${fromLabel}: ${body}`,
+        replyTo: msg.replyTo,
+        mentions: mentions.length ? mentions : void 0,
+        sourceMessageId: msg.id,
+        mentioned
       });
     }
     return msg;
@@ -167,8 +270,19 @@ var SocietyRoomsService = class extends Service {
         const recent = lines.slice(-MAX_MESSAGES_JSONL);
         for (const line of recent) {
           try {
-            const msg = JSON.parse(line);
-            if (!msg?.id || !msg.roomId) continue;
+            const rawMsg = JSON.parse(line);
+            if (!rawMsg?.id || !rawMsg.roomId) continue;
+            const msg = {
+              id: String(rawMsg.id),
+              roomId: String(rawMsg.roomId),
+              from: rawMsg.from,
+              body: String(rawMsg.body || ""),
+              createdAt: String(rawMsg.createdAt || "")
+            };
+            if (rawMsg.replyTo) msg.replyTo = String(rawMsg.replyTo);
+            if (Array.isArray(rawMsg.mentions) && rawMsg.mentions.length) {
+              msg.mentions = rawMsg.mentions.map(String);
+            }
             if (!this.history.has(msg.roomId)) this.history.set(msg.roomId, []);
             this.history.get(msg.roomId).push(msg);
           } catch {

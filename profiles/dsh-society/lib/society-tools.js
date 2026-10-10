@@ -2,8 +2,8 @@
 
 
 // plugins/society-tools/src/index.ts
-import fs2 from "node:fs";
-import path3 from "node:path";
+import fs3 from "node:fs";
+import path4 from "node:path";
 import { Service as Service2 } from "@deepseek-ai/cordis";
 
 // src/env.ts
@@ -93,6 +93,38 @@ function requireAgnesConfig(modelOverride) {
   assertAgnesFreeModel(model);
   return { provider: "agnes", apiKey, baseUrl, model };
 }
+function requireGlmConfig(modelOverride) {
+  loadDotEnv();
+  const apiKey = process.env.GLM_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error(
+      "GLM_API_KEY is missing. Put it in .env (gitignored) or export it."
+    );
+  }
+  const baseUrl = (process.env.GLM_BASE_URL?.trim() || "https://open.bigmodel.cn/api/paas/v4").replace(/\/+$/, "");
+  const model = (modelOverride || process.env.GLM_MODEL?.trim() || "glm-4-flash").trim();
+  assertGlmFreeModel(model);
+  return { provider: "glm", apiKey, baseUrl, model };
+}
+function requireSiliconflowConfig(modelOverride) {
+  loadDotEnv();
+  const apiKey = process.env.SILICONFLOW_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error(
+      "SILICONFLOW_API_KEY is missing. Put it in .env (gitignored) or export it."
+    );
+  }
+  const baseUrl = (process.env.SILICONFLOW_BASE_URL?.trim() || "https://api.siliconflow.cn/v1").replace(/\/+$/, "");
+  const model = (modelOverride || process.env.SILICONFLOW_MODEL?.trim() || SILICONFLOW_DEFAULT_MODEL).trim();
+  assertSiliconflowFreeModel(model);
+  return { provider: "siliconflow", apiKey, baseUrl, model };
+}
+function requireProviderConfig(provider, modelOverride) {
+  const p = normalizeProviderId(provider);
+  if (p === "glm") return requireGlmConfig(modelOverride);
+  if (p === "siliconflow") return requireSiliconflowConfig(modelOverride);
+  return requireAgnesConfig(modelOverride);
+}
 function configuredFreeProviders() {
   loadDotEnv();
   const out = [];
@@ -156,7 +188,8 @@ var ALLOWED_HOSTS_EXACT = [
   "apihub.agnes-ai.com",
   "api.duckduckgo.com",
   "html.duckduckgo.com",
-  "open.bigmodel.cn"
+  "open.bigmodel.cn",
+  "api.exa.ai"
 ];
 var ALLOWED_HOST_SUFFIXES = ["wikipedia.org", "wikimedia.org"];
 function isHostAllowed(hostname) {
@@ -184,6 +217,158 @@ function assertUrlAllowed(url) {
   return u;
 }
 
+// plugins/society-tools/src/private-voice.ts
+var CAST_NAME_RE = /老码|阿宁|时辰|文心|agnes|glm|xingchen[_a-z0-9]*/i;
+function looksLikeOutboundChatLine(line) {
+  const t = String(line || "").trim();
+  if (!t) return false;
+  if (/@[\w\u4e00-\u9fff]+/.test(t)) return true;
+  if (/(在吗|大家好|有没有人|想问问大家|群里|有人吗|谁在|请问大家|各位好)/.test(t)) return true;
+  if (/想问问|大家一般|有没有人会|求问|初入职场群/.test(t)) return true;
+  if (CAST_NAME_RE.test(t) && /(在吗|你好|请问|帮忙|一起|怎么看|觉得呢|对吗|来一下|看一下)/.test(t)) {
+    return true;
+  }
+  if (CAST_NAME_RE.test(t) && /[，,]\s*.*[？?]/.test(t) && /(你|您)/.test(t)) return true;
+  return false;
+}
+function classifyIdlePrivateBody(body) {
+  const raw = String(body || "").trim();
+  if (!raw) return { kind: "private", privateBody: "", chatBody: "" };
+  const chunks = raw.split(/\r?\n|\|\|\|/g).map((s) => s.trim()).filter(Boolean);
+  if (!chunks.length) return { kind: "private", privateBody: "", chatBody: "" };
+  const privateParts = [];
+  const chatParts = [];
+  for (const c of chunks) {
+    if (looksLikeOutboundChatLine(c)) chatParts.push(c);
+    else privateParts.push(c);
+  }
+  if (!chatParts.length && chunks.length === 1 && looksLikeOutboundChatLine(raw)) {
+    return { kind: "chatty", privateBody: "", chatBody: raw };
+  }
+  if (!chatParts.length && /[。！？\n]/.test(raw) && /(在吗|想问问大家|大家好|有没有人|@)/.test(raw)) {
+    const parts = raw.split(/(?<=[。！？])/).map((s) => s.trim()).filter(Boolean);
+    if (parts.length >= 2) {
+      privateParts.length = 0;
+      for (const p of parts) {
+        if (looksLikeOutboundChatLine(p)) chatParts.push(p);
+        else privateParts.push(p);
+      }
+    }
+  }
+  const privateBody = privateParts.join("\n").trim();
+  const chatBody = chatParts.join("\n").trim();
+  if (chatBody && privateBody) return { kind: "mixed", privateBody, chatBody };
+  if (chatBody) return { kind: "chatty", privateBody: "", chatBody };
+  return { kind: "private", privateBody: privateBody || raw, chatBody: "" };
+}
+function isChattyPrivateText(text) {
+  const c = classifyIdlePrivateBody(text);
+  return c.kind === "chatty" || c.kind === "mixed";
+}
+
+// src/beijing-time.ts
+var BEIJING_TZ = "Asia/Shanghai";
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+function beijingParts(at = Date.now()) {
+  const d = typeof at === "number" ? new Date(at) : at;
+  const fmt = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: BEIJING_TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    weekday: "long",
+    hour12: false
+  });
+  const parts = fmt.formatToParts(d);
+  const get = (type) => parts.find((p) => p.type === type)?.value ?? "";
+  let hour = get("hour");
+  if (hour === "24") hour = "00";
+  const year = get("year");
+  const month = pad2(get("month"));
+  const day = pad2(get("day"));
+  const minute = pad2(get("minute"));
+  const second = pad2(get("second"));
+  hour = pad2(hour);
+  const weekday = get("weekday") || "";
+  return {
+    year,
+    month,
+    day,
+    hour,
+    minute,
+    second,
+    weekday,
+    date: `${year}-${month}-${day}`,
+    clock: `${hour}:${minute}`,
+    clockWithSeconds: `${hour}:${minute}:${second}`
+  };
+}
+function beijingDayStamp(at = Date.now()) {
+  return beijingParts(at).date;
+}
+function beijingClock(at = Date.now()) {
+  return beijingParts(at).clock;
+}
+
+// plugins/society-tools/src/exa-quota.ts
+import fs2 from "node:fs";
+import path3 from "node:path";
+var EXA_QUOTA_FILE = path3.join(SOCIETY_STATE_ROOT, "exa-quota.json");
+var EXA_DAILY_LIMIT = 1;
+function emptyQuota(day) {
+  return { day, used: {} };
+}
+function readExaQuota(now = Date.now(), filePath = EXA_QUOTA_FILE) {
+  const today = beijingDayStamp(now);
+  try {
+    if (!fs2.existsSync(filePath)) return emptyQuota(today);
+    const raw = JSON.parse(fs2.readFileSync(filePath, "utf8"));
+    const day = typeof raw.day === "string" ? raw.day : today;
+    const used = raw.used && typeof raw.used === "object" && !Array.isArray(raw.used) ? Object.fromEntries(
+      Object.entries(raw.used).filter(
+        ([k, v]) => typeof k === "string" && typeof v === "string"
+      )
+    ) : {};
+    if (day !== today) return emptyQuota(today);
+    return { day, used };
+  } catch {
+    return emptyQuota(today);
+  }
+}
+function writeExaQuota(quota, filePath = EXA_QUOTA_FILE) {
+  fs2.mkdirSync(path3.dirname(filePath), { recursive: true });
+  const tmp = `${filePath}.${process.pid}.tmp`;
+  fs2.writeFileSync(tmp, JSON.stringify(quota, null, 2) + "\n", "utf8");
+  fs2.renameSync(tmp, filePath);
+}
+function isExaQuotaExhausted(modelId, now = Date.now(), filePath = EXA_QUOTA_FILE) {
+  const id = modelId.trim();
+  if (!id) return true;
+  const q = readExaQuota(now, filePath);
+  return Boolean(q.used[id]);
+}
+function tryConsumeExaQuota(modelId, now = Date.now(), filePath = EXA_QUOTA_FILE) {
+  const id = modelId.trim();
+  if (!id) return false;
+  const today = beijingDayStamp(now);
+  fs2.mkdirSync(path3.dirname(filePath), { recursive: true });
+  let quota = readExaQuota(now, filePath);
+  if (quota.day !== today) quota = emptyQuota(today);
+  if (quota.used[id]) return false;
+  const at = (typeof now === "number" ? new Date(now) : now).toISOString();
+  quota.used[id] = at;
+  writeExaQuota(quota, filePath);
+  return true;
+}
+function exaQuotaExhaustedMessage(modelId) {
+  return `Error: Exa daily quota exhausted for model ${modelId} (${EXA_DAILY_LIMIT}/day, Beijing calendar)`;
+}
+
 // plugins/society-tools/src/index.ts
 var WEB_SEARCH_TIMEOUT_MS = 15e3;
 var IMAGE_TIMEOUT_MS = 9e4;
@@ -195,32 +380,184 @@ function resolveInsideWorkspace(workspaceRoot, relativePath) {
   const raw = relativePath.trim();
   if (!raw) throw new Error("path must be a non-empty string");
   if (raw.includes("\0")) throw new Error("path must not contain null bytes");
-  if (path3.isAbsolute(raw)) {
+  if (path4.isAbsolute(raw)) {
     throw new Error(`absolute paths are not allowed: ${raw}`);
   }
-  const normalized = path3.normalize(raw);
-  if (normalized === ".." || normalized.startsWith(`..${path3.sep}`) || normalized.includes(`${path3.sep}..${path3.sep}`) || normalized.endsWith(`${path3.sep}..`)) {
+  const normalized = path4.normalize(raw);
+  if (normalized === ".." || normalized.startsWith(`..${path4.sep}`) || normalized.includes(`${path4.sep}..${path4.sep}`) || normalized.endsWith(`${path4.sep}..`)) {
     throw new Error(`path traversal rejected: ${raw}`);
   }
   if (/(^|[\\/])\.\.([\\/]|$)/.test(raw)) {
     throw new Error(`path traversal rejected: ${raw}`);
   }
-  const root = path3.resolve(workspaceRoot);
-  const resolved = path3.resolve(root, normalized);
-  const rel = path3.relative(root, resolved);
-  if (rel.startsWith("..") || path3.isAbsolute(rel)) {
+  const root = path4.resolve(workspaceRoot);
+  const resolved = path4.resolve(root, normalized);
+  const rel = path4.relative(root, resolved);
+  if (rel.startsWith("..") || path4.isAbsolute(rel)) {
     throw new Error(`path escapes workspace: ${raw}`);
   }
   return resolved;
 }
 function toWorkspaceRelative(workspaceRoot, absolutePath) {
-  const root = path3.resolve(workspaceRoot);
-  const rel = path3.relative(root, path3.resolve(absolutePath));
-  if (rel.startsWith("..") || path3.isAbsolute(rel)) {
+  const root = path4.resolve(workspaceRoot);
+  const rel = path4.relative(root, path4.resolve(absolutePath));
+  if (rel.startsWith("..") || path4.isAbsolute(rel)) {
     throw new Error("internal path escape");
   }
-  return rel.split(path3.sep).join("/");
+  return rel.split(path4.sep).join("/");
 }
+var IDLE_CLOSING_TOOL_NAMES = [
+  "speak_in_room",
+  "send_dm",
+  "write_diary",
+  "write_thought",
+  "do_nothing"
+];
+var REPLY_CLOSING_TOOL_NAMES = ["stay_silent", "speak_in_room", "send_dm"];
+var RESEARCH_TOOL_NAMES = [
+  "web_search",
+  "write_file",
+  "read_file",
+  "list_workspace",
+  "list_agents",
+  "list_rooms",
+  "run_command",
+  "generate_image",
+  "reflect_feelings"
+];
+var SIDE_TOOL_NAMES = ["reflect_feelings"];
+function isClosingToolName(name2) {
+  return IDLE_CLOSING_TOOL_NAMES.includes(name2) || name2 === "stay_silent";
+}
+function localDayStamp(d = /* @__PURE__ */ new Date()) {
+  return beijingDayStamp(d);
+}
+function localClock(d = /* @__PURE__ */ new Date()) {
+  return beijingClock(d);
+}
+function splitBubbleBodies(body) {
+  const trimmed = body.trim();
+  if (!trimmed) return [];
+  if (trimmed.includes("|||")) {
+    return trimmed.split("|||").map((s) => s.trim()).filter(Boolean).slice(0, 5).map((b) => b.slice(0, 2e3));
+  }
+  return [trimmed.slice(0, 2e3)];
+}
+var SIDE_TOOL_DEFINITIONS = [
+  {
+    type: "function",
+    function: {
+      name: "reflect_feelings",
+      description: "Record YOUR OWN subjective soul shift after this turn (openness/trust/energy/mood). Optional; call at most once per turn when your feelings actually changed. Warm chat may raise energy/trust; exhaustion may lower energy. Deltas are small (\xB10.05 max each). Does NOT speak for you \u2014 still call a closing tool.",
+      parameters: {
+        type: "object",
+        properties: {
+          openness: {
+            type: "number",
+            description: "Delta for openness, clamped to \xB10.05"
+          },
+          trust: {
+            type: "number",
+            description: "Delta for trust, clamped to \xB10.05"
+          },
+          energy: {
+            type: "number",
+            description: "Delta for energy, clamped to \xB10.05"
+          },
+          mood: {
+            type: "string",
+            description: "Optional short mood label (e.g. \u5F00\u5FC3\u3001\u75B2\u60EB\u3001\u597D\u5947)"
+          },
+          reason: {
+            type: "string",
+            description: "Optional short reason for the audit log"
+          }
+        },
+        required: []
+      }
+    }
+  }
+];
+var CLOSING_TOOL_DEFINITIONS = [
+  {
+    type: "function",
+    function: {
+      name: "speak_in_room",
+      description: "Post to a group chat. Omit roomId to post to plaza. body may use ||| to split 2\u20134 short bubbles. Optional replyTo message id. Prefer @\u663E\u793A\u540D to mention someone.",
+      parameters: {
+        type: "object",
+        properties: {
+          roomId: {
+            type: "string",
+            description: "Room id; omit to use plaza (default)"
+          },
+          body: { type: "string", description: "What you say (Chinese short bubbles; ||| ok)" },
+          replyTo: {
+            type: "string",
+            description: "Optional message id in this room to reply to"
+          }
+        },
+        required: ["body"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "write_diary",
+      description: "Append a PRIVATE diary entry for today (first-person notes to yourself ONLY). Rejects outbound chat voice (@mentions, \u300Cxxx\u5728\u5417\u300D, asking the group). Use speak_in_room or send_dm to talk to others.",
+      parameters: {
+        type: "object",
+        properties: {
+          text: { type: "string", description: "Private first-person diary text" }
+        },
+        required: ["text"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "write_thought",
+      description: "Append a PRIVATE inner thought / note for today (not for others). Same privacy rules as write_diary.",
+      parameters: {
+        type: "object",
+        properties: {
+          text: { type: "string", description: "Private thought text" }
+        },
+        required: ["text"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "do_nothing",
+      description: "Explicitly end this idle turn without speaking, DIMing, or writing. Use sparingly.",
+      parameters: {
+        type: "object",
+        properties: {
+          reason: { type: "string", description: "Optional short reason" }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "stay_silent",
+      description: "Choose NOT to reply to the current room/DM stimulus (when topic moved on, others talking among themselves, and you were not @mentioned).",
+      parameters: {
+        type: "object",
+        properties: {
+          reason: { type: "string", description: "Optional short reason" }
+        },
+        required: []
+      }
+    }
+  }
+];
 var TOOL_DEFINITIONS = [
   {
     type: "function",
@@ -272,7 +609,7 @@ var TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "web_search",
-      description: "Search the public web (DuckDuckGo + Wikipedia opensearch fallback). Returns up to 5 short snippets. Use for factual lookups.",
+      description: "Search the public web via Exa (paid). Each LLM model may search at most once per Beijing calendar day; agents sharing a model share that quota. Returns up to 5 titles/urls/snippets. Use sparingly for factual lookups.",
       parameters: {
         type: "object",
         properties: {
@@ -371,12 +708,16 @@ var TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "post_room",
-      description: "Post a message to a room you belong to (wakes other members).",
+      description: "Post a message to a room you belong to (wakes other members). Use @\u663E\u793A\u540D to mention someone; optional replyTo message id.",
       parameters: {
         type: "object",
         properties: {
           roomId: { type: "string" },
-          body: { type: "string" }
+          body: { type: "string" },
+          replyTo: {
+            type: "string",
+            description: "Optional message id in this room to reply to"
+          }
         },
         required: ["roomId", "body"]
       }
@@ -430,7 +771,7 @@ var TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "send_dm",
-      description: "Send a private direct message to another agent.",
+      description: "Send a private direct message to another agent (closing act for idle or DM reply). body may use ||| for multi-bubble.",
       parameters: {
         type: "object",
         properties: {
@@ -442,14 +783,42 @@ var TOOL_DEFINITIONS = [
     }
   }
 ];
+function mergeToolDefs(...groups) {
+  const byName = /* @__PURE__ */ new Map();
+  for (const g of groups) {
+    for (const t of g) byName.set(t.function.name, t);
+  }
+  return [...byName.values()];
+}
 var SocietyToolsService = class extends Service2 {
   static inject = ["societyIdentity", "societySandbox", "societyRooms", "societyMailbox", "societySoul", "societyMemory"];
   constructor(ctx) {
     super(ctx, "societyTools");
   }
-  /** OpenAI-style tool schemas for chat/completions. */
+  defaultRoomId = null;
+  /** Prefer plaza for speak_in_room when roomId omitted (set by society-live). */
+  setDefaultRoom(roomId) {
+    this.defaultRoomId = roomId;
+  }
+  /** OpenAI-style tool schemas for chat/completions (full catalog). */
   getToolDefinitions() {
-    return TOOL_DEFINITIONS;
+    return mergeToolDefs(TOOL_DEFINITIONS, CLOSING_TOOL_DEFINITIONS, SIDE_TOOL_DEFINITIONS);
+  }
+  /** Idle self-loop: research tools + idle closing tools. */
+  getIdleToolDefinitions() {
+    const names = /* @__PURE__ */ new Set([
+      ...RESEARCH_TOOL_NAMES,
+      ...IDLE_CLOSING_TOOL_NAMES
+    ]);
+    return this.getToolDefinitions().filter((t) => names.has(t.function.name));
+  }
+  /** Room/DM reply: research + stay_silent / speak_in_room / send_dm. */
+  getReplyToolDefinitions(kind) {
+    const names = /* @__PURE__ */ new Set([...RESEARCH_TOOL_NAMES, ...REPLY_CLOSING_TOOL_NAMES]);
+    if (kind === "direct") {
+      names.delete("speak_in_room");
+    }
+    return this.getToolDefinitions().filter((t) => names.has(t.function.name));
   }
   workspaceOf(agentId) {
     return this.ctx.societyIdentity.require(agentId).workspacePath;
@@ -475,7 +844,7 @@ var SocietyToolsService = class extends Service2 {
         case "list_workspace":
           return this.listWorkspace(agentId, args.path != null ? String(args.path) : "");
         case "web_search":
-          return await this.webSearch(String(args.query ?? ""));
+          return await this.webSearch(agentId, String(args.query ?? ""));
         case "generate_image":
           return await this.generateImage(
             agentId,
@@ -497,9 +866,39 @@ var SocietyToolsService = class extends Service2 {
         case "list_agents":
           return this.listAgents();
         case "post_room":
-          return this.postRoom(agentId, String(args.roomId ?? ""), String(args.body ?? ""));
+          return this.postRoom(
+            agentId,
+            String(args.roomId ?? ""),
+            String(args.body ?? ""),
+            args.replyTo != null ? String(args.replyTo) : void 0
+          );
+        case "speak_in_room":
+          return this.speakInRoom(
+            agentId,
+            args.roomId != null ? String(args.roomId) : void 0,
+            String(args.body ?? ""),
+            args.replyTo != null ? String(args.replyTo) : void 0
+          );
         case "send_dm":
           return this.sendDm(agentId, String(args.to ?? ""), String(args.body ?? ""));
+        case "write_diary":
+          return this.writeDiary(agentId, String(args.text ?? ""));
+        case "write_thought":
+          return this.writeThought(agentId, String(args.text ?? ""));
+        case "do_nothing":
+          return JSON.stringify({
+            ok: true,
+            acted: "do_nothing",
+            reason: args.reason != null ? String(args.reason) : void 0
+          });
+        case "stay_silent":
+          return JSON.stringify({
+            ok: true,
+            acted: "stay_silent",
+            reason: args.reason != null ? String(args.reason) : void 0
+          });
+        case "reflect_feelings":
+          return this.reflectFeelings(agentId, args);
         case "spawn_agent":
           return this.spawnAgent(agentId, args);
         default:
@@ -575,34 +974,34 @@ var SocietyToolsService = class extends Service2 {
   writeFile(agentId, relativePath, content) {
     const root = this.workspaceOf(agentId);
     const abs = resolveInsideWorkspace(root, relativePath);
-    fs2.mkdirSync(path3.dirname(abs), { recursive: true });
-    fs2.writeFileSync(abs, content, "utf8");
+    fs3.mkdirSync(path4.dirname(abs), { recursive: true });
+    fs3.writeFileSync(abs, content, "utf8");
     const rel = toWorkspaceRelative(root, abs);
     return `Wrote ${rel} (${Buffer.byteLength(content, "utf8")} bytes)`;
   }
   readFile(agentId, relativePath) {
     const root = this.workspaceOf(agentId);
     const abs = resolveInsideWorkspace(root, relativePath);
-    if (!fs2.existsSync(abs) || !fs2.statSync(abs).isFile()) {
+    if (!fs3.existsSync(abs) || !fs3.statSync(abs).isFile()) {
       throw new Error(`file not found: ${relativePath}`);
     }
-    const text = fs2.readFileSync(abs, "utf8");
+    const text = fs3.readFileSync(abs, "utf8");
     const max = 32e3;
     if (text.length > max) return text.slice(0, max) + "\n\u2026[truncated]";
     return text;
   }
   listWorkspace(agentId, relativePath = "") {
     const root = this.workspaceOf(agentId);
-    const abs = relativePath.trim() ? resolveInsideWorkspace(root, relativePath) : path3.resolve(root);
-    if (!fs2.existsSync(abs)) {
+    const abs = relativePath.trim() ? resolveInsideWorkspace(root, relativePath) : path4.resolve(root);
+    if (!fs3.existsSync(abs)) {
       throw new Error(`directory not found: ${relativePath || "."}`);
     }
-    const st = fs2.statSync(abs);
+    const st = fs3.statSync(abs);
     if (!st.isDirectory()) throw new Error(`not a directory: ${relativePath || "."}`);
-    const entries = fs2.readdirSync(abs, { withFileTypes: true });
+    const entries = fs3.readdirSync(abs, { withFileTypes: true });
     if (entries.length === 0) return "(empty)";
     const lines = entries.map((e) => {
-      const rel = toWorkspaceRelative(root, path3.join(abs, e.name));
+      const rel = toWorkspaceRelative(root, path4.join(abs, e.name));
       return e.isDirectory() ? `${rel}/` : rel;
     }).sort();
     return lines.join("\n");
@@ -679,101 +1078,275 @@ ${result.stderr.trim()}` : ""
       2
     );
   }
-  postRoom(agentId, roomId, body) {
+  postRoom(agentId, roomId, body, replyTo) {
     const b = body.trim();
     if (!b) return "Error: body must be non-empty";
     const msg = this.ctx.societyRooms.post({
       roomId,
       from: agentId,
-      body: b
+      body: b,
+      ...replyTo ? { replyTo } : {}
     });
-    return JSON.stringify({ messageId: msg.id, roomId: msg.roomId, from: msg.from });
+    return JSON.stringify({
+      ok: true,
+      acted: "speak_in_room",
+      messageId: msg.id,
+      roomId: msg.roomId,
+      from: msg.from,
+      replyTo: msg.replyTo,
+      mentions: msg.mentions
+    });
+  }
+  /** Resolve plaza / default room when roomId omitted. */
+  resolveDefaultRoomId(agentId) {
+    if (this.defaultRoomId && this.ctx.societyRooms.get(this.defaultRoomId)) {
+      return this.defaultRoomId;
+    }
+    const plaza = this.ctx.societyRooms.listRooms().find((r) => r.name === "plaza");
+    if (plaza && plaza.members.includes(agentId)) return plaza.id;
+    const mine = this.ctx.societyRooms.listRooms().find((r) => r.members.includes(agentId));
+    return mine?.id ?? null;
+  }
+  speakInRoom(agentId, roomId, body, replyTo) {
+    const bubbles = splitBubbleBodies(body);
+    if (!bubbles.length) return "Error: body must be non-empty";
+    const rid = roomId?.trim() || this.resolveDefaultRoomId(agentId) || "";
+    if (!rid) return "Error: no roomId and no plaza/default room available";
+    const room = this.ctx.societyRooms.get(rid);
+    if (!room) return `Error: room not found: ${rid}`;
+    if (!room.members.includes(agentId)) {
+      return `Error: you are not a member of room ${rid}`;
+    }
+    const messageIds = [];
+    for (let i = 0; i < bubbles.length; i++) {
+      const msg = this.ctx.societyRooms.post({
+        roomId: rid,
+        from: agentId,
+        body: bubbles[i],
+        ...replyTo && i === 0 ? { replyTo } : {}
+      });
+      messageIds.push(msg.id);
+    }
+    return JSON.stringify({
+      ok: true,
+      acted: "speak_in_room",
+      roomId: rid,
+      messageIds,
+      bubbles: bubbles.length,
+      replyTo: replyTo || void 0
+    });
   }
   sendDm(agentId, to, body) {
-    const b = body.trim();
-    if (!b) return "Error: body must be non-empty";
+    const bubbles = splitBubbleBodies(body);
+    if (!bubbles.length) return "Error: body must be non-empty";
     if (to === agentId) return "Error: cannot DM yourself";
     this.ctx.societyIdentity.require(to);
-    const msg = this.ctx.societyMailbox.deliver({
+    const messageIds = [];
+    for (const b of bubbles) {
+      const msg = this.ctx.societyMailbox.deliver({
+        to,
+        from: agentId,
+        kind: "direct",
+        body: b
+      });
+      messageIds.push(msg.id);
+    }
+    return JSON.stringify({
+      ok: true,
+      acted: "send_dm",
       to,
       from: agentId,
-      kind: "direct",
-      body: b
+      messageIds,
+      bubbles: bubbles.length
     });
-    return JSON.stringify({ messageId: msg.id, to: msg.to, from: msg.from });
+  }
+  appendDailyNote(agentId, kind, text) {
+    const raw = text.trim();
+    if (!raw) return "Error: text must be non-empty";
+    if (isChattyPrivateText(raw) || looksLikeOutboundChatLine(raw)) {
+      return JSON.stringify({
+        ok: false,
+        acted: kind,
+        error: "text looks like outbound chat (mentions, \u5728\u5417, group questions). Use speak_in_room or send_dm instead; keep diary/thoughts private first-person only."
+      });
+    }
+    const now = /* @__PURE__ */ new Date();
+    const day = localDayStamp(now);
+    const clock = localClock(now);
+    const rel = kind === "diary" ? `diary/${day}.md` : `thoughts/${day}.md`;
+    const title = kind === "diary" ? `\u65E5\u8BB0 ${day}` : `\u968F\u60F3 ${day}`;
+    let content = "";
+    try {
+      content = this.readFile(agentId, rel);
+    } catch {
+      content = `# ${title}
+
+`;
+    }
+    if (!content.trim()) content = `# ${title}
+
+`;
+    if (!content.includes(`# ${title}`)) {
+      content = `# ${title}
+
+${content}`;
+    }
+    const entry = `## ${clock}
+
+${raw}
+`;
+    content = content.replace(/\s*$/, "\n") + entry + "\n";
+    this.writeFile(agentId, rel, content);
+    try {
+      this.ctx.societyMemory.rememberInteraction(agentId, {
+        from: agentId,
+        body: raw,
+        kind: kind === "diary" ? "diary" : "idle",
+        role: "speaker"
+      });
+    } catch {
+    }
+    return JSON.stringify({
+      ok: true,
+      acted: kind,
+      path: rel,
+      clock,
+      text: raw.slice(0, 200)
+    });
   }
   /**
-   * DuckDuckGo Instant Answer JSON + optional HTML lite scrape.
-   * Caps to 3–5 short snippets. Network errors → friendly string.
+   * Subjective soul update for THIS agent only (no keyword heuristics, no fan-out).
    */
-  async webSearch(query) {
+  reflectFeelings(agentId, args) {
+    const patch = {};
+    if (args.openness != null && Number.isFinite(Number(args.openness))) {
+      patch.openness = Number(args.openness);
+    }
+    if (args.trust != null && Number.isFinite(Number(args.trust))) {
+      patch.trust = Number(args.trust);
+    }
+    if (args.energy != null && Number.isFinite(Number(args.energy))) {
+      patch.energy = Number(args.energy);
+    }
+    if (args.mood != null) patch.mood = String(args.mood);
+    if (args.reason != null) patch.reason = String(args.reason);
+    if (patch.openness == null && patch.trust == null && patch.energy == null && !patch.mood) {
+      return JSON.stringify({
+        ok: false,
+        acted: "reflect_feelings",
+        error: "provide at least one of openness/trust/energy/mood"
+      });
+    }
+    const before = this.ctx.societySoul.get(agentId);
+    const after = this.ctx.societySoul.applySubjective(agentId, patch);
+    return JSON.stringify({
+      ok: true,
+      acted: "reflect_feelings",
+      before: {
+        openness: before.openness,
+        trust: before.trust,
+        energy: before.energy,
+        mood: before.mood
+      },
+      after: {
+        openness: after.openness,
+        trust: after.trust,
+        energy: after.energy,
+        mood: after.mood
+      },
+      deltas: {
+        openness: Math.round((after.openness - before.openness) * 1e4) / 1e4,
+        trust: Math.round((after.trust - before.trust) * 1e4) / 1e4,
+        energy: Math.round((after.energy - before.energy) * 1e4) / 1e4
+      },
+      reason: patch.reason || "reflect_feelings"
+    });
+  }
+  writeDiary(agentId, text) {
+    return this.appendDailyNote(agentId, "diary", text);
+  }
+  writeThought(agentId, text) {
+    return this.appendDailyNote(agentId, "thought", text);
+  }
+  /**
+   * Exa Search API — one call per resolved LLM model id per Beijing calendar day.
+   * Requires EXA_API_KEY. No DuckDuckGo / Wikipedia fallback.
+   */
+  async webSearch(agentId, query) {
     const q = query.trim();
     if (!q) return "Error: query must be non-empty";
-    const snippets = [];
+    loadDotEnv();
+    const apiKey = process.env.EXA_API_KEY?.trim();
+    if (!apiKey) {
+      return "Error: EXA_API_KEY is missing. Set it in .env (gitignored) or the process environment; Exa is required for web_search (no free fallback).";
+    }
+    let modelId;
     try {
-      const instantUrl = `https://api.duckduckgo.com/?${new URLSearchParams({
-        q,
-        format: "json",
-        no_redirect: "1",
-        no_html: "1",
-        skip_disambig: "1"
-      }).toString()}`;
-      const instant = await fetchWithTimeout(instantUrl, WEB_SEARCH_TIMEOUT_MS, {
-        headers: { Accept: "application/json", "User-Agent": "society-chat/0.1 (research agent)" }
-      });
-      if (instant.ok) {
-        const data = await instant.json();
-        if (data.Heading && data.AbstractText) {
-          snippets.push(`${data.Heading}: ${trimSnippet(data.AbstractText)}${data.AbstractURL ? ` (${data.AbstractURL})` : ""}`);
-        } else if (data.AbstractText) {
-          snippets.push(trimSnippet(data.AbstractText));
-        }
-        if (data.Answer) snippets.push(`Answer: ${trimSnippet(data.Answer)}`);
-        if (data.Definition) snippets.push(`Definition: ${trimSnippet(data.Definition)}`);
-        for (const t of data.RelatedTopics ?? []) {
-          if (snippets.length >= 5) break;
-          if (t.Text) {
-            snippets.push(trimSnippet(t.Text) + (t.FirstURL ? ` (${t.FirstURL})` : ""));
-          }
-        }
-      }
+      const pref = this.ctx.societyIdentity.getLlmPreference(agentId);
+      const cfg = requireProviderConfig(normalizeProviderId(pref.provider), pref.model);
+      modelId = cfg.model;
     } catch (err) {
-      this.ctx.logger("society-tools").warn(`web_search instant failed: ${err instanceof Error ? err.message : err}`);
+      return `Error: cannot resolve LLM model for web_search quota \u2014 ${err instanceof Error ? err.message : String(err)}`;
     }
-    if (snippets.length < 3) {
-      try {
-        const htmlUrl = `https://html.duckduckgo.com/html/?${new URLSearchParams({ q }).toString()}`;
-        const htmlRes = await fetchWithTimeout(htmlUrl, WEB_SEARCH_TIMEOUT_MS, {
-          headers: {
-            Accept: "text/html",
-            "User-Agent": "society-chat/0.1 (research agent)"
-          }
-        });
-        if (htmlRes.ok) {
-          const html = await htmlRes.text();
-          const fromHtml = parseDuckDuckGoHtml(html, 5 - snippets.length);
-          snippets.push(...fromHtml);
-        }
-      } catch (err) {
-        if (snippets.length === 0) {
-          return `Error: web_search network failure \u2014 ${err instanceof Error ? err.message : String(err)}`;
-        }
-      }
+    if (isExaQuotaExhausted(modelId)) {
+      return exaQuotaExhaustedMessage(modelId);
     }
-    if (snippets.length < 3) {
+    if (!tryConsumeExaQuota(modelId)) {
+      return exaQuotaExhaustedMessage(modelId);
+    }
+    const url = "https://api.exa.ai/search";
+    let res;
+    try {
+      res = await fetchWithTimeout(url, WEB_SEARCH_TIMEOUT_MS, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "x-api-key": apiKey,
+          Authorization: `Bearer ${apiKey}`,
+          "User-Agent": "society-chat/0.1 (research agent)"
+        },
+        body: JSON.stringify({
+          query: q,
+          type: "auto",
+          numResults: 5,
+          contents: { highlights: true }
+        })
+      });
+    } catch (err) {
+      return `Error: Exa web_search network failure \u2014 ${err instanceof Error ? err.message : String(err)}`;
+    }
+    const rawText = await res.text();
+    if (!res.ok) {
+      let detail = rawText.slice(0, 400);
       try {
-        const wiki = await wikipediaSearch(q, 5 - snippets.length);
-        snippets.push(...wiki);
-      } catch (err) {
-        this.ctx.logger("society-tools").warn(
-          `web_search wikipedia failed: ${err instanceof Error ? err.message : err}`
-        );
+        const j = JSON.parse(rawText);
+        detail = j.error || j.message || detail;
+      } catch {
       }
+      return `Error: Exa web_search failed \u2014 HTTP ${res.status}: ${detail}`;
+    }
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      return `Error: Exa web_search returned non-JSON (HTTP ${res.status})`;
+    }
+    const snippets = [];
+    for (const r of data.results ?? []) {
+      if (snippets.length >= 5) break;
+      const title = (r.title || "").trim();
+      const pageUrl = (r.url || "").trim();
+      const highlight = Array.isArray(r.highlights) ? r.highlights.filter(Boolean).join(" \u2026 ") : "";
+      const body = (highlight || r.summary || r.text || "").trim();
+      const line = [title, body ? trimSnippet(body) : "", pageUrl ? `(${pageUrl})` : ""].filter(Boolean).join(" \u2014 ");
+      if (line) snippets.push(trimSnippet(line, 400));
     }
     if (snippets.length === 0) {
-      return `No useful results for: ${q}`;
+      return `No useful Exa results for: ${q}`;
     }
-    return snippets.slice(0, 5).map((s, i) => `${i + 1}. ${s}`).join("\n");
+    return `Exa results for "${q}" (model ${modelId}, 1/day Beijing):
+` + snippets.map((s, i) => `${i + 1}. ${s}`).join("\n");
   }
   async generateImage(agentId, prompt, filename) {
     const p = prompt.trim();
@@ -782,7 +1355,7 @@ ${result.stderr.trim()}` : ""
     const root = this.workspaceOf(agentId);
     const imagesDirRel = "images";
     const imagesDir = resolveInsideWorkspace(root, imagesDirRel);
-    fs2.mkdirSync(imagesDir, { recursive: true });
+    fs3.mkdirSync(imagesDir, { recursive: true });
     const safeName = (filename && filename.trim() ? filename.trim().replace(/[^a-zA-Z0-9._-]/g, "_") : `img-${Date.now()}.png`) || `img-${Date.now()}.png`;
     const relFile = `${imagesDirRel}/${safeName.endsWith(".png") || safeName.endsWith(".jpg") || safeName.endsWith(".webp") ? safeName : `${safeName}.png`}`;
     const absFile = resolveInsideWorkspace(root, relFile);
@@ -825,21 +1398,21 @@ ${result.stderr.trim()}` : ""
         });
         if (imgRes.ok) {
           const buf = Buffer.from(await imgRes.arrayBuffer());
-          fs2.writeFileSync(absFile, buf);
+          fs3.writeFileSync(absFile, buf);
           const notePath = resolveInsideWorkspace(root, `${relFile}.url.txt`);
-          fs2.writeFileSync(notePath, imageUrl, "utf8");
+          fs3.writeFileSync(notePath, imageUrl, "utf8");
           return `Generated image saved to ${toWorkspaceRelative(root, absFile)} (also wrote .url.txt)`;
         }
       } catch {
       }
       const noteOnly = resolveInsideWorkspace(root, `images/${safeName}.url.txt`);
-      fs2.writeFileSync(noteOnly, `prompt: ${p}
+      fs3.writeFileSync(noteOnly, `prompt: ${p}
 url: ${imageUrl}
 `, "utf8");
       return `Image URL saved to ${toWorkspaceRelative(root, noteOnly)} (download skipped): ${imageUrl}`;
     }
     if (item?.b64_json) {
-      fs2.writeFileSync(absFile, Buffer.from(item.b64_json, "base64"));
+      fs3.writeFileSync(absFile, Buffer.from(item.b64_json, "base64"));
       return `Generated image saved to ${toWorkspaceRelative(root, absFile)} (from b64)`;
     }
     return "Error: generate_image response missing url and b64_json";
@@ -859,93 +1432,24 @@ async function fetchWithTimeout(url, timeoutMs, init) {
     clearTimeout(timer);
   }
 }
-async function wikipediaSearch(query, limit) {
-  const out = [];
-  if (limit <= 0) return out;
-  const openUrl = `https://en.wikipedia.org/w/api.php?` + new URLSearchParams({
-    action: "opensearch",
-    search: query,
-    limit: String(Math.min(5, Math.max(1, limit))),
-    namespace: "0",
-    format: "json"
-  }).toString();
-  const openRes = await fetchWithTimeout(openUrl, WEB_SEARCH_TIMEOUT_MS, {
-    headers: {
-      Accept: "application/json",
-      "User-Agent": "society-chat/0.1 (research agent)"
-    }
-  });
-  if (!openRes.ok) return out;
-  const data = await openRes.json();
-  const titles = data[1] ?? [];
-  const descs = data[2] ?? [];
-  const urls = data[3] ?? [];
-  for (let i = 0; i < titles.length && out.length < limit; i++) {
-    const title = titles[i];
-    let snip = (descs[i] || "").trim();
-    const pageUrl = urls[i] || "";
-    if (!snip) {
-      try {
-        const sumUrl = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`;
-        const sumRes = await fetchWithTimeout(sumUrl, WEB_SEARCH_TIMEOUT_MS, {
-          headers: {
-            Accept: "application/json",
-            "User-Agent": "society-chat/0.1 (research agent)"
-          }
-        });
-        if (sumRes.ok) {
-          const sum = await sumRes.json();
-          snip = (sum.extract || "").trim();
-        }
-      } catch {
-      }
-    }
-    const line = snip ? `Wikipedia: ${title} \u2014 ${trimSnippet(snip)}${pageUrl ? ` (${pageUrl})` : ""}` : `Wikipedia: ${title}${pageUrl ? ` (${pageUrl})` : ""}`;
-    out.push(trimSnippet(line));
-  }
-  return out;
-}
-function parseDuckDuckGoHtml(html, limit) {
-  const out = [];
-  const re = /class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?(?:class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|td|div)>)?/gi;
-  let m;
-  while ((m = re.exec(html)) && out.length < limit) {
-    const href = decodeBasicEntities(m[1] || "");
-    const title = decodeBasicEntities(stripTags(m[2] || "")).trim();
-    const snip = decodeBasicEntities(stripTags(m[3] || "")).trim();
-    if (!title && !snip) continue;
-    const line = [title, snip].filter(Boolean).join(" \u2014 ");
-    out.push(trimSnippet(line + (href ? ` (${href})` : "")));
-  }
-  if (out.length === 0) {
-    const re2 = /uddg=([^&"]+)[^>]*>\s*([^<]{5,120})/gi;
-    while ((m = re2.exec(html)) && out.length < limit) {
-      try {
-        const href = decodeURIComponent(m[1]);
-        const title = decodeBasicEntities(m[2]).trim();
-        out.push(trimSnippet(`${title} (${href})`));
-      } catch {
-      }
-    }
-  }
-  return out;
-}
-function stripTags(s) {
-  return s.replace(/<[^>]+>/g, " ");
-}
-function decodeBasicEntities(s) {
-  return s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ");
-}
 var name = "society-tools";
 var inject = ["societyIdentity", "societySandbox", "societyRooms", "societyMailbox", "societySoul", "societyMemory"];
 function apply(ctx) {
   ctx.plugin(SocietyToolsService);
 }
 export {
+  IDLE_CLOSING_TOOL_NAMES,
+  REPLY_CLOSING_TOOL_NAMES,
+  RESEARCH_TOOL_NAMES,
+  SIDE_TOOL_NAMES,
   SocietyToolsService,
   TOOL_DEFINITIONS,
   apply,
+  classifyIdlePrivateBody,
   inject,
+  isChattyPrivateText,
+  isClosingToolName,
+  looksLikeOutboundChatLine,
   name,
   resolveInsideWorkspace,
   toWorkspaceRelative

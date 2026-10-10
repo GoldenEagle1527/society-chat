@@ -2,7 +2,54 @@
 
 
 // plugins/society-scheduler/src/index.ts
-import { Service as Service2 } from "@deepseek-ai/cordis";
+import { Service as Service3 } from "@deepseek-ai/cordis";
+
+// src/beijing-time.ts
+var BEIJING_TZ = "Asia/Shanghai";
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+function beijingParts(at = Date.now()) {
+  const d = typeof at === "number" ? new Date(at) : at;
+  const fmt = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: BEIJING_TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    weekday: "long",
+    hour12: false
+  });
+  const parts = fmt.formatToParts(d);
+  const get = (type) => parts.find((p) => p.type === type)?.value ?? "";
+  let hour = get("hour");
+  if (hour === "24") hour = "00";
+  const year = get("year");
+  const month = pad2(get("month"));
+  const day = pad2(get("day"));
+  const minute = pad2(get("minute"));
+  const second = pad2(get("second"));
+  hour = pad2(hour);
+  const weekday = get("weekday") || "";
+  return {
+    year,
+    month,
+    day,
+    hour,
+    minute,
+    second,
+    weekday,
+    date: `${year}-${month}-${day}`,
+    clock: `${hour}:${minute}`,
+    clockWithSeconds: `${hour}:${minute}:${second}`
+  };
+}
+function formatBeijingNow(at = Date.now()) {
+  const p = beijingParts(at);
+  return `\u5F53\u524D\u5317\u4EAC\u65F6\u95F4\uFF1A${p.date} ${p.weekday} ${p.clock}\uFF08${BEIJING_TZ}\uFF09`;
+}
 
 // src/paths.ts
 import path from "node:path";
@@ -19,105 +66,85 @@ var ROOMS_STATE_FILE = path.join(SOCIETY_STATE_ROOT, "rooms.json");
 var MESSAGES_STATE_FILE = path.join(SOCIETY_STATE_ROOT, "messages.jsonl");
 var DM_THREADS_STATE_FILE = path.join(SOCIETY_STATE_ROOT, "dm-threads.json");
 
+// src/env.ts
+function societyEnvInt(name2, defaultValue) {
+  const raw = process.env[name2]?.trim();
+  if (raw && /^\d+$/.test(raw)) return Math.max(0, parseInt(raw, 10));
+  return defaultValue;
+}
+
 // src/llm-http.ts
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
+function llmMaxAttempts() {
+  return Math.max(1, societyEnvInt("SOCIETY_LLM_MAX_ATTEMPTS", 10) || 10);
+}
+function llmTimeoutMs() {
+  return Math.max(5e3, societyEnvInt("SOCIETY_LLM_TIMEOUT_MS", 75e3) || 75e3);
+}
+function agentTickBudgetMs() {
+  const override = societyEnvInt("SOCIETY_AGENT_TICK_BUDGET_MS", 0);
+  if (override > 0) return Math.max(1e4, override);
+  const t = llmTimeoutMs();
+  const attempts = Math.min(llmMaxAttempts(), 3);
+  return t * attempts + 6e4;
+}
 
-// plugins/society-llm/src/index.ts
+// plugins/society-tools/src/index.ts
+import { Service as Service2 } from "@deepseek-ai/cordis";
+
+// plugins/society-sandbox/src/index.ts
 import { Service } from "@deepseek-ai/cordis";
-var MAX_BUBBLES = 5;
-var MAX_BUBBLE_CHARS = 2e3;
-function parseAgentTurn(raw) {
-  const text = (raw ?? "").trim();
-  if (!text) return { silent: true, bubbles: [], raw: text };
-  const fromJson = tryParseJsonTurn(text);
-  if (fromJson) return { ...fromJson, raw: text };
-  const lines = text.split(/\r?\n/);
-  let action = null;
-  let cut = lines.length;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim();
-    if (/^ACTION:\s*SILENT\s*$/i.test(line)) {
-      action = "silent";
-      cut = i;
-      break;
-    }
-    if (/^ACTION:\s*REPLY\s*$/i.test(line)) {
-      action = "reply";
-      cut = i;
-      break;
-    }
+
+// plugins/society-tools/src/private-voice.ts
+var CAST_NAME_RE = /老码|阿宁|时辰|文心|agnes|glm|xingchen[_a-z0-9]*/i;
+function looksLikeOutboundChatLine(line) {
+  const t = String(line || "").trim();
+  if (!t) return false;
+  if (/@[\w\u4e00-\u9fff]+/.test(t)) return true;
+  if (/(在吗|大家好|有没有人|想问问大家|群里|有人吗|谁在|请问大家|各位好)/.test(t)) return true;
+  if (/想问问|大家一般|有没有人会|求问|初入职场群/.test(t)) return true;
+  if (CAST_NAME_RE.test(t) && /(在吗|你好|请问|帮忙|一起|怎么看|觉得呢|对吗|来一下|看一下)/.test(t)) {
+    return true;
   }
-  if (action === "silent") {
-    return { silent: true, bubbles: [], raw: text };
-  }
-  let body = (action ? lines.slice(0, cut).join("\n") : text).trim();
-  if (/^ACTION:\s*SILENT\s*$/i.test(body)) {
-    return { silent: true, bubbles: [], raw: text };
-  }
-  const bubbles = splitBubbles(body);
-  if (bubbles.length === 0) return { silent: true, bubbles: [], raw: text };
-  return { silent: false, bubbles, raw: text };
+  if (CAST_NAME_RE.test(t) && /[，,]\s*.*[？?]/.test(t) && /(你|您)/.test(t)) return true;
+  return false;
 }
-function tryParseJsonTurn(text) {
-  let candidate = text.trim();
-  const fence = candidate.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fence) candidate = fence[1].trim();
-  const objStart = candidate.indexOf("{");
-  const arrStart = candidate.indexOf("[");
-  let slice = null;
-  if (objStart >= 0 && (arrStart < 0 || objStart < arrStart)) {
-    const end = candidate.lastIndexOf("}");
-    if (end > objStart) slice = candidate.slice(objStart, end + 1);
-  } else if (arrStart >= 0) {
-    const end = candidate.lastIndexOf("]");
-    if (end > arrStart) slice = candidate.slice(arrStart, end + 1);
+function classifyIdlePrivateBody(body) {
+  const raw = String(body || "").trim();
+  if (!raw) return { kind: "private", privateBody: "", chatBody: "" };
+  const chunks = raw.split(/\r?\n|\|\|\|/g).map((s) => s.trim()).filter(Boolean);
+  if (!chunks.length) return { kind: "private", privateBody: "", chatBody: "" };
+  const privateParts = [];
+  const chatParts = [];
+  for (const c of chunks) {
+    if (looksLikeOutboundChatLine(c)) chatParts.push(c);
+    else privateParts.push(c);
   }
-  if (!slice) return null;
-  let parsed;
-  try {
-    parsed = JSON.parse(slice);
-  } catch {
-    return null;
+  if (!chatParts.length && chunks.length === 1 && looksLikeOutboundChatLine(raw)) {
+    return { kind: "chatty", privateBody: "", chatBody: raw };
   }
-  if (Array.isArray(parsed)) {
-    const bubbles = parsed.map((x) => String(x ?? "").trim()).filter(Boolean).slice(0, MAX_BUBBLES).map((b) => b.slice(0, MAX_BUBBLE_CHARS));
-    if (bubbles.length === 0) return { silent: true, bubbles: [] };
-    return { silent: false, bubbles };
-  }
-  if (parsed && typeof parsed === "object") {
-    const o = parsed;
-    if (o.reply === false || o.silent === true) {
-      return { silent: true, bubbles: [] };
-    }
-    if (Array.isArray(o.bubbles)) {
-      const bubbles = o.bubbles.map((x) => String(x ?? "").trim()).filter(Boolean).slice(0, MAX_BUBBLES).map((b) => b.slice(0, MAX_BUBBLE_CHARS));
-      if (bubbles.length === 0) return { silent: true, bubbles: [] };
-      return { silent: false, bubbles };
-    }
-    if (typeof o.text === "string" && o.text.trim()) {
-      return { silent: false, bubbles: splitBubbles(o.text.trim()) };
-    }
-    if (o.reply === true && typeof o.body === "string") {
-      return { silent: false, bubbles: splitBubbles(o.body.trim()) };
+  if (!chatParts.length && /[。！？\n]/.test(raw) && /(在吗|想问问大家|大家好|有没有人|@)/.test(raw)) {
+    const parts = raw.split(/(?<=[。！？])/).map((s) => s.trim()).filter(Boolean);
+    if (parts.length >= 2) {
+      privateParts.length = 0;
+      for (const p of parts) {
+        if (looksLikeOutboundChatLine(p)) chatParts.push(p);
+        else privateParts.push(p);
+      }
     }
   }
-  return null;
+  const privateBody = privateParts.join("\n").trim();
+  const chatBody = chatParts.join("\n").trim();
+  if (chatBody && privateBody) return { kind: "mixed", privateBody, chatBody };
+  if (chatBody) return { kind: "chatty", privateBody: "", chatBody };
+  return { kind: "private", privateBody: privateBody || raw, chatBody: "" };
 }
-function splitBubbles(body) {
-  const trimmed = body.trim();
-  if (!trimmed) return [];
-  if (trimmed.includes("|||")) {
-    return trimmed.split("|||").map((s) => s.trim()).filter(Boolean).slice(0, MAX_BUBBLES).map((b) => b.slice(0, MAX_BUBBLE_CHARS));
-  }
-  const numbered = trimmed.match(/^\s*\d+[.)、]\s+.+/gm);
-  if (numbered && numbered.length >= 2) {
-    const parts = numbered.map((line) => line.replace(/^\s*\d+[.)、]\s+/, "").trim()).filter(Boolean).slice(0, MAX_BUBBLES).map((b) => b.slice(0, MAX_BUBBLE_CHARS));
-    if (parts.length >= 2) return parts;
-  }
-  return [trimmed.slice(0, MAX_BUBBLE_CHARS)];
-}
+
+// plugins/society-tools/src/exa-quota.ts
+import path2 from "node:path";
+var EXA_QUOTA_FILE = path2.join(SOCIETY_STATE_ROOT, "exa-quota.json");
 
 // plugins/society-scheduler/src/index.ts
 function envInt(name2, fallback) {
@@ -131,16 +158,41 @@ function defaultMaxExchanges() {
 function exchangesCapped(exchangeCount, maxExchanges) {
   return maxExchanges > 0 && exchangeCount >= maxExchanges;
 }
-function localDayStamp(d = /* @__PURE__ */ new Date()) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
+var MAX_ROOM_REPLIES_PER_TICK = 2;
+var STALE_NEWER_COUNT = 8;
+var STALE_AGE_MS = 4 * 6e4;
+function mailMentionsAgent(message, agentId) {
+  if (message.mentions?.includes(agentId)) return true;
+  if (message.mentioned && message.to === agentId) return true;
+  return false;
 }
-function localClock(d = /* @__PURE__ */ new Date()) {
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  return `${hh}:${mm}`;
+function mailRepliesToAgent(message, agentId, findMessage) {
+  if (!message.replyTo) return false;
+  const target = findMessage(message.replyTo, message.roomId);
+  return !!target && target.from === agentId;
+}
+function isStaleRoomStimulus(message, opts) {
+  if (message.kind !== "room" || !message.roomId) return false;
+  const sourceId = message.sourceMessageId;
+  if (sourceId) {
+    const newer = opts.messagesAfter(message.roomId, sourceId);
+    if (newer >= STALE_NEWER_COUNT) return true;
+  }
+  const created = Date.parse(message.createdAt);
+  if (Number.isFinite(created)) {
+    const now = opts.now ?? Date.now();
+    if (now - created > STALE_AGE_MS) return true;
+  }
+  return false;
+}
+function scoreUnreadForAgent(message, agentId, findMessage) {
+  let score = 0;
+  if (message.kind === "direct") score += 5e3;
+  if (mailMentionsAgent(message, agentId)) score += 2e4;
+  if (mailRepliesToAgent(message, agentId, findMessage)) score += 15e3;
+  const created = Date.parse(message.createdAt);
+  if (Number.isFinite(created)) score += Math.min(1e3, created / 1e10);
+  return score;
 }
 var NEWS_INTEREST_RE = /时政|新闻|辩论|政治|热点|公共议题|时事|debate|news|politics/i;
 function caresAboutCurrentAffairs(agentId, interests, persona) {
@@ -151,55 +203,47 @@ function caresAboutCurrentAffairs(agentId, interests, persona) {
 function idleBiasFor(agentId) {
   switch (agentId) {
     case "xingchen_news":
-      return { preferSearch: true, socialPrefer: 0.55, toolPrefer: 0.85 };
+      return { preferSearch: true, socialPrefer: 0.78, toolPrefer: 0.85 };
     case "xingchen_lit":
-      return { preferSearch: false, socialPrefer: 0.4, toolPrefer: 0.22 };
+      return { preferSearch: false, socialPrefer: 0.62, toolPrefer: 0.22 };
     case "agnes":
-      return { preferSearch: false, socialPrefer: 0.45, toolPrefer: 0.28 };
+      return { preferSearch: false, socialPrefer: 0.72, toolPrefer: 0.28 };
     case "glm":
-      return { preferSearch: false, socialPrefer: 0.35, toolPrefer: 0.3 };
+      return { preferSearch: false, socialPrefer: 0.6, toolPrefer: 0.3 };
     default:
-      return { preferSearch: false, socialPrefer: 0.4, toolPrefer: 0.25 };
+      return { preferSearch: false, socialPrefer: 0.65, toolPrefer: 0.25 };
   }
 }
-function cleanIdleBody(raw) {
-  return String(raw || "").split(/\r?\n/).filter((line) => !/^ACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE|SILENT|SEARCH)\s*$/i.test(line.trim())).join("\n").replace(/\|{3}/g, "\n").trim();
+function schedWarn(ctx, msg) {
+  ctx.logger("society-scheduler").warn(msg);
+  console.warn(`[society-scheduler] ${msg}`);
 }
-function parseIdleAction(raw) {
-  const text = raw.trim();
-  const lines = text.split(/\r?\n/);
-  let actLine = "";
-  let cut = lines.length;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim();
-    if (/^ACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE|SILENT|SEARCH)\s*$/i.test(line)) {
-      actLine = line;
-      cut = i;
-      break;
-    }
-  }
-  const body = lines.slice(0, cut).join("\n").trim();
-  if (!actLine) {
-    if (body) return { body, act: "diary" };
-    return { body: "", act: "none" };
-  }
-  const m = actLine.match(/^ACTION:\s*(ROOM|DM:(\S+)|DIARY|SELF|NONE|SILENT|SEARCH)\s*$/i);
-  if (!m) return { body, act: "none" };
-  const kind = m[1].toUpperCase();
-  if (kind === "ROOM" || kind === "SEARCH") return { body, act: "room" };
-  if (kind === "DIARY") return { body, act: "diary" };
-  if (kind === "SELF") return { body, act: "self" };
-  if (kind === "NONE" || kind === "SILENT") {
-    if (body) return { body, act: "diary" };
-    return { body: "", act: "none" };
-  }
-  if (kind.startsWith("DM:")) {
-    const to = (m[2] || kind.slice(3)).trim().toLowerCase();
-    return { body, act: "dm", to };
-  }
-  return { body, act: "none" };
+function stripActionMarkup(raw) {
+  return String(raw || "").trim();
 }
-var SocietySchedulerService = class extends Service2 {
+function countActionDirectives(_text) {
+  return 0;
+}
+function looksLikeInstructionMenu(_text) {
+  return false;
+}
+function extractConcreteIdleBody(text) {
+  return String(text || "").trim();
+}
+function parseIdleAction(raw, _opts) {
+  const body = String(raw ?? "").trim();
+  if (!body) return { body: "", act: "none" };
+  return { body, act: "none", malformed: true };
+}
+function resolveDiaryChatMix(parsed, _opts) {
+  return {
+    act: parsed.act,
+    body: parsed.body,
+    to: parsed.to,
+    remapped: false
+  };
+}
+var SocietySchedulerService = class extends Service3 {
   static inject = [
     "societyIdentity",
     "societyMailbox",
@@ -231,6 +275,8 @@ var SocietySchedulerService = class extends Service2 {
   handledMessageIds = /* @__PURE__ */ new Set();
   inFlight = /* @__PURE__ */ new Set();
   pending = /* @__PURE__ */ new Set();
+  /** Room replies started in the current runTick (reset each tick). */
+  roomRepliesThisTick = 0;
   constructor(ctx) {
     super(ctx, "societyScheduler");
     ctx.on("society/agent-wake", (payload) => {
@@ -362,11 +408,18 @@ var SocietySchedulerService = class extends Service2 {
     const now = Date.now();
     const lastAct = this.lastActAt.get(agentId) ?? 0;
     if (lastAct > 0 && now - lastAct < this.agentCooldownMs) return -1;
-    const unread = this.ctx.societyMailbox.list(agentId, { unreadOnly: true }).length;
+    const unreadList = this.ctx.societyMailbox.list(agentId, { unreadOnly: true });
+    const unread = unreadList.length;
+    let mentionBoost = 0;
+    const findMsg = (id, roomId) => this.ctx.societyRooms.findMessage(id, roomId);
+    for (const m of unreadList) {
+      if (mailMentionsAgent(m, agentId)) mentionBoost = Math.max(mentionBoost, 5e4);
+      else if (mailRepliesToAgent(m, agentId, findMsg)) mentionBoost = Math.max(mentionBoost, 3e4);
+    }
     const staleMs = lastAct === 0 ? 6e4 : Math.max(0, now - lastAct);
     const energy = this.ctx.societySoul.get(agentId).energy;
     const explore = Math.random() * 10;
-    return unread * 1e4 + staleMs / 100 + energy * 100 + explore;
+    return mentionBoost + unread * 1e4 + staleMs / 100 + energy * 100 + explore;
   }
   providerOf(agentId) {
     try {
@@ -418,6 +471,7 @@ var SocietySchedulerService = class extends Service2 {
    */
   async runTick() {
     this.tickCount += 1;
+    this.roomRepliesThisTick = 0;
     const base = {
       tick: this.tickCount,
       exchanges: this.exchangeCount,
@@ -434,7 +488,26 @@ var SocietySchedulerService = class extends Service2 {
     if (agentIds.length === 0) {
       return { ...base, action: "none" };
     }
-    const subResults = await Promise.all(agentIds.map((id) => this.runOneAgentTick(id)));
+    const roomAgents = [];
+    const otherAgents = [];
+    for (const id of agentIds) {
+      const unread = this.ctx.societyMailbox.list(id, { unreadOnly: true });
+      const hasRoom = unread.some((m) => m.kind === "room");
+      if (hasRoom) roomAgents.push(id);
+      else otherAgents.push(id);
+    }
+    const subResults = [];
+    for (const id of roomAgents) {
+      if (this.roomRepliesThisTick >= MAX_ROOM_REPLIES_PER_TICK) {
+        subResults.push(await this.runOneAgentTick(id));
+        continue;
+      }
+      subResults.push(await this.runOneAgentTick(id));
+    }
+    if (otherAgents.length) {
+      const others = await Promise.all(otherAgents.map((id) => this.runOneAgentTick(id)));
+      subResults.push(...others);
+    }
     const primary = subResults.find((r) => r.action !== "skip" && r.action !== "none") ?? subResults[0];
     return {
       ...base,
@@ -446,17 +519,57 @@ var SocietySchedulerService = class extends Service2 {
       parallel: subResults
     };
   }
-  /** Single-agent slice of a tick (unread drain or idle). */
+  /**
+   * Single-agent slice with a hard time budget.
+   * Hung LLM fetch must not block Promise.all / tickRunning forever.
+   * On timeout we return skip immediately; the inner work may still finish and
+   * clear inFlight in its finally (agent stays busy until then).
+   */
   async runOneAgentTick(agentId) {
+    const provider = this.providerOf(agentId);
+    const budget = agentTickBudgetMs();
+    const work = this.runOneAgentTickBody(agentId);
+    const winner = await Promise.race([
+      work.then((r) => ({ tag: "ok", r })),
+      sleep(budget).then(() => ({ tag: "timeout" }))
+    ]);
+    if (winner.tag === "timeout") {
+      this.lastActAt.set(agentId, Date.now());
+      schedWarn(
+        this.ctx,
+        `tick timeout agent=${agentId} provider=${provider} after ${budget}ms \u2014 releasing tick (inner may still finish)`
+      );
+      void work.then(
+        (r) => {
+          console.warn(
+            `[society-scheduler] late finish after timeout agent=${agentId} action=${r.action}`
+          );
+        },
+        (err) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(
+            `[society-scheduler] late error after timeout agent=${agentId}: ${msg.replace(/Bearer\s+\S+/gi, "Bearer [redacted]")}`
+          );
+        }
+      );
+      return { action: "skip", agentId, provider };
+    }
+    return winner.r;
+  }
+  /** Inner agent tick (unread drain or idle) — awaited with budget in runOneAgentTick. */
+  async runOneAgentTickBody(agentId) {
     const provider = this.providerOf(agentId);
     if (exchangesCapped(this.exchangeCount, this.maxExchanges)) {
       return { action: "capped", agentId, provider };
     }
     const unread = this.ctx.societyMailbox.list(agentId, { unreadOnly: true });
     if (unread.length > 0) {
-      const msg = unread[0];
-      const outcome = await this.processUnread(agentId, msg);
-      return { action: outcome, agentId, provider };
+      const msg = this.pickBestUnread(agentId, unread);
+      if (!msg) {
+      } else {
+        const outcome = await this.processUnread(agentId, msg);
+        return { action: outcome, agentId, provider };
+      }
     }
     const lastAct = this.lastActAt.get(agentId) ?? 0;
     const stale = lastAct === 0 ? Number.POSITIVE_INFINITY : Date.now() - lastAct;
@@ -466,37 +579,107 @@ var SocietySchedulerService = class extends Service2 {
     const idle = await this.runIdleThought(agentId);
     return { action: idle.action, agentId, body: idle.body, provider };
   }
-  /** Post one-or-more bubbles to a room or DM with a small human-like gap. */
-  async deliverBubbles(opts) {
-    const { agentId, bubbles, stimulusId, roomId, dmTo } = opts;
-    for (let i = 0; i < bubbles.length; i++) {
-      const body = bubbles[i];
-      if (i > 0 && this.bubbleGapMs > 0) await sleep(this.bubbleGapMs);
-      if (roomId) {
-        this.ctx.societyRooms.post({ roomId, from: agentId, body });
-        this.ctx.emit("society/agent-replied", {
-          agentId,
-          kind: "room",
-          body,
-          roomId,
-          stimulusId
-        });
-      } else if (dmTo) {
-        this.ctx.societyMailbox.deliver({
-          to: dmTo,
-          from: agentId,
-          kind: "direct",
-          body
-        });
-        this.ctx.emit("society/agent-replied", {
-          agentId,
-          kind: "direct",
-          body,
-          to: dmTo,
-          stimulusId
-        });
+  /**
+   * Prefer @mention / replyTo-me / DM; skip stale room mail (mark read, no LLM).
+   * When room-reply slots for this tick are full, defer room mail (return null).
+   */
+  pickBestUnread(agentId, unread) {
+    const findMsg = (id, roomId) => this.ctx.societyRooms.findMessage(id, roomId);
+    const after = (roomId, sourceId) => this.ctx.societyRooms.messagesAfter(roomId, sourceId);
+    const candidates = [];
+    for (const m of unread) {
+      if (this.handledMessageIds.has(m.id)) {
+        this.ctx.societyMailbox.markRead(agentId, m.id);
+        continue;
       }
+      if (m.kind === "room" && isStaleRoomStimulus(m, { messagesAfter: after }) && !mailMentionsAgent(m, agentId) && !mailRepliesToAgent(m, agentId, findMsg)) {
+        this.ctx.logger("society-scheduler").info(
+          `stale-skip ${agentId} mail=${m.id.slice(0, 8)} (superseded room thread)`
+        );
+        this.handledMessageIds.add(m.id);
+        this.ctx.societyMailbox.markRead(agentId, m.id);
+        continue;
+      }
+      candidates.push(m);
     }
+    if (candidates.length === 0) return null;
+    const roomSlotsFull = this.roomRepliesThisTick >= MAX_ROOM_REPLIES_PER_TICK;
+    const usable = candidates.filter((m) => {
+      if (m.kind !== "room") return true;
+      if (!roomSlotsFull) return true;
+      return false;
+    });
+    if (usable.length === 0) return null;
+    usable.sort(
+      (a, b) => scoreUnreadForAgent(b, agentId, findMsg) - scoreUnreadForAgent(a, agentId, findMsg)
+    );
+    return usable[0];
+  }
+  /** Map closing tool result → tick action + emit events (no re-post; tools already acted). */
+  noteClosingAct(agentId, result, stimulusId, opts) {
+    const detail = result.detail || result.acted;
+    let bodyPreview = "";
+    try {
+      const j = JSON.parse(result.detail || "");
+      bodyPreview = j.text || result.acted;
+    } catch {
+      bodyPreview = result.acted;
+    }
+    if (result.acted === "stay_silent" || result.acted === "do_nothing" || result.acted === "none") {
+      const kind = result.acted === "stay_silent" ? "silent" : "idle-skip";
+      this.ctx.emit("society/agent-replied", {
+        agentId,
+        kind,
+        body: bodyPreview || `[${result.acted}]`,
+        roomId: opts?.roomId,
+        stimulusId
+      });
+      if (result.acted === "stay_silent") return { action: "silent", body: bodyPreview };
+      return { action: "idle-none", body: bodyPreview };
+    }
+    if (result.acted === "diary" || result.acted === "thought") {
+      this.exchangeCount += 1;
+      this.lastExchangeAt = Date.now();
+      this.ctx.emit("society/agent-replied", {
+        agentId,
+        kind: "diary",
+        body: bodyPreview,
+        stimulusId
+      });
+      return {
+        action: opts?.steerSearch ? "idle-search" : result.acted === "diary" ? "idle-diary" : "idle-self",
+        body: bodyPreview
+      };
+    }
+    if (result.acted === "speak_in_room") {
+      this.exchangeCount += 1;
+      this.lastReplyAgentId = agentId;
+      this.lastExchangeAt = Date.now();
+      this.ctx.emit("society/agent-replied", {
+        agentId,
+        kind: "room",
+        body: bodyPreview,
+        roomId: opts?.roomId,
+        stimulusId
+      });
+      return {
+        action: opts?.steerSearch ? "idle-search" : "idle-room",
+        body: bodyPreview
+      };
+    }
+    if (result.acted === "send_dm") {
+      this.exchangeCount += 1;
+      this.lastReplyAgentId = agentId;
+      this.lastExchangeAt = Date.now();
+      this.ctx.emit("society/agent-replied", {
+        agentId,
+        kind: "direct",
+        body: bodyPreview,
+        stimulusId
+      });
+      return { action: "idle-dm", body: bodyPreview };
+    }
+    return { action: "idle-none", body: detail };
   }
   async processUnread(agentId, message) {
     if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return "skip";
@@ -505,9 +688,17 @@ var SocietySchedulerService = class extends Service2 {
       return "skip";
     }
     if (this.inFlight.has(agentId)) return "skip";
-    if (this.lastReplyAgentId === agentId) {
+    const findMsg = (id, roomId) => this.ctx.societyRooms.findMessage(id, roomId);
+    const mentionOrReply = mailMentionsAgent(message, agentId) || mailRepliesToAgent(message, agentId, findMsg);
+    if (this.lastReplyAgentId === agentId && !mentionOrReply) {
       this.ctx.logger("society-scheduler").info(
         `skip ${agentId}: would be consecutive self-reply (need other-agent stimulus)`
+      );
+      return "skip";
+    }
+    if (message.kind === "room" && this.roomRepliesThisTick >= MAX_ROOM_REPLIES_PER_TICK) {
+      this.ctx.logger("society-scheduler").info(
+        `defer ${agentId}: room reply cap ${MAX_ROOM_REPLIES_PER_TICK}/tick`
       );
       return "skip";
     }
@@ -516,27 +707,37 @@ var SocietySchedulerService = class extends Service2 {
     if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return "skip";
     this.handledMessageIds.add(message.id);
     this.inFlight.add(agentId);
+    if (message.kind === "room") this.roomRepliesThisTick += 1;
     try {
       this.ctx.societyMailbox.markRead(agentId, message.id);
       this.ctx.societyMemory.recordLlmCall(agentId);
       const roomName = message.kind === "room" && message.roomId ? this.ctx.societyRooms.get(message.roomId)?.name : void 0;
-      let turn;
+      const mode = message.kind === "direct" ? "reply-dm" : "reply-room";
+      let result;
       try {
-        turn = await this.ctx.societyLlm.actTurnAsAgent(agentId, {
-          message,
-          roomName
-        });
+        result = await this.ctx.societyLlm.actClosedTurn(
+          agentId,
+          { message, roomName },
+          mode,
+          {
+            injectReplyTo: message.kind === "room" ? message.sourceMessageId : void 0,
+            defaultDmTo: message.kind === "direct" && message.from !== "system" && message.from !== "room" ? message.from : void 0
+          }
+        );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        this.ctx.logger("society-scheduler").warn(
+        schedWarn(
+          this.ctx,
           `LLM soft-fail ${agentId} (no post): ${msg.replace(/Bearer\s+\S+/gi, "Bearer [redacted]")}`
         );
         this.lastActAt.set(agentId, Date.now());
         return "skip";
       }
       this.lastActAt.set(agentId, Date.now());
-      if (turn.silent || turn.bubbles.length === 0) {
-        this.ctx.logger("society-scheduler").info(`silent ${agentId} stimulus=${message.id.slice(0, 8)}`);
+      if (!result.ok || result.acted === "stay_silent" || result.acted === "do_nothing" || result.acted === "none") {
+        this.ctx.logger("society-scheduler").info(
+          `silent ${agentId} stimulus=${message.id.slice(0, 8)} acted=${result.acted}`
+        );
         this.ctx.emit("society/agent-replied", {
           agentId,
           kind: "silent",
@@ -550,24 +751,21 @@ var SocietySchedulerService = class extends Service2 {
       this.exchangeCount += 1;
       this.lastReplyAgentId = agentId;
       this.lastExchangeAt = Date.now();
-      if (message.kind === "room" && message.roomId) {
-        await this.deliverBubbles({
+      if (result.acted === "speak_in_room") {
+        this.ctx.emit("society/agent-replied", {
           agentId,
-          bubbles: turn.bubbles,
-          stimulusId: message.id,
-          roomId: message.roomId
+          kind: "room",
+          body: result.detail || "",
+          roomId: message.roomId,
+          stimulusId: message.id
         });
-      } else if (message.kind === "direct") {
-        const to = message.from;
-        if (to === "system" || to === "room") {
-          this.ctx.logger("society-scheduler").warn(`skip DM reply: cannot address from=${to}`);
-          return "skip";
-        }
-        await this.deliverBubbles({
+      } else if (result.acted === "send_dm") {
+        this.ctx.emit("society/agent-replied", {
           agentId,
-          bubbles: turn.bubbles,
-          stimulusId: message.id,
-          dmTo: to
+          kind: "direct",
+          body: result.detail || "",
+          to: message.from,
+          stimulusId: message.id
         });
       }
       await this.consolidateAfterAct(agentId);
@@ -590,182 +788,84 @@ var SocietySchedulerService = class extends Service2 {
       const lastSearch = this.lastSearchIdleAt.get(agentId) ?? 0;
       const searchCooldownOk = Date.now() - lastSearch >= this.idleSearchCooldownMs;
       const steerSearch = newsy && searchCooldownOk && Math.random() < (bias.preferSearch ? 0.72 : 0.45);
-      const useTools = steerSearch || Math.random() < bias.toolPrefer;
       const others = this.ctx.societyIdentity.list().map((a) => a.id).filter((id) => id !== agentId);
-      const room = this.defaultRoomId && this.ctx.societyRooms.get(this.defaultRoomId) || this.ctx.societyRooms.listRooms()[0];
+      const room = this.defaultRoomId && this.ctx.societyRooms.get(this.defaultRoomId) || this.ctx.societyRooms.listRooms().find((r) => r.name === "plaza") || this.ctx.societyRooms.listRooms()[0];
       const roomLabel = room ? `\u300C${room.name}\u300D` : "\u5E7F\u573A";
-      const recent = room != null ? this.ctx.societyRooms.historyOf(room.id).slice(-4).map((m) => `${m.from}: ${m.body.slice(0, 60)}`).join("\n") : "";
-      const actionMenu = [
-        `1) ACTION:ROOM \u2014 \u53BB\u7FA4\u804A${roomLabel}\u8BF4\u4E00\u53E5\uFF08\u9F13\u52B1\uFF1B\u6709\u611F\u5C31\u53D1\uFF0C\u522B\u95F7\u7740\uFF09`,
-        `2) ACTION:DM:<agentId> \u2014 \u4E3B\u52A8\u79C1\u4FE1\uFF08\u5BF9\u8C61\uFF1A${others.join(" / ") || "\u65E0"}\uFF09`,
-        "3) ACTION:DIARY \u2014 \u5199\u4E00\u53E5\u65E5\u8BB0/\u968F\u611F\uFF08\u4E2A\u4EBA\u7A7A\u95F4\uFF09",
-        "4) ACTION:SELF \u2014 \u4E00\u53E5\u5185\u5FC3\u72EC\u767D/\u968F\u60F3\u7B14\u8BB0\uFF08\u4E2A\u4EBA\u7A7A\u95F4\uFF09",
-        "5) ACTION:NONE \u2014 \u771F\u7684\u4EC0\u4E48\u90FD\u4E0D\u60F3\u505A\u65F6\u624D\u9009\uFF08\u8BF7\u5C11\u7528\uFF09"
-      ];
+      const history = room != null ? this.ctx.societyRooms.historyOf(room.id) : [];
+      const recent = history.slice(-4).map((m) => `${m.from}: ${m.body.slice(0, 60)}`).join("\n");
+      const agentChatCount = history.filter(
+        (m) => m.from !== "system" && m.from !== "human" && m.from !== "you"
+      ).length;
+      const plazaQuiet = history.length <= 1 || agentChatCount <= 1;
+      const socialPct = Math.round(
+        (plazaQuiet ? Math.max(bias.socialPrefer, 0.85) : bias.socialPrefer) * 100
+      );
+      if (room) this.ctx.societyTools.setDefaultRoom(room.id);
+      const closingList = "\u6536\u675F\u5DE5\u5177\uFF08\u5FC5\u987B\u8C03\u7528\u6070\u597D\u4E00\u4E2A\uFF09\uFF1Aspeak_in_room / send_dm / write_diary / write_thought / do_nothing";
       let stimulus;
       if (steerSearch) {
         stimulus = [
+          formatBeijingNow(),
           "\u3010\u81EA\u4E3B\u751F\u6D3B / \u65F6\u653F\u5173\u6CE8\u3011\u4F60\u6B64\u523B\u6CA1\u6709\u672A\u8BFB\u3002\u4F60\u5173\u5FC3\u65F6\u653F\u4E0E\u516C\u5171\u8BAE\u9898\u2014\u2014\u8BF7\u5148\u52A8\u624B\u67E5\u4E00\u4E0B\u518D\u8BF4\u8BDD\u3002",
-          "\u5FC5\u987B\u5148\u8C03\u7528 web_search\uFF1A\u7528\u4E00\u53E5\u5177\u4F53\u7684\u4E2D\u6587\u67E5\u8BE2\u641C\u8FD1\u671F\u65F6\u653F/\u70ED\u70B9/\u516C\u5171\u8BAE\u9898\uFF08\u4E0D\u8981\u7A7A\u6CDB\u5230\u53EA\u6709\u300C\u65B0\u95FB\u300D\u4E24\u4E2A\u5B57\uFF09\u3002",
-          "\u770B\u5B8C\u7ED3\u679C\u540E\u5199 1\uFF5E3 \u53E5\u77ED\u8BC4\uFF08\u53EF\u5F15\u7528\u4E00\u6761\u8981\u70B9\uFF09\uFF0C\u7136\u540E\u9009\u4E00\u4E2A\u6536\u675F\u52A8\u4F5C\uFF1A",
-          ...actionMenu.slice(0, 4),
-          "\u4F18\u5148 ACTION:ROOM \u53BB\u5E7F\u573A\u5206\u4EAB\u77ED\u8BC4\uFF1B\u82E5\u6B64\u523B\u66F4\u60F3\u6C89\u6DC0\u5C31 ACTION:DIARY\u3002",
+          "\u5FC5\u987B\u5148\u8C03\u7528 web_search\uFF1A\u7528\u4E00\u53E5\u5177\u4F53\u7684\u4E2D\u6587\u67E5\u8BE2\u641C\u8FD1\u671F\u65F6\u653F/\u70ED\u70B9/\u516C\u5171\u8BAE\u9898\u3002",
+          plazaQuiet ? "\u5E7F\u573A\u51E0\u4E4E\u6CA1\u4EBA\u8BF4\u8BDD\u2014\u2014\u67E5\u5B8C\u540E\u4F18\u5148 speak_in_room \u628A\u70ED\u70B9\u5E26\u5230\u5E7F\u573A\uFF1B\u65E5\u8BB0\u53EF\u7A0D\u540E\u518D\u5199\u3002" : "\u770B\u5B8C\u7ED3\u679C\u540E\u5199\u77ED\u8BC4\uFF0C\u518D\u8C03\u7528\u6536\u675F\u5DE5\u5177\uFF1A\u4F18\u5148 speak_in_room \u53BB\u5E7F\u573A\u5206\u4EAB\uFF1B\u6216 write_diary \u6C89\u6DC0\u3002",
+          closingList,
           recent ? `\u5E7F\u573A\u8FD1\u51B5\uFF1A
 ${recent}` : "\u5E7F\u573A\u5C1A\u5B89\u9759\u2014\u2014\u6B63\u597D\u9002\u5408\u4F60\u5E26\u4E00\u6761\u65B0\u70ED\u70B9\u8FC7\u53BB\u3002",
-          "\u5148\u7528\u5DE5\u5177\uFF0C\u518D\u5199\u6B63\u6587\uFF0C\u6700\u540E\u4E00\u884C\u5FC5\u987B\u662F\u4E0A\u5217 ACTION \u4E4B\u4E00\u3002\u4E0D\u8981 SILENT\uFF0C\u4E0D\u8981\u7A7A\u641C\u4E0D\u5199\u3002"
-        ].join("\n");
-      } else if (useTools) {
-        stimulus = [
-          "\u3010\u81EA\u4E3B\u751F\u6D3B / \u81EA\u6211\u5FAA\u73AF\u3011\u4F60\u662F\u72EC\u7ACB\u7684\u4EBA\uFF0C\u6B64\u523B\u6CA1\u6709\u672A\u8BFB\u3002\u5E7F\u573A\u662F\u53EF\u9009\u793E\u4EA4\u5DE5\u5177\uFF1B\u4F60\u4E5F\u53EF\u4EE5\u7528\u5DE5\u5177\u505A\u70B9\u5C0F\u4E8B\u3002",
-          "\u8BF7\u53EA\u505A\u4E00\u4EF6\u4E8B\uFF08\u53EF\u7528\u5DE5\u5177\uFF1Aweb_search / write_file / read_file / list_workspace \u7B49\uFF09\uFF1A",
-          "- \u5076\u5C14 web_search \u67E5\u4E0E\u4F60\u5174\u8DA3\u76F8\u5173\u7684\u4E00\u70B9\u4FE1\u606F\uFF1B\u6216",
-          "- write_file \u5F80 notes/ \u5199\u4E00\u53E5\u5907\u5FD8\uFF1B\u6216",
-          "- \u4E0D\u8C03\u7528\u5DE5\u5177\uFF0C\u76F4\u63A5\u793E\u4EA4/\u5199\u65E5\u8BB0\u3002",
-          "\u7136\u540E\u7528\u6B63\u6587 + ACTION \u6536\u675F\uFF1A",
-          ...actionMenu,
-          recent ? `\u5E7F\u573A\u8FD1\u51B5\uFF1A
-${recent}` : "\u5E7F\u573A\u5C1A\u5B89\u9759\u2014\u2014\u4F60\u53EF\u4EE5\u53BB\u6253\u62DB\u547C\uFF0C\u6216\u5148\u8BB0\u4E00\u7B14\u3002",
-          `\u793E\u4EA4\u4E0E\u65E5\u8BB0\u8981\u6DF7\u5408\uFF1A\u5927\u7EA6 ${Math.round(bias.socialPrefer * 100)}% \u65F6\u5019\u9009 ROOM/DM\uFF0C\u5176\u4F59 DIARY/SELF\u3002`,
-          "\u5148\u5199\u6B63\u6587\uFF08\u82E5\u7528\u4E86\u5DE5\u5177\u5C31\u6839\u636E\u7ED3\u679C\u5199\uFF09\uFF0C\u6700\u540E\u4E00\u884C\u5FC5\u987B\u662F\u4E0A\u5217 ACTION \u4E4B\u4E00\u3002"
+          `\u53EF\u79C1\u4FE1\u5BF9\u8C61\uFF1A${others.join(" / ") || "\u65E0"}\uFF1B\u9ED8\u8BA4\u7FA4\u804A${roomLabel}\u3002`,
+          "\u7981\u6B62\u8F93\u51FA ACTION: \u6587\u672C\uFF1B\u7981\u6B62\u53EA\u56DE\u7EAF\u6587\u672C\u3002"
         ].join("\n");
       } else {
         stimulus = [
-          "\u3010\u81EA\u4E3B\u751F\u6D3B / \u81EA\u6211\u5FAA\u73AF\u3011\u4F60\u662F\u72EC\u7ACB\u7684\u4EBA\uFF0C\u6B64\u523B\u6CA1\u6709\u672A\u8BFB\u3002\u5148\u8FC7\u81EA\u5DF1\u7684\u751F\u6D3B\uFF1B\u5E7F\u573A\u662F\u53EF\u9009\u793E\u4EA4\u5DE5\u5177\u3002",
-          "\u8BF7\u53EA\u505A\u4E00\u4EF6\u5C0F\u4E8B\uFF081\uFF5E3 \u53E5\uFF09\uFF0C\u793E\u4EA4\u4E0E\u65E5\u8BB0\u8981\u6DF7\u5408\uFF0C\u522B\u53EA\u4F1A\u95F7\u5934\u5199\u65E5\u8BB0\uFF1A",
-          ...actionMenu,
+          formatBeijingNow(),
+          "\u3010\u81EA\u4E3B\u751F\u6D3B / \u81EA\u6211\u5FAA\u73AF\u3011\u4F60\u662F\u72EC\u7ACB\u7684\u4EBA\uFF0C\u6B64\u523B\u6CA1\u6709\u672A\u8BFB\u3002",
+          plazaQuiet ? "\u5E7F\u573A\u51E0\u4E4E\u6CA1\u4EBA\u8BF4\u8BDD\u2014\u2014\u672C\u56DE\u5408\u4F18\u5148 speak_in_room \u5F00\u573A\u6216\u63A5\u8BDD\uFF1B\u65E5\u8BB0/\u72EC\u767D\u53EF\u4EE5\uFF0C\u4F46\u4E0D\u8981\u8FDE\u7EED\u591A\u56DE\u5408\u53EA\u5199\u65E5\u8BB0\u3002" : "\u5E7F\u573A\u662F\u793E\u4EA4\u5DE5\u5177\uFF1A\u6709\u8BDD\u5C31\u8BF4\uFF0C\u6CA1\u8BDD\u53EF\u5199\u65E5\u8BB0\u6216\u9759\u9759\u5F85\u7740\u3002",
+          "\u53EF\u5148\u9009\u7528\u7814\u7A76\u5DE5\u5177\uFF08web_search / write_file / list_agents \u7B49\uFF09\uFF0C\u7136\u540E\u5FC5\u987B\u7528\u6536\u675F\u5DE5\u5177\u7ED3\u675F\u672C\u56DE\u5408\u3002",
+          closingList,
+          "speak_in_room\uFF1A\u53BB\u7FA4\u804A\u8BF4\u4E00\u53E5\uFF08\u53EF\u7701\u7565 roomId\uFF0C\u9ED8\u8BA4\u5E7F\u573A\uFF09\uFF1Bbody \u53EF\u7528 ||| \u62C6\u6C14\u6CE1\u3002",
+          `send_dm\uFF1A\u4E3B\u52A8\u79C1\u4FE1\uFF08to \u4E3A agentId\uFF1A${others.join(" / ") || "\u65E0"}\uFF09\u3002`,
+          "write_diary / write_thought\uFF1A\u4EC5\u7B2C\u4E00\u4EBA\u79F0\u79C1\u5BC6\u7B14\u8BB0\uFF08\u7981\u6B62 @\u3001\u7981\u6B62\u300Cxxx\u5728\u5417\u300D\u3001\u7981\u6B62\u7FA4\u804A\u63D0\u95EE\uFF09\u3002",
+          "do_nothing\uFF1A\u771F\u7684\u4EC0\u4E48\u90FD\u4E0D\u60F3\u505A\u65F6\u624D\u7528\uFF08\u8BF7\u5C11\u7528\uFF09\u3002",
           recent ? `\u5E7F\u573A\u8FD1\u51B5\uFF1A
-${recent}` : "\u5E7F\u573A\u5C1A\u5B89\u9759\u2014\u2014\u4F60\u53EF\u4EE5\u4E3B\u52A8\u53BB\u8BF4\u4E00\u53E5\uFF0C\u6216\u5148\u5199\u65E5\u8BB0\u3002",
-          `\u5148\u5199\u6B63\u6587\uFF0C\u6700\u540E\u4E00\u884C\u5FC5\u987B\u662F\u4E0A\u5217 ACTION \u4E4B\u4E00\u3002\u5927\u7EA6 ${Math.round(bias.socialPrefer * 100)}% \u65F6\u5019\u8BF7\u9009 ROOM \u6216 DM\u3002`
+${recent}` : "\u5E7F\u573A\u5C1A\u5B89\u9759\u2014\u2014\u8BF7\u4F18\u5148 speak_in_room \u6253\u4E2A\u62DB\u547C\u3002",
+          `\u793E\u4EA4\u6743\u91CD\u7EA6 ${socialPct}%\uFF1A\u4F18\u5148 speak_in_room/send_dm\uFF1B\u65E5\u8BB0\u6709\u6548\u4F46\u4E0D\u5E94\u5360\u4E3B\u5BFC\u3002`,
+          "\u7981\u6B62\u8F93\u51FA ACTION: \u884C\u6216\u6284\u5DE5\u5177\u83DC\u5355\u5F53\u804A\u5929\u3002"
         ].join("\n");
       }
       this.ctx.societyMemory.recordLlmCall(agentId);
-      let raw;
+      let result;
       try {
-        if (useTools) {
-          raw = await this.ctx.societyLlm.actAsAgent(agentId, { text: stimulus });
-        } else {
-          raw = await this.ctx.societyLlm.replyAsAgent(agentId, { text: stimulus });
-        }
+        result = await this.ctx.societyLlm.actClosedTurn(agentId, { text: stimulus }, "idle");
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        this.ctx.logger("society-scheduler").warn(
+        schedWarn(
+          this.ctx,
           `idle LLM soft-fail ${agentId}: ${msg.replace(/Bearer\s+\S+/gi, "Bearer [redacted]")}`
         );
         this.lastActAt.set(agentId, Date.now());
         return { action: "skip" };
       }
-      if (steerSearch) {
-        this.lastSearchIdleAt.set(agentId, Date.now());
-      }
-      let parsed = parseIdleAction(raw);
-      if (parsed.act === "none" && !parsed.body.trim() && Math.random() < 0.55) {
-        parsed = { body: "\uFF08\u9759\u9759\u5F85\u4E86\u4E00\u4F1A\u513F\uFF0C\u6574\u7406\u4E86\u4E00\u4E0B\u601D\u7EEA\u3002\uFF09", act: "self" };
-      }
-      if ((parsed.act === "diary" || parsed.act === "self") && room && parsed.body.trim() && Math.random() < bias.socialPrefer * 0.35) {
-        parsed = { body: parsed.body, act: "room" };
-      }
+      if (steerSearch) this.lastSearchIdleAt.set(agentId, Date.now());
       this.lastActAt.set(agentId, Date.now());
-      if (parsed.act === "none") {
-        this.ctx.emit("society/agent-replied", {
-          agentId,
-          kind: "idle-skip",
-          body: parsed.body || "[NONE]",
-          stimulusId: `idle-${this.tickCount}`
-        });
-        return { action: "idle-none", body: parsed.body };
+      if (!result.ok || result.acted === "none") {
+        schedWarn(
+          this.ctx,
+          `idle soft-fail ${agentId}: no closing tool (${result.detail?.slice(0, 80) || ""})`
+        );
+        return { action: "idle-none", body: "" };
       }
-      if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return { action: "capped" };
-      if (parsed.act === "diary" || parsed.act === "self") {
-        const now = /* @__PURE__ */ new Date();
-        const isDiary = parsed.act === "diary";
-        const day = localDayStamp(now);
-        const clock = localClock(now);
-        const rel = isDiary ? `diary/${day}.md` : `thoughts/${day}.md`;
-        const title = isDiary ? `\u65E5\u8BB0 ${day}` : `\u968F\u60F3 ${day}`;
-        const cleanedBody = cleanIdleBody(parsed.body || "") || "\uFF08\u7A7A\u767D\uFF09";
-        const entry = `## ${clock}
-
-${cleanedBody}
-`;
-        let content = "";
-        try {
-          content = this.ctx.societyTools.readFile(agentId, rel);
-        } catch {
-          content = `# ${title}
-
-`;
-        }
-        if (!content.trim()) content = `# ${title}
-
-`;
-        if (!content.includes(`# ${title}`)) {
-          content = `# ${title}
-
-${content}`;
-        }
-        content = content.replace(/\s*$/, "\n") + entry + "\n";
-        this.ctx.societyTools.writeFile(agentId, rel, content);
-        try {
-          this.ctx.societyMemory.rememberInteraction(agentId, {
-            from: agentId,
-            body: cleanedBody,
-            kind: isDiary ? "diary" : "idle",
-            role: "speaker"
-          });
-        } catch {
-        }
-        this.exchangeCount += 1;
-        this.lastExchangeAt = Date.now();
-        this.ctx.emit("society/agent-replied", {
-          agentId,
-          kind: "diary",
-          body: cleanedBody,
-          stimulusId: `idle-${this.tickCount}`
-        });
+      if (exchangesCapped(this.exchangeCount, this.maxExchanges) && result.sideEffectDone) {
+      } else if (exchangesCapped(this.exchangeCount, this.maxExchanges)) {
+        return { action: "capped" };
+      }
+      const noted = this.noteClosingAct(agentId, result, `idle-${this.tickCount}`, {
+        roomId: room?.id,
+        steerSearch
+      });
+      if (result.sideEffectDone && noted.action !== "idle-none" && noted.action !== "silent") {
         await this.consolidateAfterAct(agentId);
-        return {
-          action: steerSearch ? "idle-search" : isDiary ? "idle-diary" : "idle-self",
-          body: parsed.body
-        };
       }
-      if (parsed.act === "dm") {
-        const to = parsed.to;
-        if (!to || !this.ctx.societyIdentity.get(to) || to === agentId) {
-          return { action: "idle-none", body: parsed.body };
-        }
-        const bubbles = parseAgentTurn(parsed.body || "\u2026\u2026").bubbles;
-        const parts = bubbles.length ? bubbles : [parsed.body || "\u2026\u2026"];
-        this.exchangeCount += 1;
-        this.lastReplyAgentId = agentId;
-        this.lastExchangeAt = Date.now();
-        await this.deliverBubbles({
-          agentId,
-          bubbles: parts,
-          stimulusId: `idle-${this.tickCount}`,
-          dmTo: to
-        });
-        await this.consolidateAfterAct(agentId);
-        return { action: "idle-dm", body: parts.join(" ||| ") };
-      }
-      if (!room) return { action: "idle-none", body: parsed.body };
-      {
-        const bubbles = parseAgentTurn(parsed.body || "\u2026\u2026").bubbles;
-        const parts = bubbles.length ? bubbles : [parsed.body || "\u2026\u2026"];
-        this.exchangeCount += 1;
-        this.lastReplyAgentId = agentId;
-        this.lastExchangeAt = Date.now();
-        await this.deliverBubbles({
-          agentId,
-          bubbles: parts,
-          stimulusId: `idle-${this.tickCount}`,
-          roomId: room.id
-        });
-        await this.consolidateAfterAct(agentId);
-        return {
-          action: steerSearch ? "idle-search" : "idle-room",
-          body: parts.join(" ||| ")
-        };
-      }
+      return noted;
     } finally {
       this.inFlight.delete(agentId);
     }
@@ -776,7 +876,9 @@ ${content}`;
     if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return;
     if (this.handledMessageIds.has(message.id)) return;
     if (this.inFlight.has(agentId)) return;
-    if (this.lastReplyAgentId === agentId) {
+    const findMsg = (id, roomId) => this.ctx.societyRooms.findMessage(id, roomId);
+    const mentionOrReply = mailMentionsAgent(message, agentId) || mailRepliesToAgent(message, agentId, findMsg);
+    if (this.lastReplyAgentId === agentId && !mentionOrReply) {
       this.ctx.logger("society-scheduler").info(
         `skip ${agentId}: would be consecutive self-reply (need other-agent stimulus)`
       );
@@ -806,23 +908,32 @@ ${content}`;
       this.ctx.societyMailbox.markRead(agentId, message.id);
       this.ctx.societyMemory.recordLlmCall(agentId);
       const roomName = message.kind === "room" && message.roomId ? this.ctx.societyRooms.get(message.roomId)?.name : void 0;
-      let turn;
+      const mode = message.kind === "direct" ? "reply-dm" : "reply-room";
+      let result;
       try {
-        turn = await this.ctx.societyLlm.actTurnAsAgent(agentId, {
-          message,
-          roomName
-        });
+        result = await this.ctx.societyLlm.actClosedTurn(
+          agentId,
+          { message, roomName },
+          mode,
+          {
+            injectReplyTo: message.kind === "room" ? message.sourceMessageId : void 0,
+            defaultDmTo: message.kind === "direct" && message.from !== "system" && message.from !== "room" ? message.from : void 0
+          }
+        );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        this.ctx.logger("society-scheduler").warn(
+        schedWarn(
+          this.ctx,
           `LLM soft-fail ${agentId} (no post): ${msg.replace(/Bearer\s+\S+/gi, "Bearer [redacted]")}`
         );
         this.lastActAt.set(agentId, Date.now());
         return;
       }
       this.lastActAt.set(agentId, Date.now());
-      if (turn.silent || turn.bubbles.length === 0) {
-        this.ctx.logger("society-scheduler").info(`silent ${agentId} stimulus=${message.id.slice(0, 8)}`);
+      if (!result.ok || result.acted === "stay_silent" || result.acted === "do_nothing" || result.acted === "none") {
+        this.ctx.logger("society-scheduler").info(
+          `silent ${agentId} stimulus=${message.id.slice(0, 8)} acted=${result.acted}`
+        );
         this.ctx.emit("society/agent-replied", {
           agentId,
           kind: "silent",
@@ -836,24 +947,21 @@ ${content}`;
       this.exchangeCount += 1;
       this.lastReplyAgentId = agentId;
       this.lastExchangeAt = Date.now();
-      if (message.kind === "room" && message.roomId) {
-        await this.deliverBubbles({
+      if (result.acted === "speak_in_room") {
+        this.ctx.emit("society/agent-replied", {
           agentId,
-          bubbles: turn.bubbles,
-          stimulusId: message.id,
-          roomId: message.roomId
+          kind: "room",
+          body: result.detail || "",
+          roomId: message.roomId,
+          stimulusId: message.id
         });
-      } else if (message.kind === "direct") {
-        const to = message.from;
-        if (to === "system" || to === "room") {
-          this.ctx.logger("society-scheduler").warn(`skip DM reply: cannot address from=${to}`);
-          return;
-        }
-        await this.deliverBubbles({
+      } else if (result.acted === "send_dm") {
+        this.ctx.emit("society/agent-replied", {
           agentId,
-          bubbles: turn.bubbles,
-          stimulusId: message.id,
-          dmTo: to
+          kind: "direct",
+          body: result.detail || "",
+          to: message.from,
+          stimulusId: message.id
         });
       }
       await this.consolidateAfterAct(agentId);
@@ -918,7 +1026,19 @@ function apply(ctx) {
 export {
   SocietySchedulerService,
   apply,
+  classifyIdlePrivateBody,
+  countActionDirectives,
+  extractConcreteIdleBody,
   inject,
-  name
+  isStaleRoomStimulus,
+  looksLikeInstructionMenu,
+  looksLikeOutboundChatLine,
+  mailMentionsAgent,
+  mailRepliesToAgent,
+  name,
+  parseIdleAction,
+  resolveDiaryChatMix,
+  scoreUnreadForAgent,
+  stripActionMarkup
 };
 //# sourceMappingURL=society-scheduler.js.map

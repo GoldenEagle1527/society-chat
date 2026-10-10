@@ -30,6 +30,7 @@ async function main() {
   assert.ok(isHostAllowed('apihub.agnes-ai.com'))
   assert.ok(isHostAllowed('api.duckduckgo.com'))
   assert.ok(isHostAllowed('html.duckduckgo.com'))
+  assert.ok(isHostAllowed('api.exa.ai'))
   assert.ok(isHostAllowed('en.wikipedia.org'))
   assert.ok(isHostAllowed('upload.wikimedia.org'))
   assert.ok(!isHostAllowed('evil.example.com'))
