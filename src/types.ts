@@ -1,5 +1,7 @@
 /** Shared society types (Harness-compatible plugin layer). */
 
+import { getHumanDisplayName } from './human-settings.ts'
+
 export type AgentId = string
 export type RoomId = string
 export type MessageId = string
@@ -160,7 +162,7 @@ export function isSpecialSpeaker(id: string): boolean {
 
 /** UI / mailbox label for a speaker id. */
 export function speakerLabel(id: string): string {
-  if (id === HUMAN_SPEAKER_ID) return '你'
+  if (id === HUMAN_SPEAKER_ID) return getHumanDisplayName()
   if (id === 'system') return '系统'
   if (id === 'room') return '房间'
   return id

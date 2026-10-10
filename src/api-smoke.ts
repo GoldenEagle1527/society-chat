@@ -42,6 +42,8 @@ async function main(): Promise<void> {
     assert.equal((p as any).apiKey, undefined)
   }
   assert.ok(settings.envNote.includes('.env'))
+  assert.equal(typeof settings.humanDisplayName, 'string')
+  assert.ok(settings.humanDisplayName.length >= 1)
   console.log(
     `✓ settings caps parallel=${settings.maxParallelReplies} exchanges=${settings.maxExchanges} providers=${settings.providers
       .filter((p) => p.configured)
@@ -178,6 +180,28 @@ async function main(): Promise<void> {
   assert.equal(setRes.body.AGNES_API_KEY, undefined)
   assert.equal(setRes.body.GLM_API_KEY, undefined)
   console.log('✓ GET /api/settings (no keys)')
+  assert.equal(typeof setRes.body.humanDisplayName, 'string')
+  assert.ok(setRes.body.humanDisplayName.length >= 1)
+
+  const patchName = await jsonFetch(base, '/api/settings', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ humanDisplayName: 'OC测试' }),
+  })
+  assert.equal(patchName.status, 200)
+  assert.equal(patchName.body.ok, true)
+  assert.equal(patchName.body.humanDisplayName, 'OC测试')
+  const setRes2 = await jsonFetch(base, '/api/settings')
+  assert.equal(setRes2.body.humanDisplayName, 'OC测试')
+  const patchBack = await jsonFetch(base, '/api/settings', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ humanDisplayName: '用户' }),
+  })
+  assert.equal(patchBack.status, 200)
+  assert.equal(patchBack.body.humanDisplayName, '用户')
+  console.log('✓ PATCH /api/settings humanDisplayName')
+
 
   const badRoom = await jsonFetch(base, '/api/rooms', {
     method: 'POST',

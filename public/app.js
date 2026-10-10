@@ -336,7 +336,7 @@
     if (!lm) return '暂无消息';
     const who =
       lm.from === 'human'
-        ? '你'
+        ? lm.fromName || settingsCache?.humanDisplayName || '用户'
         : lm.from === 'system'
           ? ''
           : lm.fromName || lm.from;
@@ -409,7 +409,7 @@
   }
 
   function isOutgoing(from) {
-    return from === 'human' || from === '你';
+    return from === 'human';
   }
 
 
@@ -1119,7 +1119,20 @@
         return `<div class="tg-settings-row"><span><span class="tg-dot ${dot}"></span>${esc(p.id)}</span><span>${right}</span></div>`;
       })
       .join('');
+    const humanName = s.humanDisplayName || '用户';
     el.settingsBody.innerHTML = `
+      <div class="tg-settings-card">
+        <h3>你的显示名</h3>
+        <p class="tg-muted" style="margin:0 0 8px;font-size:12px">Agent 时间线里会用这个名字（可 @）。默认「用户」。</p>
+        <label class="tg-field">
+          <span>用户名</span>
+          <input type="text" id="settingsHumanName" maxlength="32" value="${esc(humanName)}" placeholder="用户" autocomplete="nickname" />
+        </label>
+        <div class="tg-settings-actions" style="margin-top:10px">
+          <button type="button" class="tg-btn primary" id="settingsHumanSave">保存</button>
+        </div>
+        <p class="tg-muted" id="settingsHumanStatus" style="margin:8px 0 0;font-size:12px"></p>
+      </div>
       <div class="tg-settings-card">
         <h3>运行上限</h3>
         <div class="tg-settings-row"><span>并行回复</span><span>${esc(s.maxParallelReplies)}</span></div>
@@ -1154,6 +1167,36 @@
       }`;
     const birthBtn = document.getElementById('settingsBirthBtn');
     if (birthBtn) birthBtn.addEventListener('click', openBirthModal);
+    const saveBtn = document.getElementById('settingsHumanSave');
+    if (saveBtn) saveBtn.addEventListener('click', saveHumanDisplayName);
+  }
+
+  async function saveHumanDisplayName() {
+    const input = document.getElementById('settingsHumanName');
+    const status = document.getElementById('settingsHumanStatus');
+    const saveBtn = document.getElementById('settingsHumanSave');
+    if (!input) return;
+    const name = String(input.value || '').trim();
+    if (status) status.textContent = '保存中…';
+    if (saveBtn) saveBtn.disabled = true;
+    try {
+      const res = await fetch('/api/settings', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ humanDisplayName: name || '用户' }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || res.status);
+      settingsCache = { ...(settingsCache || {}), ...data };
+      input.value = data.humanDisplayName || name || '用户';
+      if (status) status.textContent = `已保存为「${input.value}」`;
+      // Refresh chat previews / fromName
+      await tick();
+    } catch (e) {
+      if (status) status.textContent = '保存失败：' + e;
+    } finally {
+      if (saveBtn) saveBtn.disabled = false;
+    }
   }
 
   async function openSettings() {

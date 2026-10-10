@@ -10,6 +10,7 @@ import {
   societyEnvInt,
   type LlmProviderId,
 } from './env.ts'
+import { getHumanDisplayName } from './human-settings.ts'
 
 export interface ObserveProviderInfo {
   id: LlmProviderId
@@ -28,6 +29,8 @@ export interface ObserveSettings {
   tickMs: number
   providers: ObserveProviderInfo[]
   allowRemoteSay: boolean
+  /** Human operator display name in timelines / UI (persisted). */
+  humanDisplayName: string
   /** Hint only — no path traversal of secrets. */
   envNote: string
 }
@@ -58,6 +61,7 @@ export function readObserveSettings(): ObserveSettings {
     tickMs: societyEnvInt('SOCIETY_TICK_MS', 1500),
     providers,
     allowRemoteSay,
+    humanDisplayName: getHumanDisplayName(),
     envNote:
       '密钥与模型请写在项目根目录 .env（已 gitignore）。本页与 /api/* 永不返回 API Key；改完需重启 society-live / Docker。',
   }

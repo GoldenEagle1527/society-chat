@@ -3,6 +3,7 @@
  * - Serves Telegram-style UI from public/
  * - observe mode: read-only
  * - live mode: POST /api/say | /api/rooms | /api/dm | /api/agents + composer
+ * - GET/PATCH /api/settings (human display name persisted under data/society/settings.json)
  * Never serves .env or API keys.
  */
 import fs from 'node:fs'
@@ -12,6 +13,7 @@ import type { RoomMessage } from './types.ts'
 import { HUMAN_SPEAKER_ID, speakerLabel } from './types.ts'
 import { isForbiddenObservePath, readAgentJournal, readObserveState } from './observe-state.ts'
 import { readObserveSettings, type ObserveSettings } from './observe-settings.ts'
+import { setHumanDisplayName } from './human-settings.ts'
 import { PROJECT_ROOT } from './paths.ts'
 
 export type ObserveMode = 'observe' | 'live'
@@ -253,6 +255,38 @@ export function createObserveServer(opts: ObserveServerOptions): ObserveServer {
       try {
         const settings = opts.getSettings ? opts.getSettings() : readObserveSettings()
         sendJson(res, 200, { ok: true, mode: opts.mode, ...settings })
+      } catch (err) {
+        sendJson(res, 500, {
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+      return
+    }
+
+
+    if (req.method === 'PATCH' && pathname === '/api/settings') {
+      if (!allowMutatingApi(req)) {
+        sendJson(res, 403, {
+          error: 'localhost only (set SOCIETY_OBSERVE_ALLOW_REMOTE_SAY=1 in Docker)',
+        })
+        return
+      }
+      try {
+        const raw = await readBody(req)
+        let parsed: Record<string, unknown>
+        try {
+          parsed = JSON.parse(raw || '{}') as Record<string, unknown>
+        } catch {
+          sendJson(res, 400, { error: 'invalid JSON' })
+          return
+        }
+        if (!('humanDisplayName' in parsed)) {
+          sendJson(res, 400, { error: 'humanDisplayName required' })
+          return
+        }
+        const humanDisplayName = setHumanDisplayName(parsed.humanDisplayName)
+        const settings = opts.getSettings ? opts.getSettings() : readObserveSettings()
+        sendJson(res, 200, { ok: true, mode: opts.mode, ...settings, humanDisplayName })
       } catch (err) {
         sendJson(res, 500, {
           error: err instanceof Error ? err.message : String(err),

@@ -21,7 +21,7 @@ async function main() {
 
   const human = ctx.societyIdentity.registerHuman()
   assert.equal(human.id, HUMAN_SPEAKER_ID)
-  assert.equal(human.displayName, '你')
+  assert.equal(human.displayName, '用户')
   assert.equal(
     ctx.societyIdentity.list().some((a) => a.id === HUMAN_SPEAKER_ID),
     false,
@@ -107,7 +107,7 @@ async function main() {
   console.log('--- transcript (tail) ---')
   for (const m of history.slice(-6)) {
     const name =
-      m.from === 'human' ? '你' : m.from === 'alice' ? 'Alice' : m.from === 'bob' ? 'Bob' : m.from
+      m.from === 'human' ? '用户' : m.from === 'alice' ? 'Alice' : m.from === 'bob' ? 'Bob' : m.from
     console.log(`${name}: ${m.body}`)
   }
   console.log('-------------------------')

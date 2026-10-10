@@ -15,6 +15,7 @@ import {
   agentDataDir,
   agentWorkspaceDir,
 } from './paths.ts'
+import { getHumanDisplayName } from './human-settings.ts'
 import { listDmThreads } from './dm-threads.ts'
 import { beijingDayStamp } from './beijing-time.ts'
 
@@ -380,7 +381,7 @@ export function readObserveState(opts?: {
   const recentSoulLog: ObserveSoulLogLine[] = []
   const byAgent: Record<string, number> = {}
   const nameById = new Map<string, string>()
-  nameById.set('human', '你')
+  nameById.set('human', getHumanDisplayName())
   nameById.set('system', '系统')
   nameById.set('room', '房间')
 

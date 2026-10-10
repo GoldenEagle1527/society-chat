@@ -322,7 +322,7 @@ export class SocietyIdentityService extends Service {
   }
 
   registerHuman(): { id: typeof HUMAN_SPEAKER_ID; displayName: string } {
-    return { id: HUMAN_SPEAKER_ID, displayName: '你' }
+    return { id: HUMAN_SPEAKER_ID, displayName: speakerLabel(HUMAN_SPEAKER_ID) }
   }
 
   /** Resolve a friendly label for agents or special speakers. */

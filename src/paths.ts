@@ -29,3 +29,6 @@ export const MESSAGES_STATE_FILE = path.join(SOCIETY_STATE_ROOT, 'messages.jsonl
 
 /** Ensured human↔agent DM threads (appear in sidebar before first message). */
 export const DM_THREADS_STATE_FILE = path.join(SOCIETY_STATE_ROOT, 'dm-threads.json')
+
+/** Persistable observe / operator settings (human display name, etc.). */
+export const SETTINGS_STATE_FILE = path.join(SOCIETY_STATE_ROOT, 'settings.json')
