@@ -415,11 +415,41 @@ button { cursor: pointer; border: none; background: none; }
   text-align: center;
   border-radius: 10px;
 }
+.tg-name-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 3px;
+}
 .tg-bubble .name {
-  display: block;
+  display: inline;
   font-size: 13px;
   font-weight: 700;
-  margin-bottom: 2px;
+  margin-bottom: 0;
+  line-height: 1.2;
+}
+.tg-model-pill {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 1.4;
+  color: var(--accent-strong);
+  background: rgba(100, 169, 220, 0.14);
+  border: 1px solid rgba(100, 169, 220, 0.28);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tg-row.out .tg-model-pill {
+  color: rgba(255,255,255,0.85);
+  background: rgba(255,255,255,0.12);
+  border-color: rgba(255,255,255,0.18);
 }
 .tg-bubble .meta {
   display: flex;
