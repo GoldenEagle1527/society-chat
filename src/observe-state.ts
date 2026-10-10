@@ -179,7 +179,13 @@ function todayKeyLocal(): string {
 
 function cleanJournalPreview(text: string): string {
   let t = String(text || '')
-  t = t.replace(/^#+\s*(日记|随想)\s*/gm, '')
+  // Prefer the latest ## HH:MM entry when daily journals append sections
+  const parts = t.split(/^##\s+/m).filter(Boolean)
+  if (parts.length > 1) {
+    const last = parts[parts.length - 1] || ''
+    t = last.replace(/^\d{1,2}:\d{2}\s*/, '')
+  }
+  t = t.replace(/^#+\s*(日记|随想)[^\n]*\n?/gm, '')
   t = t.replace(/^ACTION:\s*(DIARY|SELF|ROOM|NONE|DM:\S+)\s*$/gim, '')
   t = t.replace(/\|{3}/g, ' ')
   t = t.replace(/\s+/g, ' ').trim()

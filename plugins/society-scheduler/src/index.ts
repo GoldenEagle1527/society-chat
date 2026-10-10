@@ -113,6 +113,19 @@ function exchangesCapped(exchangeCount: number, maxExchanges: number): boolean {
   return maxExchanges > 0 && exchangeCount >= maxExchanges
 }
 
+function localDayStamp(d = new Date()): string {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+function localClock(d = new Date()): string {
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  return `${hh}:${mm}`
+}
+
 function cleanIdleBody(raw: string): string {
   return String(raw || '')
     .split(/\r?\n/)
@@ -683,12 +696,26 @@ export class SocietySchedulerService extends Service {
       if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return { action: 'capped' }
 
       if (parsed.act === 'diary' || parsed.act === 'self') {
-        const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+        const now = new Date()
         const isDiary = parsed.act === 'diary'
-        const rel = isDiary ? `diary/${stamp}.md` : `thoughts/${stamp}.md`
-        const title = isDiary ? '日记' : '随想'
+        // Diary is one file per local day; thoughts stay timestamped snippets under thoughts/
+        const day = localDayStamp(now)
+        const clock = localClock(now)
+        const rel = isDiary ? `diary/${day}.md` : `thoughts/${day}.md`
+        const title = isDiary ? `日记 ${day}` : `随想 ${day}`
         const cleanedBody = cleanIdleBody(parsed.body || '') || '（空白）'
-        const content = `# ${title}\n\n${cleanedBody}\n`
+        const entry = `## ${clock}\n\n${cleanedBody}\n`
+        let content = ''
+        try {
+          content = this.ctx.societyTools.readFile(agentId, rel)
+        } catch {
+          content = `# ${title}\n\n`
+        }
+        if (!content.trim()) content = `# ${title}\n\n`
+        if (!content.includes(`# ${title}`)) {
+          content = `# ${title}\n\n${content}`
+        }
+        content = content.replace(/\s*$/, '\n') + entry + '\n'
         this.ctx.societyTools.writeFile(agentId, rel, content)
         try {
           this.ctx.societyMemory.rememberInteraction(agentId, {
