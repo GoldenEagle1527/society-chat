@@ -248,43 +248,72 @@
     return `<div class="tg-reply-quote" data-jump="${esc(m.replyTo)}" title="查看原消息"><span class="who">${esc(who)}</span><span class="snip">${esc(snip)}</span></div>`;
   }
 
+  /** All UI clocks use Asia/Shanghai (北京时间), not browser-local. */
+  const BJ_TZ = 'Asia/Shanghai';
+
+  function bjParts(isoOrDate) {
+    const d = isoOrDate instanceof Date ? isoOrDate : new Date(isoOrDate);
+    if (Number.isNaN(d.getTime())) return null;
+    const parts = new Intl.DateTimeFormat('zh-CN', {
+      timeZone: BJ_TZ,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }).formatToParts(d);
+    const get = (t) => parts.find((p) => p.type === t)?.value || '';
+    let hour = get('hour');
+    if (hour === '24') hour = '00';
+    const pad = (s) => String(s).padStart(2, '0');
+    return {
+      year: get('year'),
+      month: pad(get('month')),
+      day: pad(get('day')),
+      hour: pad(hour),
+      minute: pad(get('minute')),
+      second: pad(get('second')),
+    };
+  }
+
   function fmtTime(iso) {
-    if (!iso) return '';
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return '';
-    const now = new Date();
-    const sameDay =
-      d.getFullYear() === now.getFullYear() &&
-      d.getMonth() === now.getMonth() &&
-      d.getDate() === now.getDate();
-    if (sameDay) {
-      return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    const p = bjParts(iso);
+    if (!p) return '';
+    const now = bjParts(new Date());
+    if (now && p.year === now.year && p.month === now.month && p.day === now.day) {
+      return `${p.hour}:${p.minute}`;
     }
-    return d.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
+    return `${Number(p.month)}/${Number(p.day)}`;
   }
 
   function fmtClock(iso) {
-    if (!iso) return '';
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return '';
-    return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    const p = bjParts(iso);
+    if (!p) return '';
+    return `${p.hour}:${p.minute}`;
+  }
+
+  function fmtStamp(iso) {
+    const p = bjParts(iso);
+    if (!p) return '';
+    return `${p.hour}:${p.minute}:${p.second}`;
   }
 
   function dayKey(iso) {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return '';
-    return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+    const p = bjParts(iso);
+    if (!p) return '';
+    return `${p.year}-${p.month}-${p.day}`;
   }
 
   function dayLabel(iso) {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return '';
-    const today = new Date();
-    const yday = new Date();
-    yday.setDate(today.getDate() - 1);
-    if (dayKey(iso) === dayKey(today.toISOString())) return '今天';
-    if (dayKey(iso) === dayKey(yday.toISOString())) return '昨天';
-    return d.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' });
+    const p = bjParts(iso);
+    if (!p) return '';
+    const todayKey = dayKey(new Date());
+    const yday = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    if (dayKey(iso) === todayKey) return '今天';
+    if (dayKey(iso) === dayKey(yday)) return '昨天';
+    return `${p.year}年${Number(p.month)}月${Number(p.day)}日`;
   }
 
   function agentById(id) {
@@ -1216,7 +1245,7 @@
       el.liveNote.textContent = data.note || '';
       el.llmTotal.textContent = String(data.llmTotals?.today ?? 0);
       el.stamp.textContent = data.generatedAt
-        ? '更新 ' + new Date(data.generatedAt).toLocaleTimeString('zh-CN', { hour12: false })
+        ? '更新 ' + fmtStamp(data.generatedAt)
         : '—';
 
       if (selectedChatId && !chatById(selectedChatId)) {

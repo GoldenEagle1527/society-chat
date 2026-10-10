@@ -16,6 +16,7 @@ import {
   agentWorkspaceDir,
 } from './paths.ts'
 import { listDmThreads } from './dm-threads.ts'
+import { beijingDayStamp } from './beijing-time.ts'
 
 const SECRET_KEY_RE = /(api[_-]?key|secret|password|token|authorization|bearer|agnes_api|glm_api|siliconflow_api)/i
 
@@ -181,11 +182,7 @@ function stripSecrets<T>(value: T): T {
 }
 
 function todayKeyLocal(): string {
-  const d = new Date()
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, '0')
-  const day = String(d.getDate()).padStart(2, '0')
-  return `${y}-${m}-${day}`
+  return beijingDayStamp()
 }
 
 

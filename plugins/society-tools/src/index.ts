@@ -16,6 +16,7 @@ import type { AgentId, RoomId } from '../../../src/types.ts'
 import { parseSpawnLlmInput, requireAgnesConfig } from '../../../src/env.ts'
 import { assertUrlAllowed } from '../../society-sandbox/src/index.ts'
 import { isChattyPrivateText, looksLikeOutboundChatLine } from './private-voice.ts'
+import { beijingClock, beijingDayStamp } from '../../../src/beijing-time.ts'
 
 export { looksLikeOutboundChatLine, classifyIdlePrivateBody, isChattyPrivateText } from './private-voice.ts'
 
@@ -126,16 +127,11 @@ export function isClosingToolName(name: string): boolean {
 }
 
 function localDayStamp(d = new Date()): string {
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, '0')
-  const day = String(d.getDate()).padStart(2, '0')
-  return `${y}-${m}-${day}`
+  return beijingDayStamp(d)
 }
 
 function localClock(d = new Date()): string {
-  const hh = String(d.getHours()).padStart(2, '0')
-  const mm = String(d.getMinutes()).padStart(2, '0')
-  return `${hh}:${mm}`
+  return beijingClock(d)
 }
 
 function splitBubbleBodies(body: string): string[] {

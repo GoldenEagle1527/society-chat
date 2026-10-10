@@ -24,6 +24,7 @@ import {
   isClosingToolName,
   type ToolDefinition,
 } from '../../society-tools/src/index.ts'
+import { formatBeijingNow } from '../../../src/beijing-time.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -251,6 +252,7 @@ export class SocietyLlmService extends Service {
     const memorySection = this.ctx.societyMemory.getPromptSection(agentId)
     const lines = [
       `你是 ${agent.displayName}（内部 id: ${agent.id}）。`,
+      formatBeijingNow(),
       `人设：${agent.persona}`,
       soulSection,
       memorySection,
@@ -281,6 +283,7 @@ export class SocietyLlmService extends Service {
   buildUserPrompt(agentId: AgentId, stimulus: ReplyStimulus): string {
     const agent = this.ctx.societyIdentity.require(agentId)
     const msg = stimulus.message
+    const timeLine = formatBeijingNow()
     const decideHint =
       '先决定要不要回：若对方 @你 / 回复你 / 问候或问你，必须调用 speak_in_room（或私信 send_dm）；若刺激已被更新话题盖过且你未被点名，调用 stay_silent。要回则在工具 body 里写短气泡（可用 |||；点名别人用 @显示名）。不要输出 ACTION: 文本。'
     if (msg) {
@@ -312,6 +315,7 @@ export class SocietyLlmService extends Service {
           ? `该消息本身在回复另一条（id=${msg.replyTo.slice(0, 8)}）。`
           : ''
         return [
+          timeLine,
           `你在群聊${roomLabel}中收到一条消息。`,
           `原始投递：${msg.body}`,
           `是否点名你：${mentioned} ${replyTarget}`.trim(),
@@ -324,6 +328,7 @@ export class SocietyLlmService extends Service {
       if (msg.kind === 'direct') {
         const fromLabel = this.ctx.societyIdentity.displayNameOf(String(msg.from))
         return [
+          timeLine,
           `你收到来自 ${fromLabel}（${msg.from}）的私信（私信默认应回复，除非是骚扰/无意义刷屏）：`,
           msg.body,
           '用 send_dm 回复；长话可用 ||| 拆分。一般不要 stay_silent。',
@@ -331,6 +336,7 @@ export class SocietyLlmService extends Service {
         ].join('\n')
       }
       return [
+        timeLine,
         `系统通知：${msg.body}`,
         decideHint,
         `若开口，请以 ${agent.displayName} 的身份作简短回应。`,
@@ -430,7 +436,7 @@ export class SocietyLlmService extends Service {
 
     const messages: ChatMessage[] = [
       { role: 'system', content: this.buildSystemPrompt(agentId, true) },
-      { role: 'user', content: `${userContent}\n\n${closingHint}` },
+      { role: 'user', content: `${formatBeijingNow()}\n\n${userContent}\n\n${closingHint}` },
     ]
 
     const researchTools: string[] = []

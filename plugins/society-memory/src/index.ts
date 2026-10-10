@@ -29,6 +29,7 @@ import {
 } from '../../../src/env.ts'
 import { LlmHttpError, withLlmRetries } from '../../../src/llm-http.ts'
 import { agentDataDir } from '../../../src/paths.ts'
+import { beijingDayStamp } from '../../../src/beijing-time.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -373,11 +374,7 @@ export class SocietyMemoryService extends Service {
   }
 
   private todayKey(): string {
-    const d = new Date()
-    const y = d.getFullYear()
-    const m = String(d.getMonth() + 1).padStart(2, '0')
-    const day = String(d.getDate()).padStart(2, '0')
-    return `${y}-${m}-${day}`
+    return beijingDayStamp()
   }
 
   getLlmCallsToday(agentId: AgentId): number {

@@ -26,6 +26,7 @@
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { AgentId, InboxMessage, RoomId } from '../../../src/types.ts'
 import type { AgentActResult } from '../../society-llm/src/index.ts'
+import { formatBeijingNow } from '../../../src/beijing-time.ts'
 
 // Re-export voice helpers for offline smokes
 export { looksLikeOutboundChatLine, classifyIdlePrivateBody } from '../../society-tools/src/index.ts'
@@ -945,6 +946,7 @@ export class SocietySchedulerService extends Service {
       let stimulus: string
       if (steerSearch) {
         stimulus = [
+          formatBeijingNow(),
           '【自主生活 / 时政关注】你此刻没有未读。你关心时政与公共议题——请先动手查一下再说话。',
           '必须先调用 web_search：用一句具体的中文查询搜近期时政/热点/公共议题。',
           '看完结果后写短评，再调用收束工具：优先 speak_in_room 去广场分享；或 write_diary 沉淀。',
@@ -955,6 +957,7 @@ export class SocietySchedulerService extends Service {
         ].join('\n')
       } else {
         stimulus = [
+          formatBeijingNow(),
           '【自主生活 / 自我循环】你是独立的人，此刻没有未读。广场是可选社交工具。',
           '可先选用研究工具（web_search / write_file / list_agents 等），然后必须用收束工具结束本回合。',
           closingList,

@@ -121,6 +121,9 @@ async function main() {
   assert.ok(!/ACTION:ROOM/.test(sys))
   assert.ok(!/ACTION:SILENT/.test(sys))
   assert.ok(/speak_in_room/.test(sys) || /收束工具/.test(sys))
+  assert.ok(/当前北京时间：\d{4}-\d{2}-\d{2}/.test(sys), 'system prompt must include Beijing date')
+  assert.ok(/Asia\/Shanghai/.test(sys), 'system prompt must name Asia/Shanghai')
+  assert.ok(/星期/.test(sys), 'system prompt must include Chinese weekday')
 
   await app.dispose()
   console.log('=== TOOL-CLOSING-SMOKE PASS ===')
