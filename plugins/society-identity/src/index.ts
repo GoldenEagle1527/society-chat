@@ -113,6 +113,30 @@ export function sanitizeAgentId(raw: string): string {
   return id
 }
 
+/** Best-effort slug from a display name (may still need uniqueness). */
+export function slugFromDisplayName(displayName: string): string {
+  const raw = String(displayName || '').trim()
+  // Keep latin/digits; strip CJK to pinyin-less fallback
+  let slug = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[-_]+|[-_]+$/g, '')
+  if (!slug || !/^[a-z]/.test(slug)) {
+    // Chinese / symbols → agent + short hash-ish from code points
+    let h = 0
+    for (let i = 0; i < raw.length; i++) h = (h * 31 + raw.charCodeAt(i)) >>> 0
+    slug = `agent${(h % 100000).toString(36)}`
+  }
+  if (slug.length < 2) slug = `a${slug || 'x'}`
+  if (slug.length > 28) slug = slug.slice(0, 28).replace(/-+$/g, '')
+  try {
+    return sanitizeAgentId(slug)
+  } catch {
+    return sanitizeAgentId(`agent${Date.now().toString(36).slice(-6)}`)
+  }
+}
+
 export class SocietyIdentityService extends Service {
   private readonly agents = new Map<AgentId, AgentProfile>()
 
@@ -123,6 +147,39 @@ export class SocietyIdentityService extends Service {
   maxAgents(): number {
     loadDotEnv()
     return societyEnvInt('SOCIETY_MAX_AGENTS', 8)
+  }
+
+  /** True if id is registered or profile.json already on disk. */
+  exists(id: AgentId): boolean {
+    try {
+      const sid = sanitizeAgentId(id)
+      if (this.agents.has(sid)) return true
+      return fs.existsSync(path.join(agentDataDir(sid), 'profile.json'))
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Pick a free agent id. If hint given, sanitize it (or slug from display name).
+   * On collision append -2, -3, … then a time suffix.
+   */
+  allocateUniqueId(hint?: string): string {
+    const base = hint?.trim()
+      ? (() => {
+          try {
+            return sanitizeAgentId(hint)
+          } catch {
+            return slugFromDisplayName(hint)
+          }
+        })()
+      : sanitizeAgentId(`agent${Date.now().toString(36).slice(-8)}`)
+    if (!this.exists(base)) return base
+    for (let n = 2; n <= 99; n++) {
+      const cand = sanitizeAgentId(`${base.slice(0, 28)}-${n}`.slice(0, 32))
+      if (!this.exists(cand)) return cand
+    }
+    return sanitizeAgentId(`a${Date.now().toString(36)}`.slice(0, 32))
   }
 
   /** Ensure data dirs exist and return the profile (create if missing). */

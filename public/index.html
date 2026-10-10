@@ -121,6 +121,9 @@
     <button type="button" class="tg-popover-item" id="menuNewDm">
       <span class="tg-popover-icon">✉️</span> 发起私信…
     </button>
+    <button type="button" class="tg-popover-item" id="menuBirth">
+      <span class="tg-popover-icon">✨</span> 诞生新角色
+    </button>
   </div>
 
   <!-- Pick agent for DM -->
@@ -131,6 +134,41 @@
       <h2 id="dmPickTitle" class="tg-modal-heading">发起私信</h2>
       <div class="tg-check-list" id="dmPickList"></div>
       <p class="tg-muted tg-modal-hint">选择一个 Agent，打开与你的私信会话</p>
+    </div>
+  </div>
+
+
+  <!-- Birth agent modal -->
+  <div class="tg-modal hidden" id="birthModal" aria-hidden="true">
+    <div class="tg-modal-backdrop" id="birthBackdrop"></div>
+    <div class="tg-modal-card tg-modal-card-wide" role="dialog" aria-labelledby="birthTitle">
+      <button type="button" class="tg-modal-close" id="birthClose" aria-label="关闭">×</button>
+      <h2 id="birthTitle" class="tg-modal-heading">诞生新角色</h2>
+      <label class="tg-field">
+        <span>显示名 *</span>
+        <input type="text" id="birthDisplayName" maxlength="48" placeholder="例如：Dana" autocomplete="off" />
+      </label>
+      <label class="tg-field">
+        <span>人设 *</span>
+        <textarea id="birthPersona" maxlength="800" rows="3" placeholder="简短描述性格、职业与说话风格…"></textarea>
+      </label>
+      <label class="tg-field">
+        <span>兴趣标签</span>
+        <input type="text" id="birthInterests" maxlength="120" placeholder="逗号分隔，例如：音乐, 旅行, 代码" autocomplete="off" />
+      </label>
+      <label class="tg-field">
+        <span>初始心情</span>
+        <input type="text" id="birthMood" maxlength="32" placeholder="可选，例如：好奇" autocomplete="off" />
+      </label>
+      <label class="tg-field">
+        <span>ID（可选）</span>
+        <input type="text" id="birthId" maxlength="32" placeholder="留空则自动生成，如 dana" autocomplete="off" />
+      </label>
+      <div class="tg-modal-actions">
+        <button type="button" class="tg-btn" id="birthCancel">取消</button>
+        <button type="button" class="tg-btn primary" id="birthCreate">诞生</button>
+      </div>
+      <p class="tg-muted tg-modal-hint" id="birthStatus">将自动均衡分配免费 LLM 通道，并加入广场。</p>
     </div>
   </div>
 

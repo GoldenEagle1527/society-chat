@@ -1,5 +1,5 @@
 /**
- * Cheap API smoke: mock live observe server — rooms / dm / settings / say guard.
+ * Cheap API smoke: mock live observe server — rooms / dm / agents / settings / say guard.
  * No LLM calls. Never prints API keys.
  */
 import assert from 'node:assert/strict'
@@ -11,6 +11,7 @@ import {
   type CreateDmApiResult,
   type CreateRoomApiResult,
   type SayResult,
+  type SpawnAgentApiResult,
 } from './observe-server.ts'
 import { ensureHumanDm, listDmThreads } from './dm-threads.ts'
 import { readObserveSettings } from './observe-settings.ts'
@@ -50,6 +51,8 @@ async function main(): Promise<void> {
 
   let roomsCreated = 0
   let dmCreated = 0
+  let agentsSpawned = 0
+  const spawnedIds = new Set<string>()
 
   const srv = createObserveServer({
     mode: 'live',
@@ -91,6 +94,42 @@ async function main(): Promise<void> {
         agentId: req.agentId,
         created: ensured.created,
         peers: [...ensured.peers],
+      }
+    },
+    onSpawnAgent: async (req): Promise<SpawnAgentApiResult> => {
+      const displayName = req.displayName
+      const persona = req.persona
+      let id = (req.id || displayName.toLowerCase().replace(/[^a-z0-9]+/g, '') || 'agentx').slice(0, 32)
+      if (!/^[a-z]/.test(id)) id = `a${id}`
+      if (spawnedIds.has(id) || id === 'alice' || id === 'bob') {
+        throw new Error(`agent already exists: ${id}`)
+      }
+      const max = readObserveSettings().maxAgents
+      // Simulate cap: seeds alice+bob count as 2 in this mock when checking
+      if (agentsSpawned + 2 >= max && max <= 2) {
+        throw new Error(`max agents (${max}) reached; set SOCIETY_MAX_AGENTS to raise`)
+      }
+      agentsSpawned += 1
+      spawnedIds.add(id)
+      const provider = agentsSpawned % 2 === 1 ? 'agnes' : 'glm'
+      return {
+        ok: true,
+        agent: {
+          id,
+          displayName,
+          persona,
+          soul: {
+            openness: 0.5,
+            trust: 0.5,
+            energy: 0.5,
+            interests: Array.isArray(req.interests) ? req.interests : [],
+            mood: req.mood || '平静',
+          },
+          workspacePath: `/tmp/${id}`,
+          createdAt: new Date().toISOString(),
+        },
+        llm: { provider, model: provider === 'glm' ? 'glm-4-flash' : 'agnes-3.0-flash' },
+        chatIds: { self: `self:${id}`, plaza: 'room:plaza-mock' },
       }
     },
     getSettings: () => readObserveSettings(),
@@ -184,6 +223,49 @@ async function main(): Promise<void> {
   assert.equal(say.status, 200)
   assert.equal(say.body.ok, true)
   console.log('✓ POST /api/say')
+
+
+  // Spawn agent
+  const badBirth = await jsonFetch(base, '/api/agents', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ displayName: '', persona: '' }),
+  })
+  assert.equal(badBirth.status, 400)
+  console.log('✓ POST /api/agents rejects empty')
+
+  const birth = await jsonFetch(base, '/api/agents', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      displayName: 'Dana',
+      persona: '冷静的运维，喜欢日志与配额。',
+      interests: '运维, 日志',
+      mood: '专注',
+      id: 'dana-api',
+    }),
+  })
+  assert.equal(birth.status, 200, JSON.stringify(birth.body))
+  assert.equal(birth.body.ok, true)
+  assert.equal(birth.body.agent.id, 'dana-api')
+  assert.equal(birth.body.agent.displayName, 'Dana')
+  assert.ok(birth.body.llm?.provider)
+  assert.equal(birth.body.chatIds.self, 'self:dana-api')
+  assert.equal(agentsSpawned, 1)
+  assert.ok(!JSON.stringify(birth.body).match(/sk-[A-Za-z0-9]|api[_-]?key/i))
+  console.log(`✓ POST /api/agents → ${birth.body.agent.id} llm=${birth.body.llm.provider}`)
+
+  const dupBirth = await jsonFetch(base, '/api/agents', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      displayName: 'Dana2',
+      persona: 'dup',
+      id: 'dana-api',
+    }),
+  })
+  assert.equal(dupBirth.status, 409)
+  console.log('✓ POST /api/agents duplicate → 409')
 
   // Forbidden paths
   const envLeak = await new Promise<{ status: number }>((resolve, reject) => {

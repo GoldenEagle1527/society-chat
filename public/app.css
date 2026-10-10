@@ -637,7 +637,8 @@ button { cursor: pointer; border: none; background: none; }
   font-size: 13px;
   color: var(--text-secondary);
 }
-.tg-field input[type="text"] {
+.tg-field input[type="text"],
+.tg-field textarea {
   background: var(--input-bg);
   border: none;
   outline: none;
@@ -645,9 +646,22 @@ button { cursor: pointer; border: none; background: none; }
   padding: 10px 12px;
   color: var(--text);
   width: 100%;
+  font: inherit;
+  resize: vertical;
+  min-height: 40px;
 }
-.tg-field input[type="text"]:focus {
+.tg-field input[type="text"]:focus,
+.tg-field textarea:focus {
   box-shadow: 0 0 0 2px rgba(100, 169, 220, 0.35);
+}
+.tg-modal-card-wide {
+  max-width: 440px;
+}
+.tg-settings-actions {
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 .tg-check-list {
   display: grid;

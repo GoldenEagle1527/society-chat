@@ -39,6 +39,18 @@
     newMenu: document.getElementById('newMenu'),
     menuNewGroup: document.getElementById('menuNewGroup'),
     menuNewDm: document.getElementById('menuNewDm'),
+    menuBirth: document.getElementById('menuBirth'),
+    birthModal: document.getElementById('birthModal'),
+    birthBackdrop: document.getElementById('birthBackdrop'),
+    birthClose: document.getElementById('birthClose'),
+    birthCancel: document.getElementById('birthCancel'),
+    birthCreate: document.getElementById('birthCreate'),
+    birthDisplayName: document.getElementById('birthDisplayName'),
+    birthPersona: document.getElementById('birthPersona'),
+    birthInterests: document.getElementById('birthInterests'),
+    birthMood: document.getElementById('birthMood'),
+    birthId: document.getElementById('birthId'),
+    birthStatus: document.getElementById('birthStatus'),
     newGroupModal: document.getElementById('newGroupModal'),
     newGroupBackdrop: document.getElementById('newGroupBackdrop'),
     newGroupClose: document.getElementById('newGroupClose'),
@@ -67,6 +79,7 @@
   let stickBottom = true;
   let profileAgentId = '';
   let creating = false;
+  let birthing = false;
 
   function esc(s) {
     return String(s ?? '').replace(/[&<>"']/g, (c) =>
@@ -555,6 +568,79 @@
     }
   }
 
+
+  function openBirthModal() {
+    closeNewMenu();
+    closeSettings();
+    el.birthDisplayName.value = '';
+    el.birthPersona.value = '';
+    el.birthInterests.value = '';
+    el.birthMood.value = '';
+    el.birthId.value = '';
+    const max = settingsCache?.maxAgents || state?.agents?.length || '—';
+    const cur = state?.agents?.length ?? 0;
+    el.birthStatus.textContent =
+      `将自动均衡分配免费 LLM，并加入广场。当前 ${cur} / 上限 ${max}`;
+    el.birthModal.classList.remove('hidden');
+    el.birthModal.setAttribute('aria-hidden', 'false');
+    setTimeout(() => el.birthDisplayName.focus(), 50);
+  }
+
+  function closeBirthModal() {
+    el.birthModal.classList.add('hidden');
+    el.birthModal.setAttribute('aria-hidden', 'true');
+  }
+
+  async function birthAgent() {
+    if (!state?.canSay || birthing) return;
+    const displayName = (el.birthDisplayName.value || '').trim();
+    const persona = (el.birthPersona.value || '').trim();
+    const interests = (el.birthInterests.value || '').trim();
+    const mood = (el.birthMood.value || '').trim();
+    const id = (el.birthId.value || '').trim();
+    if (!displayName) {
+      el.birthStatus.textContent = '请填写显示名';
+      return;
+    }
+    if (!persona) {
+      el.birthStatus.textContent = '请填写人设';
+      return;
+    }
+    birthing = true;
+    el.birthCreate.disabled = true;
+    el.birthStatus.textContent = '诞生中…';
+    try {
+      const payload = { displayName, persona };
+      if (interests) payload.interests = interests;
+      if (mood) payload.mood = mood;
+      if (id) payload.id = id;
+      const res = await fetch('/api/agents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        el.birthStatus.textContent = '失败：' + (data.error || res.status);
+        return;
+      }
+      closeBirthModal();
+      await tick();
+      const selfId = data.chatIds?.self;
+      if (selfId) selectChat(selfId);
+      const route = data.llm
+        ? `${data.llm.provider}${data.llm.model ? '/' + data.llm.model : ''}`
+        : '—';
+      el.sayStatus.textContent =
+        `已诞生 ${data.agent?.displayName || displayName}（@${data.agent?.id || ''} · ${route}）`;
+    } catch (e) {
+      el.birthStatus.textContent = '失败：' + e;
+    } finally {
+      birthing = false;
+      el.birthCreate.disabled = false;
+    }
+  }
+
   function renderSettings(s) {
     const providers = (s.providers || [])
       .map((p) => {
@@ -586,7 +672,20 @@
       <div class="tg-settings-card">
         <h3>.env</h3>
         <p class="tg-settings-note">${esc(s.envNote || '')}</p>
-      </div>`;
+      </div>
+      ${
+        state?.canSay
+          ? `<div class="tg-settings-card">
+        <h3>角色</h3>
+        <p class="tg-muted" style="margin:0 0 8px;font-size:12px">当前 ${(state.agents || []).length} / ${esc(s.maxAgents)} · LLM 自动均衡</p>
+        <div class="tg-settings-actions">
+          <button type="button" class="tg-btn primary" id="settingsBirthBtn">诞生新角色</button>
+        </div>
+      </div>`
+          : ''
+      }`;
+    const birthBtn = document.getElementById('settingsBirthBtn');
+    if (birthBtn) birthBtn.addEventListener('click', openBirthModal);
   }
 
   async function openSettings() {
@@ -735,6 +834,7 @@
   });
   el.menuNewGroup.addEventListener('click', openNewGroupModal);
   el.menuNewDm.addEventListener('click', openDmPickModal);
+  el.menuBirth.addEventListener('click', openBirthModal);
   document.addEventListener('click', (e) => {
     if (!el.newMenu.classList.contains('hidden')) {
       if (!el.newMenu.contains(e.target) && e.target !== el.newChatBtn) closeNewMenu();
@@ -749,11 +849,17 @@
   el.dmPickClose.addEventListener('click', closeDmPickModal);
   el.dmPickBackdrop.addEventListener('click', closeDmPickModal);
 
+  el.birthClose.addEventListener('click', closeBirthModal);
+  el.birthCancel.addEventListener('click', closeBirthModal);
+  el.birthBackdrop.addEventListener('click', closeBirthModal);
+  el.birthCreate.addEventListener('click', birthAgent);
+
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       closeProfile();
       closeNewGroupModal();
       closeDmPickModal();
+      closeBirthModal();
       closeNewMenu();
       closeSettings();
     }

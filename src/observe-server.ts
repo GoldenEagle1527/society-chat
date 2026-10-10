@@ -2,7 +2,7 @@
  * Shared observe / society-live HTTP server (Node http only).
  * - Serves Telegram-style UI from public/
  * - observe mode: read-only
- * - live mode: POST /api/say | /api/rooms | /api/dm + composer
+ * - live mode: POST /api/say | /api/rooms | /api/dm | /api/agents + composer
  * Never serves .env or API keys.
  */
 import fs from 'node:fs'
@@ -61,6 +61,41 @@ export interface CreateDmApiResult {
   peers: string[]
 }
 
+export interface SpawnAgentApiRequest {
+  displayName: string
+  persona: string
+  /** Optional slug; auto-allocated when omitted. */
+  id?: string
+  /** Comma string or string array. */
+  interests?: string[] | string
+  /** Initial mood seed. */
+  mood?: string
+  openness?: number
+  trust?: number
+  energy?: number
+}
+
+export interface SpawnAgentApiResult {
+  ok: true
+  agent: {
+    id: string
+    displayName: string
+    persona: string
+    soul: {
+      openness: number
+      trust: number
+      energy: number
+      interests: string[]
+      mood?: string
+    }
+    workspacePath: string
+    createdAt: string
+  }
+  llm: { provider: string; model?: string }
+  /** Convenience chat ids for UI navigation. */
+  chatIds: { self: string; plaza?: string }
+}
+
 export interface ObserveServerOptions {
   mode: ObserveMode
   host?: string
@@ -71,6 +106,8 @@ export interface ObserveServerOptions {
   onCreateRoom?: (req: CreateRoomApiRequest) => CreateRoomApiResult | Promise<CreateRoomApiResult>
   /** Live only: ensure human↔agent DM surface. */
   onCreateDm?: (req: CreateDmApiRequest) => CreateDmApiResult | Promise<CreateDmApiResult>
+  /** Live only: birth a new agent (balanced LLM routing). */
+  onSpawnAgent?: (req: SpawnAgentApiRequest) => SpawnAgentApiResult | Promise<SpawnAgentApiResult>
   /** Optional live status line for /api/state note override. */
   liveNote?: () => string
   /** Optional settings override (defaults to env-derived caps, no keys). */
@@ -359,6 +396,84 @@ export function createObserveServer(opts: ObserveServerOptions): ObserveServer {
         sendJson(res, 400, {
           error: err instanceof Error ? err.message : String(err),
         })
+      }
+      return
+    }
+
+    if (req.method === 'POST' && pathname === '/api/agents') {
+      if (opts.mode !== 'live' || !opts.onSpawnAgent) {
+        sendJson(res, 404, { error: 'spawn agent only available in society-live' })
+        return
+      }
+      if (!allowMutatingApi(req)) {
+        sendJson(res, 403, {
+          error: 'localhost only (set SOCIETY_OBSERVE_ALLOW_REMOTE_SAY=1 in Docker)',
+        })
+        return
+      }
+      try {
+        const raw = await readBody(req)
+        let parsed: SpawnAgentApiRequest
+        try {
+          parsed = JSON.parse(raw || '{}') as SpawnAgentApiRequest
+        } catch {
+          sendJson(res, 400, { error: 'invalid JSON' })
+          return
+        }
+        const displayName = String(parsed.displayName || '').trim()
+        const persona = String(parsed.persona || '').trim()
+        if (!displayName) {
+          sendJson(res, 400, { error: 'displayName required' })
+          return
+        }
+        if (displayName.length > 48) {
+          sendJson(res, 400, { error: 'displayName too long (max 48)' })
+          return
+        }
+        if (!persona) {
+          sendJson(res, 400, { error: 'persona required' })
+          return
+        }
+        if (persona.length > 800) {
+          sendJson(res, 400, { error: 'persona too long (max 800)' })
+          return
+        }
+        let interests: string[] | undefined
+        if (typeof parsed.interests === 'string') {
+          interests = parsed.interests
+            .split(/[,，、]/)
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .slice(0, 8)
+        } else if (Array.isArray(parsed.interests)) {
+          interests = parsed.interests.map((x) => String(x).trim()).filter(Boolean).slice(0, 8)
+        }
+        const mood = parsed.mood != null ? String(parsed.mood).trim().slice(0, 32) : undefined
+        const id = parsed.id != null && String(parsed.id).trim() ? String(parsed.id).trim() : undefined
+        const clamp01 = (v: unknown): number | undefined => {
+          if (v == null || v === '') return undefined
+          const n = Number(v)
+          if (!Number.isFinite(n)) return undefined
+          return Math.max(0, Math.min(1, n))
+        }
+        const result = await opts.onSpawnAgent({
+          displayName,
+          persona,
+          id,
+          interests,
+          mood: mood || undefined,
+          openness: clamp01(parsed.openness),
+          trust: clamp01(parsed.trust),
+          energy: clamp01(parsed.energy),
+        })
+        sendJson(res, 200, result)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        const conflict =
+          /already exists/i.test(msg) ||
+          /max agents/i.test(msg) ||
+          /reserved/i.test(msg)
+        sendJson(res, conflict ? 409 : 400, { error: msg })
       }
       return
     }

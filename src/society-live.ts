@@ -14,6 +14,7 @@ import {
   createObserveServer,
   listenObserveServer,
   type SayRequest,
+  type SpawnAgentApiRequest,
 } from './observe-server.ts'
 import { readObserveSettings } from './observe-settings.ts'
 import { ensureHumanDm } from './dm-threads.ts'
@@ -315,18 +316,81 @@ async function main(): Promise<void> {
     }
   }
 
+  const onSpawnAgent = async (req: SpawnAgentApiRequest) => {
+    const id = req.id?.trim()
+      ? req.id.trim()
+      : ctx.societyIdentity.allocateUniqueId(req.displayName)
+    const soul: {
+      openness?: number
+      trust?: number
+      energy?: number
+      interests?: string[]
+      mood?: string
+    } = {}
+    if (req.openness != null) soul.openness = req.openness
+    if (req.trust != null) soul.trust = req.trust
+    if (req.energy != null) soul.energy = req.energy
+    const interestList = Array.isArray(req.interests)
+      ? req.interests
+      : typeof req.interests === 'string'
+        ? req.interests.split(/[,，、]/).map((s) => s.trim()).filter(Boolean)
+        : []
+    if (interestList.length) soul.interests = interestList.slice(0, 8)
+    if (req.mood) soul.mood = req.mood
+    // Balanced LLM via spawn() when llm omitted; agent-born hook joins plaza + allowlist
+    const profile = ctx.societyIdentity.spawn({
+      id,
+      displayName: req.displayName,
+      persona: req.persona,
+      soul,
+    })
+    ctx.societySoul.load(profile.id)
+    ctx.societyMemory.load(profile.id)
+    const llm = ctx.societyIdentity.getLlmPreference(profile.id)
+    const plaza = ctx.societyRooms.listRooms().find((r) => r.name === 'plaza')
+    console.log(
+      `[birth+] ${profile.displayName}(${profile.id}) llm=${ctx.societyLlm.describeAgentRoute(profile.id)}`,
+    )
+    return {
+      ok: true as const,
+      agent: {
+        id: profile.id,
+        displayName: profile.displayName,
+        persona: profile.persona,
+        soul: {
+          openness: profile.soul.openness,
+          trust: profile.soul.trust,
+          energy: profile.soul.energy,
+          interests: [...profile.soul.interests],
+          mood: profile.soul.mood,
+        },
+        workspacePath: profile.workspacePath,
+        createdAt: profile.createdAt,
+      },
+      llm: {
+        provider: llm.provider,
+        ...(llm.model ? { model: llm.model } : {}),
+      },
+      chatIds: {
+        self: `self:${profile.id}`,
+        ...(plaza ? { plaza: `room:${plaza.id}` } : {}),
+      },
+    }
+  }
+
   const srv = createObserveServer({
     mode: 'live',
     onSay,
     onCreateRoom,
     onCreateDm,
+    onSpawnAgent,
     getSettings: () => readObserveSettings(),
     liveNote: () =>
       `直播中 · tick=${ticksDone} exchanges=${ctx.societyScheduler.exchangeCountOf()}/${maxExchanges} · 选中会话后发言 · 不暴露密钥`,
   })
   await listenObserveServer(srv)
   console.log(`[live] http://${srv.host}:${srv.port}/`)
-  console.log(`[live] POST /api/say|/api/rooms|/api/dm · caps maxExchanges=${maxExchanges} tickMs=${tickMs}`)
+  console.log(`[live] POST /api/say|/api/rooms|/api/dm|/api/agents · caps maxExchanges=${maxExchanges} tickMs=${tickMs}`)
   console.log('  stop: Ctrl+C / SIGTERM')
 
   ctx.on('society/agent-replied', (p) => {
