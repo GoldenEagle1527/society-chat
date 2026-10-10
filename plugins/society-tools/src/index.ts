@@ -7,7 +7,7 @@
  * run_command MUST go through societySandbox (bwrap or docker mode); no raw shell.
  * web_search (Exa; 1 call/model/Beijing-day) / generate_image HTTP clients use host allowlist from society-sandbox.
  * Social tools: create_room / invite_to_room / list_rooms / list_agents / post_room / speak_in_room / send_dm / spawn_agent.
- * Closing tools (idle/reply): speak_in_room / send_dm / write_diary / write_thought / do_nothing / stay_silent.
+ * Closing tools (idle/reply): speak_in_room / send_dm / write_diary / write_thought / do_nothing / stay_silent / rest.
  * Side tool: reflect_feelings (subjective soul nudge; not a closing act).
  */
 import fs from 'node:fs'
@@ -29,6 +29,20 @@ import {
   isExaQuotaExhausted,
   tryConsumeExaQuota,
 } from './exa-quota.ts'
+import { resolveRestUntil, writeRest } from './rest.ts'
+
+export {
+  clearRest,
+  defaultRestUntil,
+  getRestUntil,
+  isAgentResting,
+  nextBeijingWallClock,
+  readRest,
+  resolveRestUntil,
+  restFilePath,
+  writeRest,
+} from './rest.ts'
+export type { AgentRestState, ResolveRestUntilArgs, ResolveRestUntilResult } from './rest.ts'
 
 export { looksLikeOutboundChatLine, classifyIdlePrivateBody, isChattyPrivateText } from './private-voice.ts'
 
@@ -108,9 +122,10 @@ export const IDLE_CLOSING_TOOL_NAMES = [
   'write_diary',
   'write_thought',
   'do_nothing',
+  'rest',
 ] as const
 
-export const REPLY_CLOSING_TOOL_NAMES = ['stay_silent', 'speak_in_room', 'send_dm'] as const
+export const REPLY_CLOSING_TOOL_NAMES = ['stay_silent', 'speak_in_room', 'send_dm', 'rest'] as const
 
 export const RESEARCH_TOOL_NAMES = [
   'web_search',
@@ -134,6 +149,7 @@ export type ClosingActName =
   | 'thought'
   | 'do_nothing'
   | 'stay_silent'
+  | 'rest'
 
 export function isClosingToolName(name: string): boolean {
   return (
@@ -279,6 +295,34 @@ const CLOSING_TOOL_DEFINITIONS: ToolDefinition[] = [
         type: 'object',
         properties: {
           reason: { type: 'string', description: 'Optional short reason' },
+        },
+        required: [],
+      },
+    },
+  },
+
+  {
+    type: 'function',
+    function: {
+      name: 'rest',
+      description:
+        'End this turn and go to sleep / stop socializing until a chosen time. Use after saying goodnight, when tired, or when you want the scheduler to stop waking you for idle/chatter. Default (only reason or empty): next Beijing 07:00, or +7h if that is <3h or >12h away. until: ISO timestamp, Beijing HH:mm (next occurrence), or "morning" (= next Beijing 07:00). minutes: sleep for N minutes (1–1440). Human messages and @mentions still wake you early.',
+      parameters: {
+        type: 'object',
+        properties: {
+          until: {
+            type: 'string',
+            description:
+              'ISO timestamp, Beijing HH:mm (e.g. "23:30"), or "morning" for next Beijing 07:00',
+          },
+          minutes: {
+            type: 'number',
+            description: 'Sleep for this many minutes (1–1440). Overrides until when set.',
+          },
+          reason: {
+            type: 'string',
+            description: 'Optional short reason (e.g. 晚安、想静静)',
+          },
         },
         required: [],
       },
@@ -643,6 +687,8 @@ export class SocietyToolsService extends Service {
             acted: 'stay_silent',
             reason: args.reason != null ? String(args.reason) : undefined,
           })
+        case 'rest':
+          return this.rest(agentId, args)
         case 'reflect_feelings':
           return this.reflectFeelings(agentId, args)
         case 'spawn_agent':
@@ -982,6 +1028,32 @@ export class SocietyToolsService extends Service {
       clock,
       text: raw.slice(0, 200),
     })
+  }
+
+
+  /** Closing act: snooze until a chosen time (persists rest.json). */
+  rest(agentId: AgentId, args: Record<string, unknown>): string {
+    this.ctx.societyIdentity.require(agentId)
+    try {
+      const { until, mode } = resolveRestUntil({
+        until: args.until,
+        minutes: args.minutes,
+        reason: args.reason,
+      })
+      const reason = args.reason != null ? String(args.reason) : undefined
+      const state = writeRest(agentId, until, { reason, mode })
+      return JSON.stringify({
+        ok: true,
+        acted: 'rest',
+        until: state.until,
+        mode: state.mode,
+        reason: state.reason,
+        text: state.reason || 'rest',
+      })
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      return JSON.stringify({ ok: false, acted: 'rest', error: msg })
+    }
   }
 
   /**

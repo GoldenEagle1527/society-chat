@@ -18,6 +18,7 @@ import {
 import { getHumanDisplayName } from './human-settings.ts'
 import { listDmThreads } from './dm-threads.ts'
 import { beijingDayStamp } from './beijing-time.ts'
+import { getRestUntil, readRest } from '../plugins/society-tools/src/rest.ts'
 
 const SECRET_KEY_RE = /(api[_-]?key|secret|password|token|authorization|bearer|agnes_api|glm_api|siliconflow_api)/i
 
@@ -41,6 +42,9 @@ export interface ObserveAgent {
   soulNotes: string
   avatarColor: string
   initials: string
+  /** ISO until time if currently resting; null otherwise */
+  restingUntil: string | null
+  restingReason: string | null
 }
 
 export interface ObserveRoom {
@@ -440,6 +444,8 @@ export function readObserveState(opts?: {
       const llmProvider = llmPref?.provider || profile?.llm?.provider || null
       const llmModel = llmPref?.model || profile?.llm?.model || null
 
+      const restUntil = getRestUntil(id)
+      const restState = restUntil ? readRest(id) : null
       agents.push({
         id: profile?.id || id,
         displayName,
@@ -458,6 +464,8 @@ export function readObserveState(opts?: {
         soulNotes: clip(soul?.notes || '', 200),
         avatarColor: avatarColorFor(id),
         initials: initialsFor(displayName),
+        restingUntil: restUntil ? restUntil.toISOString() : null,
+        restingReason: restState?.reason || null,
       })
       byAgent[id] = llmCallsToday
 
@@ -815,8 +823,10 @@ export function readObserveState(opts?: {
     chats.push({
       id: cid,
       kind: 'self',
-      title: `${a.displayName}`,
-      subtitle: '个人空间 · 日记 / 工具 / 灵魂',
+      title: a.restingUntil ? `${a.displayName} · 💤休息` : `${a.displayName}`,
+      subtitle: a.restingUntil
+        ? `休息中${a.restingReason ? ' · ' + a.restingReason : ''} · 个人空间`
+        : '个人空间 · 日记 / 工具 / 灵魂',
       agentId: a.id,
       avatarColor: a.avatarColor,
       initials: a.initials,

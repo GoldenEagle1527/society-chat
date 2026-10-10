@@ -381,11 +381,18 @@
           .map((c) => {
             const active = c.id === selectedChatId ? ' active' : '';
             const groupClass = c.kind === 'group' ? ' group' : '';
+            const resting =
+              c.kind === 'self' && c.agentId
+                ? (state?.agents || []).find((a) => a.id === c.agentId)?.restingUntil
+                : null;
+            const restBadge = resting
+              ? `<span class="tg-rest-badge" title="休息至 ${esc(resting)}">💤</span>`
+              : '';
             return `<button type="button" class="tg-chat-item${active}" data-chat-id="${esc(c.id)}">
               <span class="tg-avatar${groupClass}" style="background:${esc(c.avatarColor)}">${esc(c.initials)}</span>
               <div class="tg-chat-main">
                 <div class="tg-chat-top">
-                  <div class="tg-chat-title">${esc(c.title)}</div>
+                  <div class="tg-chat-title">${esc(c.title)}${restBadge}</div>
                   <div class="tg-chat-time">${esc(fmtTime(c.lastMessage?.createdAt))}</div>
                 </div>
                 <div class="tg-chat-preview">${esc(previewText(c))}</div>
@@ -789,6 +796,11 @@
       <div class="tg-profile-card">
         <h3>灵魂状态</h3>
         <div class="tg-profile-row"><span>心情</span><span>${esc(a.mood)}</span></div>
+        ${
+          a.restingUntil
+            ? `<div class="tg-profile-row"><span>状态</span><span>💤 休息中${a.restingReason ? ' · ' + esc(a.restingReason) : ''}<br/><span class="tg-muted" style="font-size:12px">至 ${esc(a.restingUntil)}</span></span></div>`
+            : ''
+        }
         <div class="tg-bars" style="margin-top:8px">
           ${bar('开放', a.openness)}
           ${bar('信任', a.trust)}

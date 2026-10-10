@@ -17,7 +17,8 @@
  * - at most MAX_ROOM_REPLIES_PER_TICK room replies per tick (idle/DM still parallel) to reduce same-room blindness
  * - prefer @mention / replyTo-me unread; skip stale room stimuli (>STALE_NEWER_COUNT newer msgs or age)
  * - room replies auto-set replyTo to the stimulus room message id
- * - replies/idle use structured closing tools (speak_in_room / stay_silent / write_diary / …)
+ * - replies/idle use structured closing tools (speak_in_room / stay_silent / write_diary / rest / …)
+ * - rest snooze: skip idle while resting; room unread only if @mention or from human; agent↔agent DM skipped; human DM/@ wakes
  * - no ACTION: text protocol; tools apply side effects; scheduler must not double-post
  * - multi-bubble via ||| inside tool body args
  * - idle: always actClosedTurn; news personas often web_search then speak_in_room
@@ -29,9 +30,15 @@
  */
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { AgentId, InboxMessage, RoomId } from '../../../src/types.ts'
+import { HUMAN_SPEAKER_ID } from '../../../src/types.ts'
 import type { ActMode, AgentActResult, ReplyStimulus } from '../../society-llm/src/index.ts'
 import { formatBeijingNow } from '../../../src/beijing-time.ts'
 import { agentTickBudgetMs, sleep as sleepMs } from '../../../src/llm-http.ts'
+import {
+  clearRest,
+  getRestUntil,
+  isAgentResting,
+} from '../../society-tools/src/rest.ts'
 
 // Re-export voice helpers for offline smokes
 export { looksLikeOutboundChatLine, classifyIdlePrivateBody } from '../../society-tools/src/index.ts'
@@ -190,6 +197,27 @@ export function isStaleRoomStimulus(
     const now = opts.now ?? Date.now()
     if (now - created > STALE_AGE_MS) return true
   }
+  return false
+}
+
+
+/** True when message is from the human operator. */
+export function mailFromHuman(message: InboxMessage): boolean {
+  return message.from === HUMAN_SPEAKER_ID
+}
+
+/**
+ * While resting: only human posts or @mentions (or reply-to-me) may wake the agent.
+ * Agent↔agent DMs and unmentioned room chatter are skipped.
+ */
+export function restWakeStimulus(
+  message: InboxMessage,
+  agentId: AgentId,
+  findMessage: (id: string, roomId?: string) => { from: string } | undefined,
+): boolean {
+  if (mailFromHuman(message)) return true
+  if (mailMentionsAgent(message, agentId)) return true
+  if (mailRepliesToAgent(message, agentId, findMessage)) return true
   return false
 }
 
@@ -502,12 +530,22 @@ export class SocietySchedulerService extends Service {
     const lastAct = this.lastActAt.get(agentId) ?? 0
     if (lastAct > 0 && now - lastAct < this.agentCooldownMs) return -1
 
+    // Expire rest if due; while resting only wake-worthy unread scores
+    getRestUntil(agentId, now)
+    const resting = isAgentResting(agentId, now)
+
     const unreadList = this.ctx.societyMailbox.list(agentId, { unreadOnly: true })
-    const unread = unreadList.length
-    let mentionBoost = 0
     const findMsg = (id: string, roomId?: string) =>
       this.ctx.societyRooms.findMessage(id, roomId as RoomId | undefined)
-    for (const m of unreadList) {
+    const wakeUnread = resting
+      ? unreadList.filter((m) => restWakeStimulus(m, agentId, findMsg))
+      : unreadList
+    if (resting && wakeUnread.length === 0) return -1
+
+    const unread = wakeUnread.length
+    let mentionBoost = 0
+    for (const m of wakeUnread) {
+      if (mailFromHuman(m)) mentionBoost = Math.max(mentionBoost, 80_000)
       if (mailMentionsAgent(m, agentId)) mentionBoost = Math.max(mentionBoost, 50_000)
       else if (mailRepliesToAgent(m, agentId, findMsg)) mentionBoost = Math.max(mentionBoost, 30_000)
     }
@@ -689,15 +727,24 @@ export class SocietySchedulerService extends Service {
       return { action: 'capped', agentId, provider }
     }
 
+    const now = Date.now()
+    getRestUntil(agentId, now) // clear expired
+    const resting = isAgentResting(agentId, now)
+
     const unread = this.ctx.societyMailbox.list(agentId, { unreadOnly: true })
     if (unread.length > 0) {
-      const msg = this.pickBestUnread(agentId, unread)
+      const msg = this.pickBestUnread(agentId, unread, { resting })
       if (!msg) {
         // All room unread deferred by per-tick room cap → fall through to idle if possible
       } else {
         const outcome = await this.processUnread(agentId, msg)
         return { action: outcome, agentId, provider }
       }
+    }
+
+    // While resting: no idle self-loop
+    if (resting) {
+      return { action: 'skip', agentId, provider }
     }
 
     // Idle / self-loop: agents live in their own mind even when plaza is silent.
@@ -716,11 +763,16 @@ export class SocietySchedulerService extends Service {
    * Prefer @mention / replyTo-me / DM; skip stale room mail (mark read, no LLM).
    * When room-reply slots for this tick are full, defer room mail (return null).
    */
-  private pickBestUnread(agentId: AgentId, unread: InboxMessage[]): InboxMessage | null {
+  private pickBestUnread(
+    agentId: AgentId,
+    unread: InboxMessage[],
+    opts?: { resting?: boolean },
+  ): InboxMessage | null {
     const findMsg = (id: string, roomId?: string) =>
       this.ctx.societyRooms.findMessage(id, roomId as RoomId | undefined)
     const after = (roomId: string, sourceId: string) =>
       this.ctx.societyRooms.messagesAfter(roomId as RoomId, sourceId)
+    const resting = opts?.resting === true
 
     // Drop / mark-read stale room stimuli first
     const candidates: InboxMessage[] = []
@@ -737,6 +789,15 @@ export class SocietySchedulerService extends Service {
       ) {
         this.ctx.logger('society-scheduler').info(
           `stale-skip ${agentId} mail=${m.id.slice(0, 8)} (superseded room thread)`,
+        )
+        this.handledMessageIds.add(m.id)
+        this.ctx.societyMailbox.markRead(agentId, m.id)
+        continue
+      }
+      // Resting: skip agent↔agent DM and unmentioned non-human room mail
+      if (resting && !restWakeStimulus(m, agentId, findMsg)) {
+        this.ctx.logger('society-scheduler').info(
+          `rest-skip ${agentId} mail=${m.id.slice(0, 8)} kind=${m.kind} from=${m.from}`,
         )
         this.handledMessageIds.add(m.id)
         this.ctx.societyMailbox.markRead(agentId, m.id)
@@ -779,7 +840,12 @@ export class SocietySchedulerService extends Service {
       bodyPreview = result.acted
     }
 
-    if (result.acted === 'stay_silent' || result.acted === 'do_nothing' || result.acted === 'none') {
+    if (
+      result.acted === 'stay_silent' ||
+      result.acted === 'do_nothing' ||
+      result.acted === 'rest' ||
+      result.acted === 'none'
+    ) {
       const kind = result.acted === 'stay_silent' ? 'silent' : 'idle-skip'
       this.ctx.emit('society/agent-replied', {
         agentId,
@@ -789,6 +855,7 @@ export class SocietySchedulerService extends Service {
         stimulusId,
       })
       if (result.acted === 'stay_silent') return { action: 'silent', body: bodyPreview }
+      if (result.acted === 'rest') return { action: 'idle-none', body: bodyPreview || '[rest]' }
       return { action: 'idle-none', body: bodyPreview }
     }
 
@@ -922,6 +989,7 @@ export class SocietySchedulerService extends Service {
             !result.ok ||
             result.acted === 'stay_silent' ||
             result.acted === 'do_nothing' ||
+            result.acted === 'rest' ||
             result.acted === 'none'
           ) {
             schedWarn(
@@ -1028,6 +1096,24 @@ export class SocietySchedulerService extends Service {
 
     const findMsg = (id: string, roomId?: string) =>
       this.ctx.societyRooms.findMessage(id, roomId as RoomId | undefined)
+
+    // Rest gate: only human / @ / reply-to-me may proceed; clear snooze on wake
+    getRestUntil(agentId)
+    if (isAgentResting(agentId)) {
+      if (!restWakeStimulus(message, agentId, findMsg)) {
+        this.handledMessageIds.add(message.id)
+        this.ctx.societyMailbox.markRead(agentId, message.id)
+        this.ctx.logger('society-scheduler').info(
+          `rest-skip-unread ${agentId} mail=${message.id.slice(0, 8)}`,
+        )
+        return 'skip'
+      }
+      clearRest(agentId, mailFromHuman(message) ? 'human-wake' : 'mention-wake')
+      this.ctx.logger('society-scheduler').info(
+        `rest-wake ${agentId} via ${mailFromHuman(message) ? 'human' : 'mention'} mail=${message.id.slice(0, 8)}`,
+      )
+    }
+
     const mentionOrReply =
       mailMentionsAgent(message, agentId) || mailRepliesToAgent(message, agentId, findMsg)
 
@@ -1104,6 +1190,7 @@ export class SocietySchedulerService extends Service {
         !result.ok ||
         result.acted === 'stay_silent' ||
         result.acted === 'do_nothing' ||
+        result.acted === 'rest' ||
         result.acted === 'none'
       ) {
         this.ctx.logger('society-scheduler').info(
@@ -1153,6 +1240,8 @@ export class SocietySchedulerService extends Service {
     agentId: AgentId,
   ): Promise<{ action: TickResult['action']; body?: string }> {
     if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return { action: 'capped' }
+    getRestUntil(agentId)
+    if (isAgentResting(agentId)) return { action: 'skip' }
     const cool = await this.respectCooldowns(agentId)
     if (!cool) return { action: 'skip' }
     if (this.inFlight.has(agentId)) return { action: 'skip' }
@@ -1198,7 +1287,7 @@ export class SocietySchedulerService extends Service {
       if (room) this.ctx.societyTools.setDefaultRoom(room.id)
 
       const closingList =
-        '收束工具（必须调用恰好一个）：speak_in_room / send_dm / write_diary / write_thought / do_nothing'
+        '收束工具（必须调用恰好一个）：speak_in_room / send_dm / write_diary / write_thought / do_nothing / rest'
 
       let stimulus: string
       if (steerSearch) {
@@ -1227,6 +1316,7 @@ export class SocietySchedulerService extends Service {
           `send_dm：主动私信（to 为 agentId：${others.join(' / ') || '无'}）。`,
           'write_diary / write_thought：仅第一人称私密笔记（禁止 @、禁止「xxx在吗」、禁止群聊提问）。',
           'do_nothing：真的什么都不想做时才用（请少用）。',
+          'rest：说完晚安、想睡觉、或自觉不想再被心跳叫醒时调用（可带 reason / until / minutes）；比反复沉默更合适。',
           recent ? `广场近况：\n${recent}` : '广场尚安静——请优先 speak_in_room 打个招呼。',
           `社交权重约 ${socialPct}%：优先 speak_in_room/send_dm；日记有效但不应占主导。`,
           '禁止输出 ACTION: 行或抄工具菜单当聊天。',
@@ -1298,6 +1388,20 @@ export class SocietySchedulerService extends Service {
     if (this.inFlight.has(agentId)) return
     const findMsg = (id: string, roomId?: string) =>
       this.ctx.societyRooms.findMessage(id, roomId as RoomId | undefined)
+
+    getRestUntil(agentId)
+    if (isAgentResting(agentId)) {
+      if (!restWakeStimulus(message, agentId, findMsg)) {
+        this.handledMessageIds.add(message.id)
+        this.ctx.societyMailbox.markRead(agentId, message.id)
+        this.ctx.logger('society-scheduler').info(
+          `rest-skip-wake ${agentId} mail=${message.id.slice(0, 8)}`,
+        )
+        return
+      }
+      clearRest(agentId, mailFromHuman(message) ? 'human-wake' : 'mention-wake')
+    }
+
     const mentionOrReply =
       mailMentionsAgent(message, agentId) || mailRepliesToAgent(message, agentId, findMsg)
     if (this.lastReplyAgentId === agentId && !mentionOrReply) {
@@ -1381,6 +1485,7 @@ export class SocietySchedulerService extends Service {
         !result.ok ||
         result.acted === 'stay_silent' ||
         result.acted === 'do_nothing' ||
+        result.acted === 'rest' ||
         result.acted === 'none'
       ) {
         this.ctx.logger('society-scheduler').info(

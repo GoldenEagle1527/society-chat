@@ -10,7 +10,15 @@ import {
   looksLikeOutboundChatLine,
   classifyIdlePrivateBody,
   isChattyPrivateText,
+  clearRest,
+  isAgentResting,
+  readRest,
+  resolveRestUntil,
+  defaultRestUntil,
 } from '../plugins/society-tools/src/index.ts'
+import { agentDataDir } from './paths.ts'
+import fs from 'node:fs'
+import path from 'node:path'
 import { bootSociety } from './boot.ts'
 import { ensureSmokeAliceBob } from './smoke-fixtures.ts'
 import { loadDotEnv } from './env.ts'
@@ -116,6 +124,52 @@ async function main() {
   const noop = await ctx.societyTools.execute('bob', 'do_nothing', '{}')
   assert.equal(JSON.parse(noop).acted, 'do_nothing')
 
+  assert.ok(isClosingToolName('rest'))
+  assert.ok(IDLE_CLOSING_TOOL_NAMES.includes('rest'))
+  assert.ok(REPLY_CLOSING_TOOL_NAMES.includes('rest'))
+  assert.ok(idleNames.includes('rest'), `idle missing rest: ${idleNames.join(',')}`)
+  assert.ok(replyNames.includes('rest'), `reply missing rest: ${replyNames.join(',')}`)
+
+  // resolveRestUntil: minutes / morning / default
+  const byMin = resolveRestUntil({ minutes: 30 }, Date.parse('2026-10-10T12:00:00+08:00'))
+  assert.equal(byMin.mode, 'minutes')
+  assert.ok(byMin.until.getTime() - Date.parse('2026-10-10T12:00:00+08:00') === 30 * 60_000)
+
+  const byMorning = resolveRestUntil({ until: 'morning' }, Date.parse('2026-10-10T22:00:00+08:00'))
+  assert.equal(byMorning.mode, 'morning')
+  // next Beijing 07:00 after 22:00 is next calendar morning
+  assert.ok(byMorning.until.toISOString().includes('T23:00:00.000Z') || byMorning.until.getUTCHours() === 23)
+
+  const def = defaultRestUntil(Date.parse('2026-10-10T22:00:00+08:00'))
+  assert.ok(def.getTime() > Date.parse('2026-10-10T22:00:00+08:00'))
+
+  clearRest('bob')
+  const rested = await ctx.societyTools.execute(
+    'bob',
+    'rest',
+    JSON.stringify({ minutes: 45, reason: '晚安测试' }),
+  )
+  const restObj = JSON.parse(rested) as {
+    ok: boolean
+    acted: string
+    until: string
+    mode: string
+    reason?: string
+  }
+  assert.equal(restObj.ok, true)
+  assert.equal(restObj.acted, 'rest')
+  assert.equal(restObj.mode, 'minutes')
+  assert.equal(restObj.reason, '晚安测试')
+  assert.ok(isAgentResting('bob'))
+  const restFile = path.join(agentDataDir('bob'), 'rest.json')
+  assert.ok(fs.existsSync(restFile), 'rest.json should persist')
+  const stored = readRest('bob')
+  assert.ok(stored)
+  assert.equal(stored!.reason, '晚安测试')
+  clearRest('bob')
+  assert.equal(isAgentResting('bob'), false)
+  console.log('✓ rest closing tool persists snooze; clearRest wakes')
+
   // Subjective soul: no auto heuristic on room post; only reflect_feelings
   const bobBefore = { ...ctx.societySoul.get('bob') }
   ctx.societyRooms.post({
@@ -163,6 +217,7 @@ async function main() {
   assert.ok(!/ACTION:ROOM/.test(sys))
   assert.ok(!/ACTION:SILENT/.test(sys))
   assert.ok(/speak_in_room/.test(sys) || /收束工具/.test(sys))
+  assert.ok(/\brest\b/.test(sys), 'system prompt must mention rest')
   assert.ok(/reflect_feelings/.test(sys), 'system prompt must mention reflect_feelings')
   assert.ok(/主观/.test(sys) || /reflect_feelings/.test(sys))
   assert.ok(/当前北京时间：\d{4}-\d{2}-\d{2}/.test(sys), 'system prompt must include Beijing date')
