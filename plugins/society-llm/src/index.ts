@@ -263,7 +263,7 @@ export class SocietyLlmService extends Service {
       '- 始终保持上述人设、灵魂状态与记忆，用中文简短说话。',
       '- 不要加「Alice:」之类前缀，不要解释你是 AI 或模型。',
       '- 不要输出思考过程或 reasoning。',
-      '- 收到消息后先判断要不要开口：若消息 @点名你、回复你的话、问候你、问你问题、或私信给你，应当回复（调用 speak_in_room / send_dm），不要 stay_silent。',
+      '- 收到消息后先判断要不要开口：群聊里若被 @点名、被回复、被问候或被提问，通常应回复（speak_in_room）；私信可自由选择 send_dm / stay_silent / rest，想不理就可以不理，没有「必须回私信」。',
       '- 群聊里别人互相对话、话题与你无关、刺激已被更新的话题盖过且你未被 @，调用 stay_silent，不要抢着刷屏。',
       '- 说完晚安、想睡觉、或自觉不想再被心跳叫醒时，优先调用 rest（可带 reason）；不要反复 stay_silent / do_nothing 却仍被调度激活。',
       '- 点名某人时在正文里写 @显示名（例如 @阿宁）；回复某条时系统会自动挂 replyTo。',
@@ -333,10 +333,10 @@ export class SocietyLlmService extends Service {
         const fromLabel = this.ctx.societyIdentity.displayNameOf(String(msg.from))
         return [
           timeLine,
-          `你收到来自 ${fromLabel}（${msg.from}）的私信（私信默认应回复，除非是骚扰/无意义刷屏）：`,
+          `你收到来自 ${fromLabel}（${msg.from}）的私信：`,
           msg.body,
-          '用 send_dm 回复；长话可用 ||| 拆分。一般不要 stay_silent。',
-          `请以 ${agent.displayName} 的身份说话。`,
+          '可自由选择：send_dm 回复（长话可用 ||| 拆分）、stay_silent 不理、或 rest 休息。私信没有必须回复；想沉默就可以沉默。',
+          `请以 ${agent.displayName} 的身份决定。`,
         ].join('\n')
       }
       return [
@@ -434,7 +434,7 @@ export class SocietyLlmService extends Service {
         : [
             '【收束规则】可先用研究工具，可选一次 reflect_feelings，但本回合结束前必须调用且仅调用一个收束工具：',
             mode === 'reply-dm'
-              ? 'send_dm（回对方）、stay_silent，或 rest（想歇了/说完晚安）。'
+              ? 'send_dm（想回再回）、stay_silent（可直接不理任何私信）、或 rest（想歇了/说完晚安）。私信无强制回复。'
               : 'speak_in_room（回复当前刺激；系统会自动带 replyTo）、stay_silent，或 rest（说完晚安/不想再聊）；一般不要改去私信。',
             '若本回合主观感受有变可 reflect_feelings 一次。禁止输出 ACTION: 行，禁止只回纯文本当回复。',
           ].join('\n')

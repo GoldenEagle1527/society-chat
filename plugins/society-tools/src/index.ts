@@ -290,7 +290,7 @@ const CLOSING_TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: 'stay_silent',
       description:
-        'Choose NOT to reply to the current room/DM stimulus (when topic moved on, others talking among themselves, and you were not @mentioned).',
+        'Choose NOT to reply to the current room/DM stimulus. Freely allowed for any DM (ignore whenever you want). For rooms: when topic moved on, others talking among themselves, or you were not @mentioned.',
       parameters: {
         type: 'object',
         properties: {
