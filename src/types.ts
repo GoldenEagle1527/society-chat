@@ -15,7 +15,7 @@ export interface SoulState {
   notes?: string
 }
 
-export type LlmProviderId = 'agnes' | 'glm'
+export type LlmProviderId = 'agnes' | 'glm' | 'siliconflow'
 
 /** Per-agent chat provider preference (also stored as data/agents/<id>/llm.json). */
 export interface AgentLlmPreference {

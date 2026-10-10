@@ -409,7 +409,7 @@
         <h3>模型路由</h3>
         <div class="tg-profile-row"><span>通道</span><span>${esc(a.llmProvider || '—')}</span></div>
         <div class="tg-profile-row"><span>模型</span><span>${esc(a.llmModel || '—')}</span></div>
-        <div class="tg-profile-row"><span>今日调用</span><span>${esc(a.llmCallsToday)}</span></div>
+        <div class="tg-profile-row"><span>今日调用</span><span>${esc(a.llmCallsToday)}（仅统计）</span></div>
       </div>
       <div class="tg-profile-card">
         <h3>更新</h3>
@@ -663,7 +663,7 @@
         <h3>运行上限</h3>
         <div class="tg-settings-row"><span>并行回复</span><span>${esc(s.maxParallelReplies)}</span></div>
         <div class="tg-settings-row"><span>最大 exchanges</span><span>${esc(s.maxExchanges)}</span></div>
-        <div class="tg-settings-row"><span>每日 LLM 预算</span><span>${esc(s.dailyLlmBudget)}</span></div>
+        <div class="tg-settings-row"><span>每日 LLM 预算</span><span>无上限（免费模型）</span></div>
         <div class="tg-settings-row"><span>Agent 上限</span><span>${esc(s.maxAgents)}</span></div>
         <div class="tg-settings-row"><span>心跳间隔</span><span>${esc(s.tickMs)} ms</span></div>
       </div>

@@ -11,6 +11,7 @@ import {
   configuredFreeProviders,
   defaultFreeModelFor,
   loadDotEnv,
+  normalizeProviderId,
   societyEnvInt,
   type LlmProviderId,
 } from '../../../src/env.ts'
@@ -62,22 +63,23 @@ export function pickBalancedLlm(existing: AgentLlmPreference[]): AgentLlmPrefere
     const p = pool[0]!
     return { provider: p, model: defaultFreeModelFor(p) }
   }
-  const counts: Record<LlmProviderId, number> = { agnes: 0, glm: 0 }
+  const counts: Record<LlmProviderId, number> = { agnes: 0, glm: 0, siliconflow: 0 }
   for (const pref of existing) {
-    if (pref.provider === 'glm') counts.glm += 1
-    else counts.agnes += 1
+    const p = normalizeProviderId(pref.provider)
+    counts[p] = (counts[p] ?? 0) + 1
   }
   // Prefer fewer agents on that provider
   let best = pool[0]!
   for (const p of pool) {
-    if (counts[p] < counts[best]) best = p
+    if ((counts[p] ?? 0) < (counts[best] ?? 0)) best = p
   }
-  // Tie-break: opposite of the most recently listed agent (spreads consecutive spawns)
-  const tied = pool.filter((p) => counts[p] === counts[best])
+  // Tie-break: rotate after the most recently listed agent (spreads consecutive spawns)
+  const tied = pool.filter((p) => (counts[p] ?? 0) === (counts[best] ?? 0))
   if (tied.length > 1 && existing.length > 0) {
-    const last = existing[existing.length - 1]!
-    const opposite: LlmProviderId = last.provider === 'glm' ? 'agnes' : 'glm'
-    if (tied.includes(opposite)) best = opposite
+    const last = normalizeProviderId(existing[existing.length - 1]!.provider)
+    const lastIdx = pool.indexOf(last)
+    const next = pool[(lastIdx >= 0 ? lastIdx + 1 : 0) % pool.length]!
+    if (tied.includes(next)) best = next
   }
   return { provider: best, model: defaultFreeModelFor(best) }
 }
@@ -87,7 +89,7 @@ function writeLlmPreference(agentId: string, pref: AgentLlmPreference): void {
   fs.mkdirSync(dataDir, { recursive: true })
   const file = path.join(dataDir, 'llm.json')
   const payload: AgentLlmPreference = {
-    provider: pref.provider === 'glm' ? 'glm' : 'agnes',
+    provider: normalizeProviderId(pref.provider),
     ...(pref.model ? { model: String(pref.model).trim() } : {}),
   }
   fs.writeFileSync(file, JSON.stringify(payload, null, 2) + '\n', 'utf8')
@@ -209,7 +211,7 @@ export class SocietyIdentityService extends Service {
     }
     if (input.llm) {
       profile.llm = {
-        provider: input.llm.provider === 'glm' ? 'glm' : 'agnes',
+        provider: normalizeProviderId(input.llm.provider),
         ...(input.llm.model ? { model: String(input.llm.model).trim() } : {}),
       }
     }
@@ -282,7 +284,7 @@ export class SocietyIdentityService extends Service {
     if (fs.existsSync(llmPath)) {
       try {
         const raw = JSON.parse(fs.readFileSync(llmPath, 'utf8')) as AgentLlmPreference
-        const provider = raw.provider === 'glm' ? 'glm' : 'agnes'
+        const provider = normalizeProviderId(raw.provider)
         return {
           provider,
           ...(raw.model ? { model: String(raw.model).trim() } : {}),
@@ -294,7 +296,7 @@ export class SocietyIdentityService extends Service {
     const profile = this.agents.get(agentId)
     if (profile?.llm?.provider) {
       return {
-        provider: profile.llm.provider === 'glm' ? 'glm' : 'agnes',
+        provider: normalizeProviderId(profile.llm.provider),
         ...(profile.llm.model ? { model: String(profile.llm.model).trim() } : {}),
       }
     }
@@ -304,7 +306,7 @@ export class SocietyIdentityService extends Service {
   setLlmPreference(agentId: AgentId, pref: AgentLlmPreference): AgentLlmPreference {
     this.require(agentId)
     const normalized: AgentLlmPreference = {
-      provider: pref.provider === 'glm' ? 'glm' : 'agnes',
+      provider: normalizeProviderId(pref.provider),
       ...(pref.model ? { model: String(pref.model).trim() } : {}),
     }
     writeLlmPreference(agentId, normalized)
@@ -373,7 +375,7 @@ export class SocietyIdentityService extends Service {
           ...(raw.llm?.provider
             ? {
                 llm: {
-                  provider: raw.llm.provider === 'glm' ? 'glm' : 'agnes',
+                  provider: normalizeProviderId(raw.llm.provider),
                   ...(raw.llm.model ? { model: String(raw.llm.model).trim() } : {}),
                 },
               }

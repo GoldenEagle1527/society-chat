@@ -5,15 +5,20 @@
  * Defaults: Alice/Carol → Agnes free flash; Bob → GLM glm-4-flash.
  * Image gen stays Agnes-only (society-tools).
  * Never logs API keys.
+ *
+ * Retries: 429 → 15s; other errors → 30s; max 10 attempts.
+ * Turns: optional silence + multi-bubble (||| / JSON).
  */
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { AgentId, InboxMessage } from '../../../src/types.ts'
 import {
+  normalizeProviderId,
   providerModelLabel,
   requireProviderConfig,
   type LlmEndpointConfig,
   type LlmProviderId,
 } from '../../../src/env.ts'
+import { LlmHttpError, withLlmRetries } from '../../../src/llm-http.ts'
 import type { ToolDefinition } from '../../society-tools/src/index.ts'
 
 declare module '@deepseek-ai/cordis' {
@@ -39,6 +44,12 @@ export interface ChatMessage {
   name?: string
 }
 
+export interface AgentTurn {
+  silent: boolean
+  bubbles: string[]
+  raw: string
+}
+
 interface OpenAiToolCall {
   id: string
   type: 'function'
@@ -58,6 +69,131 @@ interface OpenAiChatResponse {
 }
 
 const MAX_TOOL_ROUNDS = 3
+const MAX_BUBBLES = 5
+const MAX_BUBBLE_CHARS = 2000
+
+/** Parse model output into silence vs one-or-more chat bubbles. Exported for smokes. */
+export function parseAgentTurn(raw: string): AgentTurn {
+  const text = (raw ?? '').trim()
+  if (!text) return { silent: true, bubbles: [], raw: text }
+
+  const fromJson = tryParseJsonTurn(text)
+  if (fromJson) return { ...fromJson, raw: text }
+
+  const lines = text.split(/\r?\n/)
+  let action: 'silent' | 'reply' | null = null
+  let cut = lines.length
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!.trim()
+    if (/^ACTION:\s*SILENT\s*$/i.test(line)) {
+      action = 'silent'
+      cut = i
+      break
+    }
+    if (/^ACTION:\s*REPLY\s*$/i.test(line)) {
+      action = 'reply'
+      cut = i
+      break
+    }
+  }
+
+  if (action === 'silent') {
+    return { silent: true, bubbles: [], raw: text }
+  }
+
+  let body = (action ? lines.slice(0, cut).join('\n') : text).trim()
+  // Strip a lone ACTION:SILENT if model put it mid-body as only content
+  if (/^ACTION:\s*SILENT\s*$/i.test(body)) {
+    return { silent: true, bubbles: [], raw: text }
+  }
+
+  const bubbles = splitBubbles(body)
+  if (bubbles.length === 0) return { silent: true, bubbles: [], raw: text }
+  return { silent: false, bubbles, raw: text }
+}
+
+function tryParseJsonTurn(text: string): Omit<AgentTurn, 'raw'> | null {
+  let candidate = text.trim()
+  const fence = candidate.match(/```(?:json)?\s*([\s\S]*?)```/i)
+  if (fence) candidate = fence[1]!.trim()
+
+  // Prefer object or array slice
+  const objStart = candidate.indexOf('{')
+  const arrStart = candidate.indexOf('[')
+  let slice: string | null = null
+  if (objStart >= 0 && (arrStart < 0 || objStart < arrStart)) {
+    const end = candidate.lastIndexOf('}')
+    if (end > objStart) slice = candidate.slice(objStart, end + 1)
+  } else if (arrStart >= 0) {
+    const end = candidate.lastIndexOf(']')
+    if (end > arrStart) slice = candidate.slice(arrStart, end + 1)
+  }
+  if (!slice) return null
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(slice)
+  } catch {
+    return null
+  }
+
+  if (Array.isArray(parsed)) {
+    const bubbles = parsed
+      .map((x) => String(x ?? '').trim())
+      .filter(Boolean)
+      .slice(0, MAX_BUBBLES)
+      .map((b) => b.slice(0, MAX_BUBBLE_CHARS))
+    if (bubbles.length === 0) return { silent: true, bubbles: [] }
+    return { silent: false, bubbles }
+  }
+
+  if (parsed && typeof parsed === 'object') {
+    const o = parsed as Record<string, unknown>
+    if (o.reply === false || o.silent === true) {
+      return { silent: true, bubbles: [] }
+    }
+    if (Array.isArray(o.bubbles)) {
+      const bubbles = o.bubbles
+        .map((x) => String(x ?? '').trim())
+        .filter(Boolean)
+        .slice(0, MAX_BUBBLES)
+        .map((b) => b.slice(0, MAX_BUBBLE_CHARS))
+      if (bubbles.length === 0) return { silent: true, bubbles: [] }
+      return { silent: false, bubbles }
+    }
+    if (typeof o.text === 'string' && o.text.trim()) {
+      return { silent: false, bubbles: splitBubbles(o.text.trim()) }
+    }
+    if (o.reply === true && typeof o.body === 'string') {
+      return { silent: false, bubbles: splitBubbles(o.body.trim()) }
+    }
+  }
+  return null
+}
+
+function splitBubbles(body: string): string[] {
+  const trimmed = body.trim()
+  if (!trimmed) return []
+  if (trimmed.includes('|||')) {
+    return trimmed
+      .split('|||')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, MAX_BUBBLES)
+      .map((b) => b.slice(0, MAX_BUBBLE_CHARS))
+  }
+  // Numbered parts: "1. ...\n2. ..." only when ≥2 clear numbered lines
+  const numbered = trimmed.match(/^\s*\d+[.)、]\s+.+/gm)
+  if (numbered && numbered.length >= 2) {
+    const parts = numbered
+      .map((line) => line.replace(/^\s*\d+[.)、]\s+/, '').trim())
+      .filter(Boolean)
+      .slice(0, MAX_BUBBLES)
+      .map((b) => b.slice(0, MAX_BUBBLE_CHARS))
+    if (parts.length >= 2) return parts
+  }
+  return [trimmed.slice(0, MAX_BUBBLE_CHARS)]
+}
 
 export class SocietyLlmService extends Service {
   static inject = ['societyIdentity', 'societyMemory', 'societySoul', 'societyTools']
@@ -69,7 +205,7 @@ export class SocietyLlmService extends Service {
   /** Resolve endpoint for this agent (llm.json / profile / defaults). Never logs keys. */
   resolveConfig(agentId: AgentId): LlmEndpointConfig {
     const pref = this.ctx.societyIdentity.getLlmPreference(agentId)
-    const provider: LlmProviderId = pref.provider === 'glm' ? 'glm' : 'agnes'
+    const provider: LlmProviderId = normalizeProviderId(pref.provider)
     return requireProviderConfig(provider, pref.model)
   }
 
@@ -89,9 +225,13 @@ export class SocietyLlmService extends Service {
       soulSection,
       memorySection,
       '规则：',
-      '- 始终保持上述人设、灵魂状态与记忆，用中文简短回复（通常 1～3 句）。',
-      '- 只输出你要对对方说的正文，不要加「Alice:」之类前缀，不要解释你是 AI 或模型。',
+      '- 始终保持上述人设、灵魂状态与记忆，用中文简短说话。',
+      '- 不要加「Alice:」之类前缀，不要解释你是 AI 或模型。',
       '- 不要输出思考过程或 reasoning。',
+      '- 收到消息后先判断要不要开口：若消息在点名你、问候你、问你问题、或私信给你，应当回复，不要 SILENT。',
+      '- 群聊里别人互相对话、话题与你无关、或已有充分回应时，可只输出一行 ACTION:SILENT（或 JSON {"reply":false}），不要抢着刷屏。',
+      '- 若要回复：可把长话拆成 2～4 条短气泡，用 ||| 分隔；或输出 JSON {"reply":true,"bubbles":["第一句","第二句"]}；也可在最后一行写 ACTION:REPLY。',
+      '- 单条气泡尽量一两句；整轮最多约 4 条气泡。',
     ]
     if (withTools) {
       lines.push(
@@ -100,7 +240,7 @@ export class SocietyLlmService extends Service {
         '- 只有对方明确要求生图时才调用 generate_image；不要主动刷图。',
         '- 需要落盘时用 write_file；路径必须是相对路径，禁止 .. 与绝对路径。',
         '- run_command 在沙箱内执行，默认无网络；argv[0] 必须是 /bin/ 或 /usr/bin/ 下的绝对路径。',
-        '- 工具调用结束后，用简短中文向对方说明结果（例如文件名），不要粘贴大段工具原始输出。',
+        '- 工具调用结束后，用简短中文向对方说明结果（例如文件名），不要粘贴大段工具原始输出；仍可用 ||| 拆多气泡，或 ACTION:SILENT。',
       )
     }
     return lines.join('\n')
@@ -109,25 +249,30 @@ export class SocietyLlmService extends Service {
   buildUserPrompt(agentId: AgentId, stimulus: ReplyStimulus): string {
     const agent = this.ctx.societyIdentity.require(agentId)
     const msg = stimulus.message
+    const decideHint =
+      '先决定要不要回：若对方在问候/点名/问你，必须回复；仅当与你无关或无需插话时才输出 ACTION:SILENT。要回则用短气泡（可用 ||| 拆分）。'
     if (msg) {
       if (msg.kind === 'room' && msg.roomId) {
         const roomLabel = stimulus.roomName ? `「${stimulus.roomName}」` : ''
         return [
           `你在群聊${roomLabel}中收到一条消息。`,
           `原始投递：${msg.body}`,
-          `请以 ${agent.displayName} 的身份回复这条群消息。`,
+          decideHint,
+          `若开口，请以 ${agent.displayName} 的身份说话。`,
         ].join('\n')
       }
       if (msg.kind === 'direct') {
         return [
-          `你收到来自 ${msg.from} 的私信：`,
+          `你收到来自 ${msg.from} 的私信（私信默认应回复，除非是骚扰/无意义刷屏）：`,
           msg.body,
-          `请以 ${agent.displayName} 的身份回复这条私信。`,
+          '用短气泡回复；长话可用 ||| 拆分。一般不要 SILENT。',
+          `请以 ${agent.displayName} 的身份说话。`,
         ].join('\n')
       }
       return [
         `系统通知：${msg.body}`,
-        `请以 ${agent.displayName} 的身份作出简短回应（如无需回应可回复「好的」）。`,
+        decideHint,
+        `若开口，请以 ${agent.displayName} 的身份作简短回应。`,
       ].join('\n')
     }
     const text = stimulus.text?.trim()
@@ -153,11 +298,24 @@ export class SocietyLlmService extends Service {
     return cleaned
   }
 
+  /** Same as replyAsAgent but parsed into silence / bubbles. */
+  async replyTurnAsAgent(agentId: AgentId, stimulus: ReplyStimulus): Promise<AgentTurn> {
+    const raw = await this.replyAsAgent(agentId, stimulus)
+    return parseAgentTurn(raw)
+  }
+
   /**
    * Agent turn with OpenAI tool calling (bound to this agentId's workspace).
-   * Max MAX_TOOL_ROUNDS tool rounds; final assistant text is the room/DM reply.
+   * Max MAX_TOOL_ROUNDS tool rounds; final assistant text is the room/DM reply body.
    */
   async actAsAgent(agentId: AgentId, stimulus: ReplyStimulus): Promise<string> {
+    const turn = await this.actTurnAsAgent(agentId, stimulus)
+    if (turn.silent) return 'ACTION:SILENT'
+    return turn.raw
+  }
+
+  /** Tool-capable turn returning parsed silence / bubbles. */
+  async actTurnAsAgent(agentId: AgentId, stimulus: ReplyStimulus): Promise<AgentTurn> {
     this.ctx.societyIdentity.require(agentId)
     const cfg = this.resolveConfig(agentId)
     this.ctx.logger('society-llm').info(`chat ${agentId} ${providerModelLabel(cfg)} (tools)`)
@@ -204,15 +362,16 @@ export class SocietyLlmService extends Service {
         if (round < MAX_TOOL_ROUNDS) {
           messages.push({
             role: 'user',
-            content: '请根据工具结果，用中文简短回复对方（不要再调用工具）。',
+            content:
+              '请根据工具结果决定：不回则 ACTION:SILENT；要回则用中文短气泡（可用 |||），不要再调用工具。',
           })
           const final = await this.chatCompletions(messages, cfg, { tools: false })
           const text = (final.content ?? '').trim()
-          if (text) return text
+          if (text) return parseAgentTurn(text)
         }
         throw new Error(`Empty LLM content for agent ${agentId} after tool loop`)
       }
-      return cleaned
+      return parseAgentTurn(cleaned)
     }
 
     throw new Error(`actAsAgent exceeded tool rounds for ${agentId}`)
@@ -223,42 +382,68 @@ export class SocietyLlmService extends Service {
     cfg: LlmEndpointConfig,
     opts: { tools: boolean; toolDefs?: ToolDefinition[] },
   ): Promise<{ content: string | null; tool_calls?: OpenAiToolCall[] }> {
+    const log = (msg: string) => this.ctx.logger('society-llm').warn(msg)
+    return withLlmRetries(
+      `${cfg.provider} chat/completions`,
+      () => this.chatCompletionsOnce(messages, cfg, opts),
+      log,
+    )
+  }
+
+  private async chatCompletionsOnce(
+    messages: ChatMessage[],
+    cfg: LlmEndpointConfig,
+    opts: { tools: boolean; toolDefs?: ToolDefinition[] },
+  ): Promise<{ content: string | null; tool_calls?: OpenAiToolCall[] }> {
     const url = `${cfg.baseUrl}/chat/completions`
     const body: Record<string, unknown> = {
       model: cfg.model,
       messages,
       temperature: 0.7,
-      max_tokens: 1024,
+      max_tokens: 1536,
     }
     if (opts.tools && opts.toolDefs?.length) {
       body.tools = opts.toolDefs
       body.tool_choice = 'auto'
     }
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${cfg.apiKey}`,
-      },
-      body: JSON.stringify(body),
-    })
+    let res: Response
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${cfg.apiKey}`,
+        },
+        body: JSON.stringify(body),
+      })
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      throw new LlmHttpError(cfg.provider, 0, `${cfg.provider} network error: ${msg}`)
+    }
 
     const raw = await res.text()
     let data: OpenAiChatResponse
     try {
       data = JSON.parse(raw) as OpenAiChatResponse
     } catch {
-      throw new Error(`${cfg.provider} API returned non-JSON (HTTP ${res.status})`)
+      throw new LlmHttpError(
+        cfg.provider,
+        res.status,
+        `${cfg.provider} API returned non-JSON (HTTP ${res.status})`,
+      )
     }
 
     if (!res.ok) {
       const msg = data.error?.message || `HTTP ${res.status}`
-      throw new Error(`${cfg.provider} chat/completions failed: ${msg}`)
+      throw new LlmHttpError(
+        cfg.provider,
+        res.status,
+        `${cfg.provider} chat/completions failed: ${msg}`,
+      )
     }
 
     const choice = data.choices?.[0]?.message
-    // Normalize tool_calls (some providers omit type)
     let tool_calls = choice?.tool_calls?.length ? choice.tool_calls : undefined
     if (tool_calls) {
       tool_calls = tool_calls.map((tc, i) => ({
@@ -277,7 +462,9 @@ export class SocietyLlmService extends Service {
     if (!tool_calls?.length) {
       const trimmed = (content ?? '').trim()
       if (!trimmed) {
-        throw new Error(
+        throw new LlmHttpError(
+          cfg.provider,
+          res.status,
           `${cfg.provider} response missing message.content (reasoning_content ignored)`,
         )
       }

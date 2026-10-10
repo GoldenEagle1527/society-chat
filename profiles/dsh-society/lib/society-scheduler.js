@@ -2,7 +2,124 @@
 
 
 // plugins/society-scheduler/src/index.ts
+import { Service as Service2 } from "@deepseek-ai/cordis";
+
+// src/paths.ts
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+var here = path.dirname(fileURLToPath(import.meta.url));
+var PROJECT_ROOT = path.resolve(
+  process.env.SOCIETY_PROJECT_ROOT?.trim() || path.resolve(here, "..")
+);
+var DATA_ROOT = path.join(PROJECT_ROOT, "data");
+var AGENTS_DATA_ROOT = path.join(DATA_ROOT, "agents");
+var AGENTS_SEED_ROOT = path.join(PROJECT_ROOT, "agents");
+var SOCIETY_STATE_ROOT = path.join(DATA_ROOT, "society");
+var ROOMS_STATE_FILE = path.join(SOCIETY_STATE_ROOT, "rooms.json");
+var MESSAGES_STATE_FILE = path.join(SOCIETY_STATE_ROOT, "messages.jsonl");
+var DM_THREADS_STATE_FILE = path.join(SOCIETY_STATE_ROOT, "dm-threads.json");
+
+// src/llm-http.ts
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// plugins/society-llm/src/index.ts
 import { Service } from "@deepseek-ai/cordis";
+var MAX_BUBBLES = 5;
+var MAX_BUBBLE_CHARS = 2e3;
+function parseAgentTurn(raw) {
+  const text = (raw ?? "").trim();
+  if (!text) return { silent: true, bubbles: [], raw: text };
+  const fromJson = tryParseJsonTurn(text);
+  if (fromJson) return { ...fromJson, raw: text };
+  const lines = text.split(/\r?\n/);
+  let action = null;
+  let cut = lines.length;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (/^ACTION:\s*SILENT\s*$/i.test(line)) {
+      action = "silent";
+      cut = i;
+      break;
+    }
+    if (/^ACTION:\s*REPLY\s*$/i.test(line)) {
+      action = "reply";
+      cut = i;
+      break;
+    }
+  }
+  if (action === "silent") {
+    return { silent: true, bubbles: [], raw: text };
+  }
+  let body = (action ? lines.slice(0, cut).join("\n") : text).trim();
+  if (/^ACTION:\s*SILENT\s*$/i.test(body)) {
+    return { silent: true, bubbles: [], raw: text };
+  }
+  const bubbles = splitBubbles(body);
+  if (bubbles.length === 0) return { silent: true, bubbles: [], raw: text };
+  return { silent: false, bubbles, raw: text };
+}
+function tryParseJsonTurn(text) {
+  let candidate = text.trim();
+  const fence = candidate.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) candidate = fence[1].trim();
+  const objStart = candidate.indexOf("{");
+  const arrStart = candidate.indexOf("[");
+  let slice = null;
+  if (objStart >= 0 && (arrStart < 0 || objStart < arrStart)) {
+    const end = candidate.lastIndexOf("}");
+    if (end > objStart) slice = candidate.slice(objStart, end + 1);
+  } else if (arrStart >= 0) {
+    const end = candidate.lastIndexOf("]");
+    if (end > arrStart) slice = candidate.slice(arrStart, end + 1);
+  }
+  if (!slice) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(slice);
+  } catch {
+    return null;
+  }
+  if (Array.isArray(parsed)) {
+    const bubbles = parsed.map((x) => String(x ?? "").trim()).filter(Boolean).slice(0, MAX_BUBBLES).map((b) => b.slice(0, MAX_BUBBLE_CHARS));
+    if (bubbles.length === 0) return { silent: true, bubbles: [] };
+    return { silent: false, bubbles };
+  }
+  if (parsed && typeof parsed === "object") {
+    const o = parsed;
+    if (o.reply === false || o.silent === true) {
+      return { silent: true, bubbles: [] };
+    }
+    if (Array.isArray(o.bubbles)) {
+      const bubbles = o.bubbles.map((x) => String(x ?? "").trim()).filter(Boolean).slice(0, MAX_BUBBLES).map((b) => b.slice(0, MAX_BUBBLE_CHARS));
+      if (bubbles.length === 0) return { silent: true, bubbles: [] };
+      return { silent: false, bubbles };
+    }
+    if (typeof o.text === "string" && o.text.trim()) {
+      return { silent: false, bubbles: splitBubbles(o.text.trim()) };
+    }
+    if (o.reply === true && typeof o.body === "string") {
+      return { silent: false, bubbles: splitBubbles(o.body.trim()) };
+    }
+  }
+  return null;
+}
+function splitBubbles(body) {
+  const trimmed = body.trim();
+  if (!trimmed) return [];
+  if (trimmed.includes("|||")) {
+    return trimmed.split("|||").map((s) => s.trim()).filter(Boolean).slice(0, MAX_BUBBLES).map((b) => b.slice(0, MAX_BUBBLE_CHARS));
+  }
+  const numbered = trimmed.match(/^\s*\d+[.)、]\s+.+/gm);
+  if (numbered && numbered.length >= 2) {
+    const parts = numbered.map((line) => line.replace(/^\s*\d+[.)、]\s+/, "").trim()).filter(Boolean).slice(0, MAX_BUBBLES).map((b) => b.slice(0, MAX_BUBBLE_CHARS));
+    if (parts.length >= 2) return parts;
+  }
+  return [trimmed.slice(0, MAX_BUBBLE_CHARS)];
+}
+
+// plugins/society-scheduler/src/index.ts
 function envInt(name2, fallback) {
   const raw = process.env[name2]?.trim();
   if (raw && /^\d+$/.test(raw)) return Math.max(0, parseInt(raw, 10));
@@ -41,7 +158,7 @@ function parseIdleAction(raw) {
   }
   return { body, act: "none" };
 }
-var SocietySchedulerService = class extends Service {
+var SocietySchedulerService = class extends Service2 {
   static inject = [
     "societyIdentity",
     "societyMailbox",
@@ -60,7 +177,7 @@ var SocietySchedulerService = class extends Service {
   cooldownMs = 50;
   agentCooldownMs = 0;
   idleStaleMs = 3e3;
-  dailyLlmBudget = 40;
+  bubbleGapMs = 400;
   maxParallelReplies = 2;
   defaultRoomId = null;
   exchangeCount = 0;
@@ -147,7 +264,7 @@ var SocietySchedulerService = class extends Service {
     this.cooldownMs = opts?.cooldownMs ?? 50;
     this.agentCooldownMs = opts?.agentCooldownMs ?? envInt("SOCIETY_AGENT_COOLDOWN_MS", 0);
     this.idleStaleMs = opts?.idleStaleMs ?? envInt("SOCIETY_IDLE_STALE_MS", 3e3);
-    this.dailyLlmBudget = opts?.dailyLlmBudget ?? envInt("SOCIETY_DAILY_LLM_BUDGET", 40);
+    this.bubbleGapMs = opts?.bubbleGapMs ?? envInt("SOCIETY_BUBBLE_GAP_MS", 400);
     const parallelRaw = opts?.maxParallelReplies ?? envInt("SOCIETY_MAX_PARALLEL_REPLIES", 2);
     this.maxParallelReplies = Math.max(1, Math.min(8, parallelRaw || 1));
     if (opts?.defaultRoomId) this.defaultRoomId = opts.defaultRoomId;
@@ -181,10 +298,6 @@ var SocietySchedulerService = class extends Service {
     if (this.onlyAgents && !this.onlyAgents.has(agentId)) return false;
     return true;
   }
-  budgetOk(agentId) {
-    const calls = this.ctx.societyMemory.getLlmCallsToday(agentId);
-    return calls < this.dailyLlmBudget;
-  }
   async respectCooldowns(agentId) {
     const now = Date.now();
     const sinceGlobal = now - this.lastExchangeAt;
@@ -201,7 +314,6 @@ var SocietySchedulerService = class extends Service {
   scoreAgent(agentId) {
     if (!this.agentAllowed(agentId)) return -1;
     if (this.inFlight.has(agentId)) return -1;
-    if (!this.budgetOk(agentId)) return -1;
     const now = Date.now();
     const lastAct = this.lastActAt.get(agentId) ?? 0;
     if (lastAct > 0 && now - lastAct < this.agentCooldownMs) return -1;
@@ -298,8 +410,8 @@ var SocietySchedulerService = class extends Service {
     const unread = this.ctx.societyMailbox.list(agentId, { unreadOnly: true });
     if (unread.length > 0) {
       const msg = unread[0];
-      const ok = await this.processUnread(agentId, msg);
-      return { action: ok ? "reply" : "skip", agentId, provider };
+      const outcome = await this.processUnread(agentId, msg);
+      return { action: outcome, agentId, provider };
     }
     const lastAct = this.lastActAt.get(agentId) ?? 0;
     const stale = lastAct === 0 ? Number.POSITIVE_INFINITY : Date.now() - lastAct;
@@ -312,76 +424,112 @@ var SocietySchedulerService = class extends Service {
     const idle = await this.runIdleThought(agentId);
     return { action: idle.action, agentId, body: idle.body, provider };
   }
+  /** Post one-or-more bubbles to a room or DM with a small human-like gap. */
+  async deliverBubbles(opts) {
+    const { agentId, bubbles, stimulusId, roomId, dmTo } = opts;
+    for (let i = 0; i < bubbles.length; i++) {
+      const body = bubbles[i];
+      if (i > 0 && this.bubbleGapMs > 0) await sleep(this.bubbleGapMs);
+      if (roomId) {
+        this.ctx.societyRooms.post({ roomId, from: agentId, body });
+        this.ctx.emit("society/agent-replied", {
+          agentId,
+          kind: "room",
+          body,
+          roomId,
+          stimulusId
+        });
+      } else if (dmTo) {
+        this.ctx.societyMailbox.deliver({
+          to: dmTo,
+          from: agentId,
+          kind: "direct",
+          body
+        });
+        this.ctx.emit("society/agent-replied", {
+          agentId,
+          kind: "direct",
+          body,
+          to: dmTo,
+          stimulusId
+        });
+      }
+    }
+  }
   async processUnread(agentId, message) {
-    if (this.exchangeCount >= this.maxExchanges) return false;
+    if (this.exchangeCount >= this.maxExchanges) return "skip";
     if (this.handledMessageIds.has(message.id)) {
       this.ctx.societyMailbox.markRead(agentId, message.id);
-      return false;
+      return "skip";
     }
-    if (this.inFlight.has(agentId)) return false;
+    if (this.inFlight.has(agentId)) return "skip";
     if (this.lastReplyAgentId === agentId) {
       this.ctx.logger("society-scheduler").info(
         `skip ${agentId}: would be consecutive self-reply (need other-agent stimulus)`
       );
-      return false;
-    }
-    if (!this.budgetOk(agentId)) {
-      this.ctx.logger("society-scheduler").info(`skip ${agentId}: daily LLM budget exhausted`);
-      return false;
+      return "skip";
     }
     const cool = await this.respectCooldowns(agentId);
-    if (!cool) return false;
-    if (this.exchangeCount >= this.maxExchanges) return false;
+    if (!cool) return "skip";
+    if (this.exchangeCount >= this.maxExchanges) return "skip";
     this.handledMessageIds.add(message.id);
     this.inFlight.add(agentId);
     try {
       this.ctx.societyMailbox.markRead(agentId, message.id);
       this.ctx.societyMemory.recordLlmCall(agentId);
       const roomName = message.kind === "room" && message.roomId ? this.ctx.societyRooms.get(message.roomId)?.name : void 0;
-      const replyText = await this.ctx.societyLlm.actAsAgent(agentId, {
-        message,
-        roomName
-      });
-      if (this.exchangeCount >= this.maxExchanges) return false;
+      let turn;
+      try {
+        turn = await this.ctx.societyLlm.actTurnAsAgent(agentId, {
+          message,
+          roomName
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.ctx.logger("society-scheduler").warn(
+          `LLM soft-fail ${agentId} (no post): ${msg.replace(/Bearer\s+\S+/gi, "Bearer [redacted]")}`
+        );
+        this.lastActAt.set(agentId, Date.now());
+        return "skip";
+      }
+      this.lastActAt.set(agentId, Date.now());
+      if (turn.silent || turn.bubbles.length === 0) {
+        this.ctx.logger("society-scheduler").info(`silent ${agentId} stimulus=${message.id.slice(0, 8)}`);
+        this.ctx.emit("society/agent-replied", {
+          agentId,
+          kind: "silent",
+          body: "[SILENT]",
+          roomId: message.roomId,
+          stimulusId: message.id
+        });
+        return "silent";
+      }
+      if (this.exchangeCount >= this.maxExchanges) return "skip";
       this.exchangeCount += 1;
       this.lastReplyAgentId = agentId;
       this.lastExchangeAt = Date.now();
-      this.lastActAt.set(agentId, Date.now());
       if (message.kind === "room" && message.roomId) {
-        this.ctx.societyRooms.post({
-          roomId: message.roomId,
-          from: agentId,
-          body: replyText
-        });
-        this.ctx.emit("society/agent-replied", {
+        await this.deliverBubbles({
           agentId,
-          kind: "room",
-          body: replyText,
-          roomId: message.roomId,
-          stimulusId: message.id
+          bubbles: turn.bubbles,
+          stimulusId: message.id,
+          roomId: message.roomId
         });
       } else if (message.kind === "direct") {
         const to = message.from;
         if (to === "system" || to === "room") {
           this.ctx.logger("society-scheduler").warn(`skip DM reply: cannot address from=${to}`);
-          return false;
+          return "skip";
         }
-        this.ctx.societyMailbox.deliver({
-          to,
-          from: agentId,
-          kind: "direct",
-          body: replyText
-        });
-        this.ctx.emit("society/agent-replied", {
+        await this.deliverBubbles({
           agentId,
-          kind: "direct",
-          body: replyText,
-          to,
-          stimulusId: message.id
+          bubbles: turn.bubbles,
+          stimulusId: message.id,
+          dmTo: to
         });
       }
       await this.consolidateAfterAct(agentId);
-      return true;
+      return "reply";
     } finally {
       this.inFlight.delete(agentId);
     }
@@ -391,7 +539,6 @@ var SocietySchedulerService = class extends Service {
     if (this.lastReplyAgentId === agentId) {
       return { action: "skip" };
     }
-    if (!this.budgetOk(agentId)) return { action: "skip" };
     const cool = await this.respectCooldowns(agentId);
     if (!cool) return { action: "skip" };
     if (this.inFlight.has(agentId)) return { action: "skip" };
@@ -432,12 +579,12 @@ ${recent}` : "\u5E7F\u573A\u5C1A\u5B89\u9759\u3002",
       if (this.exchangeCount >= this.maxExchanges) return { action: "capped" };
       if (parsed.act === "diary") {
         const stamp = (/* @__PURE__ */ new Date()).toISOString().slice(0, 19).replace(/[:T]/g, "-");
-        const path = `diary/${stamp}.md`;
+        const path2 = `diary/${stamp}.md`;
         const content = `# \u65E5\u8BB0
 
 ${parsed.body || "\uFF08\u7A7A\u767D\uFF09"}
 `;
-        this.ctx.societyTools.writeFile(agentId, path, content);
+        this.ctx.societyTools.writeFile(agentId, path2, content);
         this.exchangeCount += 1;
         this.lastReplyAgentId = agentId;
         this.lastExchangeAt = Date.now();
@@ -455,43 +602,36 @@ ${parsed.body || "\uFF08\u7A7A\u767D\uFF09"}
         if (!to || !this.ctx.societyIdentity.get(to) || to === agentId) {
           return { action: "idle-none", body: parsed.body };
         }
+        const bubbles = parseAgentTurn(parsed.body || "\u2026\u2026").bubbles;
+        const parts = bubbles.length ? bubbles : [parsed.body || "\u2026\u2026"];
         this.exchangeCount += 1;
         this.lastReplyAgentId = agentId;
         this.lastExchangeAt = Date.now();
-        this.ctx.societyMailbox.deliver({
-          to,
-          from: agentId,
-          kind: "direct",
-          body: parsed.body || "\u2026\u2026"
-        });
-        this.ctx.emit("society/agent-replied", {
+        await this.deliverBubbles({
           agentId,
-          kind: "direct",
-          body: parsed.body || "",
-          to,
-          stimulusId: `idle-${this.tickCount}`
+          bubbles: parts,
+          stimulusId: `idle-${this.tickCount}`,
+          dmTo: to
         });
         await this.consolidateAfterAct(agentId);
-        return { action: "idle-dm", body: parsed.body };
+        return { action: "idle-dm", body: parts.join(" ||| ") };
       }
       if (!room) return { action: "idle-none", body: parsed.body };
-      this.exchangeCount += 1;
-      this.lastReplyAgentId = agentId;
-      this.lastExchangeAt = Date.now();
-      this.ctx.societyRooms.post({
-        roomId: room.id,
-        from: agentId,
-        body: parsed.body || "\u2026\u2026"
-      });
-      this.ctx.emit("society/agent-replied", {
-        agentId,
-        kind: "room",
-        body: parsed.body || "",
-        roomId: room.id,
-        stimulusId: `idle-${this.tickCount}`
-      });
-      await this.consolidateAfterAct(agentId);
-      return { action: "idle-room", body: parsed.body };
+      {
+        const bubbles = parseAgentTurn(parsed.body || "\u2026\u2026").bubbles;
+        const parts = bubbles.length ? bubbles : [parsed.body || "\u2026\u2026"];
+        this.exchangeCount += 1;
+        this.lastReplyAgentId = agentId;
+        this.lastExchangeAt = Date.now();
+        await this.deliverBubbles({
+          agentId,
+          bubbles: parts,
+          stimulusId: `idle-${this.tickCount}`,
+          roomId: room.id
+        });
+        await this.consolidateAfterAct(agentId);
+        return { action: "idle-room", body: parts.join(" ||| ") };
+      }
     } finally {
       this.inFlight.delete(agentId);
     }
@@ -508,7 +648,6 @@ ${parsed.body || "\uFF08\u7A7A\u767D\uFF09"}
       );
       return;
     }
-    if (!this.budgetOk(agentId)) return;
     const slotDeadline = Date.now() + 3e4;
     while (this.freeParallelSlots() <= 0) {
       if (Date.now() > slotDeadline) {
@@ -533,27 +672,42 @@ ${parsed.body || "\uFF08\u7A7A\u767D\uFF09"}
       this.ctx.societyMailbox.markRead(agentId, message.id);
       this.ctx.societyMemory.recordLlmCall(agentId);
       const roomName = message.kind === "room" && message.roomId ? this.ctx.societyRooms.get(message.roomId)?.name : void 0;
-      const replyText = await this.ctx.societyLlm.actAsAgent(agentId, {
-        message,
-        roomName
-      });
+      let turn;
+      try {
+        turn = await this.ctx.societyLlm.actTurnAsAgent(agentId, {
+          message,
+          roomName
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.ctx.logger("society-scheduler").warn(
+          `LLM soft-fail ${agentId} (no post): ${msg.replace(/Bearer\s+\S+/gi, "Bearer [redacted]")}`
+        );
+        this.lastActAt.set(agentId, Date.now());
+        return;
+      }
+      this.lastActAt.set(agentId, Date.now());
+      if (turn.silent || turn.bubbles.length === 0) {
+        this.ctx.logger("society-scheduler").info(`silent ${agentId} stimulus=${message.id.slice(0, 8)}`);
+        this.ctx.emit("society/agent-replied", {
+          agentId,
+          kind: "silent",
+          body: "[SILENT]",
+          roomId: message.roomId,
+          stimulusId: message.id
+        });
+        return;
+      }
       if (this.exchangeCount >= this.maxExchanges) return;
       this.exchangeCount += 1;
       this.lastReplyAgentId = agentId;
       this.lastExchangeAt = Date.now();
-      this.lastActAt.set(agentId, Date.now());
       if (message.kind === "room" && message.roomId) {
-        this.ctx.societyRooms.post({
-          roomId: message.roomId,
-          from: agentId,
-          body: replyText
-        });
-        this.ctx.emit("society/agent-replied", {
+        await this.deliverBubbles({
           agentId,
-          kind: "room",
-          body: replyText,
-          roomId: message.roomId,
-          stimulusId: message.id
+          bubbles: turn.bubbles,
+          stimulusId: message.id,
+          roomId: message.roomId
         });
       } else if (message.kind === "direct") {
         const to = message.from;
@@ -561,18 +715,11 @@ ${parsed.body || "\uFF08\u7A7A\u767D\uFF09"}
           this.ctx.logger("society-scheduler").warn(`skip DM reply: cannot address from=${to}`);
           return;
         }
-        this.ctx.societyMailbox.deliver({
-          to,
-          from: agentId,
-          kind: "direct",
-          body: replyText
-        });
-        this.ctx.emit("society/agent-replied", {
+        await this.deliverBubbles({
           agentId,
-          kind: "direct",
-          body: replyText,
-          to,
-          stimulusId: message.id
+          bubbles: turn.bubbles,
+          stimulusId: message.id,
+          dmTo: to
         });
       }
       await this.consolidateAfterAct(agentId);

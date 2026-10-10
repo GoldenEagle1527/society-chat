@@ -36,7 +36,7 @@ async function main(): Promise<void> {
   assert.ok(settings.maxParallelReplies >= 1)
   assert.ok(Array.isArray(settings.providers))
   for (const p of settings.providers) {
-    assert.ok(p.id === 'agnes' || p.id === 'glm')
+    assert.ok(p.id === 'agnes' || p.id === 'glm' || p.id === 'siliconflow')
     assert.equal(typeof p.configured, 'boolean')
     // Must never leak key material in settings object
     assert.equal((p as any).apiKey, undefined)
@@ -111,7 +111,8 @@ async function main(): Promise<void> {
       }
       agentsSpawned += 1
       spawnedIds.add(id)
-      const provider = agentsSpawned % 2 === 1 ? 'agnes' : 'glm'
+      const providerCycle = (['agnes', 'glm', 'siliconflow'] as const)[(agentsSpawned - 1) % 3]!
+      const provider = providerCycle
       return {
         ok: true,
         agent: {
@@ -128,7 +129,15 @@ async function main(): Promise<void> {
           workspacePath: `/tmp/${id}`,
           createdAt: new Date().toISOString(),
         },
-        llm: { provider, model: provider === 'glm' ? 'glm-4-flash' : 'agnes-3.0-flash' },
+        llm: {
+          provider,
+          model:
+            provider === 'glm'
+              ? 'glm-4-flash'
+              : provider === 'siliconflow'
+                ? 'XingChenAGI/Xing4.0-29B'
+                : 'agnes-3.0-flash',
+        },
         chatIds: { self: `self:${id}`, plaza: 'room:plaza-mock' },
       }
     },

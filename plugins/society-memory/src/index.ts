@@ -23,10 +23,11 @@ import {
   providerModelLabel,
   requireProviderConfig,
   societyConsolidateCooldownMs,
-  societyEnvInt,
   societyWorkingMax,
+  normalizeProviderId,
   type LlmProviderId,
 } from '../../../src/env.ts'
+import { LlmHttpError, withLlmRetries } from '../../../src/llm-http.ts'
 import { agentDataDir } from '../../../src/paths.ts'
 
 declare module '@deepseek-ai/cordis' {
@@ -132,8 +133,9 @@ export class SocietyMemoryService extends Service {
     return societyConsolidateCooldownMs(300_000)
   }
 
+  /** @deprecated No hard cap; kept for observe display compatibility (Infinity). */
   dailyLlmBudget(): number {
-    return societyEnvInt('SOCIETY_DAILY_LLM_BUDGET', 80)
+    return Number.POSITIVE_INFINITY
   }
 
   load(agentId: AgentId): AgentMemoryStore {
@@ -216,7 +218,7 @@ export class SocietyMemoryService extends Service {
 
   /**
    * LLM consolidate when working.length > threshold.
-   * At most 1 per agent per SOCIETY_CONSOLIDATE_COOLDOWN_MS; respects daily LLM budget.
+   * At most 1 per agent per SOCIETY_CONSOLIDATE_COOLDOWN_MS; LLM counters are display-only (no daily hard cap).
    * Uses the agent's own free provider (llm.json). Never logs API keys.
    */
   async consolidateIfNeeded(
@@ -239,13 +241,6 @@ export class SocietyMemoryService extends Service {
       return { did: false, reason: 'cooldown' }
     }
 
-    const budget = this.dailyLlmBudget()
-    if (this.getLlmCallsToday(agentId) >= budget && !opts?.force) {
-      // Still cap working so UI/prompts don't explode
-      if (store.working.length > soft) this.dumbConsolidate(agentId, store)
-      return { did: false, reason: 'budget' }
-    }
-
     // Need at least soft+1 lines, or force with whatever we have above soft
     if (store.working.length <= soft) {
       return { did: false, reason: 'under-threshold' }
@@ -256,7 +251,7 @@ export class SocietyMemoryService extends Service {
       const overflowCount = store.working.length - soft
       const chunk = store.working.slice(0, overflowCount)
       const pref = this.ctx.societyIdentity.getLlmPreference(agentId)
-      const provider: LlmProviderId = pref.provider === 'glm' ? 'glm' : 'agnes'
+      const provider: LlmProviderId = normalizeProviderId(pref.provider)
       const cfg = requireProviderConfig(provider, pref.model)
 
       this.ctx.logger('society-memory').info(
@@ -445,38 +440,61 @@ export class SocietyMemoryService extends Service {
     const user = `Agent id: ${agentId}\n请压缩以下 ${chunk.length} 条工作记忆：\n${transcript}`
 
     const url = `${baseUrl}/chat/completions`
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
+    const log = (msg: string) => this.ctx.logger('society-memory').warn(msg)
+    return withLlmRetries(
+      `${provider} consolidate`,
+      async () => {
+        let res: Response
+        try {
+          res = await fetch(url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify({
+              model,
+              messages: [
+                { role: 'system', content: system },
+                { role: 'user', content: user },
+              ],
+              temperature: 0.3,
+              max_tokens: 800,
+            }),
+          })
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          throw new LlmHttpError(provider, 0, `${provider} consolidate network error: ${msg}`)
+        }
+        const raw = await res.text()
+        let data: {
+          choices?: Array<{ message?: { content?: string | null } }>
+          error?: { message?: string }
+        }
+        try {
+          data = JSON.parse(raw) as typeof data
+        } catch {
+          throw new LlmHttpError(
+            provider,
+            res.status,
+            `${provider} consolidate non-JSON (HTTP ${res.status})`,
+          )
+        }
+        if (!res.ok) {
+          throw new LlmHttpError(
+            provider,
+            res.status,
+            `${provider} consolidate failed: ${data.error?.message || `HTTP ${res.status}`}`,
+          )
+        }
+        const content = (data.choices?.[0]?.message?.content || '').trim()
+        if (!content) {
+          throw new LlmHttpError(provider, res.status, `${provider} consolidate empty content`)
+        }
+        return this.parseConsolidateJson(content)
       },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-        ],
-        temperature: 0.3,
-        max_tokens: 800,
-      }),
-    })
-    const raw = await res.text()
-    let data: {
-      choices?: Array<{ message?: { content?: string | null } }>
-      error?: { message?: string }
-    }
-    try {
-      data = JSON.parse(raw) as typeof data
-    } catch {
-      throw new Error(`${provider} consolidate non-JSON (HTTP ${res.status})`)
-    }
-    if (!res.ok) {
-      throw new Error(`${provider} consolidate failed: ${data.error?.message || `HTTP ${res.status}`}`)
-    }
-    const content = (data.choices?.[0]?.message?.content || '').trim()
-    if (!content) throw new Error(`${provider} consolidate empty content`)
-    return this.parseConsolidateJson(content)
+      log,
+    )
   }
 
   private parseConsolidateJson(content: string): ConsolidateJson {

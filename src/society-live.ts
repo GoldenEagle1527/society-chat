@@ -5,10 +5,16 @@
  * Usage: npm run society-live
  * Open http://127.0.0.1:8787/
  *
- * Never logs API keys. Free Agnes / GLM flash only.
+ * Never logs API keys. Free Agnes / GLM / SiliconFlow only.
  */
 import { randomUUID } from 'node:crypto'
-import { loadDotEnv, requireAgnesConfig, requireGlmConfig, providerModelLabel } from './env.ts'
+import {
+  loadDotEnv,
+  providerModelLabel,
+  requireAgnesConfig,
+  requireGlmConfig,
+  requireSiliconflowConfig,
+} from './env.ts'
 import { bootSociety } from './boot.ts'
 import {
   createObserveServer,
@@ -59,6 +65,14 @@ async function main(): Promise<void> {
   } catch {
     console.log('⚠ GLM not configured — agents routed to glm will fail until GLM_API_KEY is set')
   }
+  try {
+    const sf = requireSiliconflowConfig()
+    console.log(`✓ SiliconFlow: ${providerModelLabel(sf)} key=set`)
+  } catch {
+    console.log(
+      '⚠ SiliconFlow not configured — agents routed to siliconflow will fail until SILICONFLOW_API_KEY is set',
+    )
+  }
 
   const maxTicks = envInt('SOCIETY_MAX_TICKS', 10_000)
   const maxExchanges = envInt('SOCIETY_MAX_EXCHANGES', 200)
@@ -66,7 +80,6 @@ async function main(): Promise<void> {
   const cooldownMs = envInt('SOCIETY_COOLDOWN_MS', 600)
   const agentCooldownMs = envInt('SOCIETY_AGENT_COOLDOWN_MS', 400)
   const idleStaleMs = envInt('SOCIETY_IDLE_STALE_MS', 8_000)
-  const dailyLlmBudget = envInt('SOCIETY_DAILY_LLM_BUDGET', 80)
   const maxParallelReplies = Math.max(1, envInt('SOCIETY_MAX_PARALLEL_REPLIES', 2) || 1)
 
   const app = await bootSociety({ loadSeeds: true })
@@ -92,7 +105,6 @@ async function main(): Promise<void> {
     cooldownMs,
     agentCooldownMs,
     idleStaleMs,
-    dailyLlmBudget,
     maxParallelReplies,
   })
 

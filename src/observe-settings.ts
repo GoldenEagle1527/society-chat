@@ -3,6 +3,7 @@
  * Never includes API keys or secret values.
  */
 import {
+  ALL_LLM_PROVIDERS,
   configuredFreeProviders,
   defaultFreeModelFor,
   loadDotEnv,
@@ -20,7 +21,9 @@ export interface ObserveProviderInfo {
 export interface ObserveSettings {
   maxParallelReplies: number
   maxExchanges: number
-  dailyLlmBudget: number
+  /** Always null / unlimited — free models; counters stay on agents. */
+  dailyLlmBudget: null
+  llmBudgetUnlimited: true
   maxAgents: number
   tickMs: number
   providers: ObserveProviderInfo[]
@@ -32,7 +35,7 @@ export interface ObserveSettings {
 export function readObserveSettings(): ObserveSettings {
   loadDotEnv()
   const configured = new Set(configuredFreeProviders())
-  const providers: ObserveProviderInfo[] = (['agnes', 'glm'] as LlmProviderId[]).map((id) => {
+  const providers: ObserveProviderInfo[] = ALL_LLM_PROVIDERS.map((id) => {
     const ok = configured.has(id)
     let model: string | null = null
     if (ok) {
@@ -49,7 +52,8 @@ export function readObserveSettings(): ObserveSettings {
   return {
     maxParallelReplies: Math.max(1, societyEnvInt('SOCIETY_MAX_PARALLEL_REPLIES', 2) || 1),
     maxExchanges: societyEnvInt('SOCIETY_MAX_EXCHANGES', 200),
-    dailyLlmBudget: societyEnvInt('SOCIETY_DAILY_LLM_BUDGET', 80),
+    dailyLlmBudget: null,
+    llmBudgetUnlimited: true,
     maxAgents: societyEnvInt('SOCIETY_MAX_AGENTS', 8),
     tickMs: societyEnvInt('SOCIETY_TICK_MS', 1500),
     providers,

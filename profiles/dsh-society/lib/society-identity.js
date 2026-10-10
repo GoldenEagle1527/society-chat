@@ -61,6 +61,16 @@ function loadDotEnv(filePath = path2.join(PROJECT_ROOT, ".env")) {
 }
 var AGNES_FREE_FLASH = /^(agnes-2\.5-flash|agnes-3\.0-flash)$/i;
 var GLM_FREE_FLASH = /glm-4-flash/i;
+var SILICONFLOW_FREE = /^XingChenAGI\/Xing4\.0-29B$/i;
+var SILICONFLOW_DEFAULT_MODEL = "XingChenAGI/Xing4.0-29B";
+function normalizeProviderId(raw) {
+  const s = String(raw ?? "").trim().toLowerCase();
+  if (s === "glm" || s === "zhipu" || s === "zhipuai") return "glm";
+  if (s === "siliconflow" || s === "silicon" || s === "sf" || s === "silicon-flow") {
+    return "siliconflow";
+  }
+  return "agnes";
+}
 function assertAgnesFreeModel(model) {
   if (!AGNES_FREE_FLASH.test(model)) {
     throw new Error(
@@ -75,6 +85,13 @@ function assertGlmFreeModel(model) {
     );
   }
 }
+function assertSiliconflowFreeModel(model) {
+  if (!SILICONFLOW_FREE.test(model.trim())) {
+    throw new Error(
+      `Refusing SiliconFlow model "${model}": society-chat only allows free XingChenAGI/Xing4.0-29B.`
+    );
+  }
+}
 function societyEnvInt(name2, defaultValue) {
   const raw = process.env[name2]?.trim();
   if (raw && /^\d+$/.test(raw)) return Math.max(0, parseInt(raw, 10));
@@ -85,13 +102,20 @@ function configuredFreeProviders() {
   const out = [];
   if (process.env.AGNES_API_KEY?.trim()) out.push("agnes");
   if (process.env.GLM_API_KEY?.trim()) out.push("glm");
+  if (process.env.SILICONFLOW_API_KEY?.trim()) out.push("siliconflow");
   return out;
 }
 function defaultFreeModelFor(provider) {
   loadDotEnv();
-  if (provider === "glm") {
+  const p = normalizeProviderId(provider);
+  if (p === "glm") {
     const m2 = (process.env.GLM_MODEL?.trim() || "glm-4-flash").trim();
     assertGlmFreeModel(m2);
+    return m2;
+  }
+  if (p === "siliconflow") {
+    const m2 = (process.env.SILICONFLOW_MODEL?.trim() || SILICONFLOW_DEFAULT_MODEL).trim();
+    assertSiliconflowFreeModel(m2);
     return m2;
   }
   const m = (process.env.AGNES_MODEL?.trim() || "agnes-3.0-flash").trim();
@@ -119,20 +143,21 @@ function pickBalancedLlm(existing) {
     const p = pool[0];
     return { provider: p, model: defaultFreeModelFor(p) };
   }
-  const counts = { agnes: 0, glm: 0 };
+  const counts = { agnes: 0, glm: 0, siliconflow: 0 };
   for (const pref of existing) {
-    if (pref.provider === "glm") counts.glm += 1;
-    else counts.agnes += 1;
+    const p = normalizeProviderId(pref.provider);
+    counts[p] = (counts[p] ?? 0) + 1;
   }
   let best = pool[0];
   for (const p of pool) {
-    if (counts[p] < counts[best]) best = p;
+    if ((counts[p] ?? 0) < (counts[best] ?? 0)) best = p;
   }
-  const tied = pool.filter((p) => counts[p] === counts[best]);
+  const tied = pool.filter((p) => (counts[p] ?? 0) === (counts[best] ?? 0));
   if (tied.length > 1 && existing.length > 0) {
-    const last = existing[existing.length - 1];
-    const opposite = last.provider === "glm" ? "agnes" : "glm";
-    if (tied.includes(opposite)) best = opposite;
+    const last = normalizeProviderId(existing[existing.length - 1].provider);
+    const lastIdx = pool.indexOf(last);
+    const next = pool[(lastIdx >= 0 ? lastIdx + 1 : 0) % pool.length];
+    if (tied.includes(next)) best = next;
   }
   return { provider: best, model: defaultFreeModelFor(best) };
 }
@@ -141,7 +166,7 @@ function writeLlmPreference(agentId, pref) {
   fs2.mkdirSync(dataDir, { recursive: true });
   const file = path3.join(dataDir, "llm.json");
   const payload = {
-    provider: pref.provider === "glm" ? "glm" : "agnes",
+    provider: normalizeProviderId(pref.provider),
     ...pref.model ? { model: String(pref.model).trim() } : {}
   };
   fs2.writeFileSync(file, JSON.stringify(payload, null, 2) + "\n", "utf8");
@@ -239,7 +264,7 @@ var SocietyIdentityService = class extends Service {
     };
     if (input.llm) {
       profile.llm = {
-        provider: input.llm.provider === "glm" ? "glm" : "agnes",
+        provider: normalizeProviderId(input.llm.provider),
         ...input.llm.model ? { model: String(input.llm.model).trim() } : {}
       };
     }
@@ -302,7 +327,7 @@ var SocietyIdentityService = class extends Service {
     if (fs2.existsSync(llmPath)) {
       try {
         const raw = JSON.parse(fs2.readFileSync(llmPath, "utf8"));
-        const provider = raw.provider === "glm" ? "glm" : "agnes";
+        const provider = normalizeProviderId(raw.provider);
         return {
           provider,
           ...raw.model ? { model: String(raw.model).trim() } : {}
@@ -313,7 +338,7 @@ var SocietyIdentityService = class extends Service {
     const profile = this.agents.get(agentId);
     if (profile?.llm?.provider) {
       return {
-        provider: profile.llm.provider === "glm" ? "glm" : "agnes",
+        provider: normalizeProviderId(profile.llm.provider),
         ...profile.llm.model ? { model: String(profile.llm.model).trim() } : {}
       };
     }
@@ -322,7 +347,7 @@ var SocietyIdentityService = class extends Service {
   setLlmPreference(agentId, pref) {
     this.require(agentId);
     const normalized = {
-      provider: pref.provider === "glm" ? "glm" : "agnes",
+      provider: normalizeProviderId(pref.provider),
       ...pref.model ? { model: String(pref.model).trim() } : {}
     };
     writeLlmPreference(agentId, normalized);
@@ -385,7 +410,7 @@ var SocietyIdentityService = class extends Service {
           createdAt: raw.createdAt || (/* @__PURE__ */ new Date()).toISOString(),
           ...raw.llm?.provider ? {
             llm: {
-              provider: raw.llm.provider === "glm" ? "glm" : "agnes",
+              provider: normalizeProviderId(raw.llm.provider),
               ...raw.llm.model ? { model: String(raw.llm.model).trim() } : {}
             }
           } : {}

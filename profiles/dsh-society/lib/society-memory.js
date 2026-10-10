@@ -49,6 +49,16 @@ function loadDotEnv(filePath = path2.join(PROJECT_ROOT, ".env")) {
 }
 var AGNES_FREE_FLASH = /^(agnes-2\.5-flash|agnes-3\.0-flash)$/i;
 var GLM_FREE_FLASH = /glm-4-flash/i;
+var SILICONFLOW_FREE = /^XingChenAGI\/Xing4\.0-29B$/i;
+var SILICONFLOW_DEFAULT_MODEL = "XingChenAGI/Xing4.0-29B";
+function normalizeProviderId(raw) {
+  const s = String(raw ?? "").trim().toLowerCase();
+  if (s === "glm" || s === "zhipu" || s === "zhipuai") return "glm";
+  if (s === "siliconflow" || s === "silicon" || s === "sf" || s === "silicon-flow") {
+    return "siliconflow";
+  }
+  return "agnes";
+}
 function assertAgnesFreeModel(model) {
   if (!AGNES_FREE_FLASH.test(model)) {
     throw new Error(
@@ -60,6 +70,13 @@ function assertGlmFreeModel(model) {
   if (!GLM_FREE_FLASH.test(model)) {
     throw new Error(
       `Refusing GLM model "${model}": society-chat only allows free flash ids matching /glm-4-flash/i (e.g. glm-4-flash, glm-4-flash-250414).`
+    );
+  }
+}
+function assertSiliconflowFreeModel(model) {
+  if (!SILICONFLOW_FREE.test(model.trim())) {
+    throw new Error(
+      `Refusing SiliconFlow model "${model}": society-chat only allows free XingChenAGI/Xing4.0-29B.`
     );
   }
 }
@@ -92,8 +109,23 @@ function requireGlmConfig(modelOverride) {
   assertGlmFreeModel(model);
   return { provider: "glm", apiKey, baseUrl, model };
 }
+function requireSiliconflowConfig(modelOverride) {
+  loadDotEnv();
+  const apiKey = process.env.SILICONFLOW_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error(
+      "SILICONFLOW_API_KEY is missing. Put it in .env (gitignored) or export it."
+    );
+  }
+  const baseUrl = (process.env.SILICONFLOW_BASE_URL?.trim() || "https://api.siliconflow.cn/v1").replace(/\/+$/, "");
+  const model = (modelOverride || process.env.SILICONFLOW_MODEL?.trim() || SILICONFLOW_DEFAULT_MODEL).trim();
+  assertSiliconflowFreeModel(model);
+  return { provider: "siliconflow", apiKey, baseUrl, model };
+}
 function requireProviderConfig(provider, modelOverride) {
-  if (provider === "glm") return requireGlmConfig(modelOverride);
+  const p = normalizeProviderId(provider);
+  if (p === "glm") return requireGlmConfig(modelOverride);
+  if (p === "siliconflow") return requireSiliconflowConfig(modelOverride);
   return requireAgnesConfig(modelOverride);
 }
 function providerModelLabel(cfg) {
@@ -109,6 +141,52 @@ function societyWorkingMax(defaultValue = 20) {
 }
 function societyConsolidateCooldownMs(defaultValue = 3e5) {
   return societyEnvInt("SOCIETY_CONSOLIDATE_COOLDOWN_MS", defaultValue);
+}
+
+// src/llm-http.ts
+var LlmHttpError = class extends Error {
+  status;
+  provider;
+  constructor(provider, status, message) {
+    super(message);
+    this.name = "LlmHttpError";
+    this.provider = provider;
+    this.status = status;
+  }
+};
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+function llmMaxAttempts() {
+  return Math.max(1, societyEnvInt("SOCIETY_LLM_MAX_ATTEMPTS", 10) || 10);
+}
+function llmRetryDelayMs(err) {
+  const status = err instanceof LlmHttpError ? err.status : typeof err === "object" && err && "status" in err ? Number(err.status) || 0 : 0;
+  return status === 429 ? 15e3 : 3e4;
+}
+async function withLlmRetries(label, attempt, log) {
+  const max = llmMaxAttempts();
+  let last;
+  for (let i = 1; i <= max; i++) {
+    try {
+      return await attempt();
+    } catch (err) {
+      last = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      const safe = msg.replace(/Bearer\s+\S+/gi, "Bearer [redacted]").replace(/sk-[A-Za-z0-9]+/g, "[redacted]");
+      if (i >= max) {
+        log?.(`${label} failed after ${max} attempts: ${safe}`);
+        throw err instanceof Error ? err : new Error(safe);
+      }
+      const wait = llmRetryDelayMs(err);
+      const status = err instanceof LlmHttpError ? err.status : 0;
+      log?.(
+        `${label} attempt ${i}/${max} failed (status=${status || "n/a"}): ${safe}; retry in ${wait / 1e3}s`
+      );
+      await sleep(wait);
+    }
+  }
+  throw last instanceof Error ? last : new Error(String(last));
 }
 
 // plugins/society-memory/src/index.ts
@@ -192,8 +270,9 @@ var SocietyMemoryService = class extends Service {
   consolidateCooldownMs() {
     return societyConsolidateCooldownMs(3e5);
   }
+  /** @deprecated No hard cap; kept for observe display compatibility (Infinity). */
   dailyLlmBudget() {
-    return societyEnvInt("SOCIETY_DAILY_LLM_BUDGET", 80);
+    return Number.POSITIVE_INFINITY;
   }
   load(agentId) {
     this.ctx.societyIdentity.require(agentId);
@@ -264,7 +343,7 @@ var SocietyMemoryService = class extends Service {
   }
   /**
    * LLM consolidate when working.length > threshold.
-   * At most 1 per agent per SOCIETY_CONSOLIDATE_COOLDOWN_MS; respects daily LLM budget.
+   * At most 1 per agent per SOCIETY_CONSOLIDATE_COOLDOWN_MS; LLM counters are display-only (no daily hard cap).
    * Uses the agent's own free provider (llm.json). Never logs API keys.
    */
   async consolidateIfNeeded(agentId, opts) {
@@ -282,11 +361,6 @@ var SocietyMemoryService = class extends Service {
     if (!opts?.bypassCooldown && !opts?.force && last > 0 && Date.now() - last < cooldown) {
       return { did: false, reason: "cooldown" };
     }
-    const budget = this.dailyLlmBudget();
-    if (this.getLlmCallsToday(agentId) >= budget && !opts?.force) {
-      if (store.working.length > soft) this.dumbConsolidate(agentId, store);
-      return { did: false, reason: "budget" };
-    }
     if (store.working.length <= soft) {
       return { did: false, reason: "under-threshold" };
     }
@@ -295,7 +369,7 @@ var SocietyMemoryService = class extends Service {
       const overflowCount = store.working.length - soft;
       const chunk = store.working.slice(0, overflowCount);
       const pref = this.ctx.societyIdentity.getLlmPreference(agentId);
-      const provider = pref.provider === "glm" ? "glm" : "agnes";
+      const provider = normalizeProviderId(pref.provider);
       const cfg = requireProviderConfig(provider, pref.model);
       this.ctx.logger("society-memory").info(
         `consolidate ${agentId} chunk=${chunk.length} ${providerModelLabel(cfg)}`
@@ -453,35 +527,58 @@ var SocietyMemoryService = class extends Service {
 \u8BF7\u538B\u7F29\u4EE5\u4E0B ${chunk.length} \u6761\u5DE5\u4F5C\u8BB0\u5FC6\uFF1A
 ${transcript}`;
     const url = `${baseUrl}/chat/completions`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`
+    const log = (msg) => this.ctx.logger("society-memory").warn(msg);
+    return withLlmRetries(
+      `${provider} consolidate`,
+      async () => {
+        let res;
+        try {
+          res = await fetch(url, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${apiKey}`
+            },
+            body: JSON.stringify({
+              model,
+              messages: [
+                { role: "system", content: system },
+                { role: "user", content: user }
+              ],
+              temperature: 0.3,
+              max_tokens: 800
+            })
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          throw new LlmHttpError(provider, 0, `${provider} consolidate network error: ${msg}`);
+        }
+        const raw = await res.text();
+        let data;
+        try {
+          data = JSON.parse(raw);
+        } catch {
+          throw new LlmHttpError(
+            provider,
+            res.status,
+            `${provider} consolidate non-JSON (HTTP ${res.status})`
+          );
+        }
+        if (!res.ok) {
+          throw new LlmHttpError(
+            provider,
+            res.status,
+            `${provider} consolidate failed: ${data.error?.message || `HTTP ${res.status}`}`
+          );
+        }
+        const content = (data.choices?.[0]?.message?.content || "").trim();
+        if (!content) {
+          throw new LlmHttpError(provider, res.status, `${provider} consolidate empty content`);
+        }
+        return this.parseConsolidateJson(content);
       },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user }
-        ],
-        temperature: 0.3,
-        max_tokens: 800
-      })
-    });
-    const raw = await res.text();
-    let data;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      throw new Error(`${provider} consolidate non-JSON (HTTP ${res.status})`);
-    }
-    if (!res.ok) {
-      throw new Error(`${provider} consolidate failed: ${data.error?.message || `HTTP ${res.status}`}`);
-    }
-    const content = (data.choices?.[0]?.message?.content || "").trim();
-    if (!content) throw new Error(`${provider} consolidate empty content`);
-    return this.parseConsolidateJson(content);
+      log
+    );
   }
   parseConsolidateJson(content) {
     let text = content.trim();

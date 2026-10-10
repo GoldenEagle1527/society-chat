@@ -29,7 +29,8 @@
     "spawn-route-smoke": "tsx src/spawn-route-smoke.ts",
     "api-smoke": "tsx src/api-smoke.ts",
     "build:dsh-overlay": "node scripts/build-dsh-overlay.mjs",
-    "dsh-overlay-smoke": "tsx src/dsh-overlay-smoke.ts"
+    "dsh-overlay-smoke": "tsx src/dsh-overlay-smoke.ts",
+    "turn-parse-smoke": "tsx src/turn-parse-smoke.ts"
   },
   "dependencies": {
     "@deepseek-ai/cordis": "^4.0.4",

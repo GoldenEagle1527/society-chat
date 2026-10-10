@@ -44,6 +44,16 @@ function loadDotEnv(filePath = path2.join(PROJECT_ROOT, ".env")) {
 }
 var AGNES_FREE_FLASH = /^(agnes-2\.5-flash|agnes-3\.0-flash)$/i;
 var GLM_FREE_FLASH = /glm-4-flash/i;
+var SILICONFLOW_FREE = /^XingChenAGI\/Xing4\.0-29B$/i;
+var SILICONFLOW_DEFAULT_MODEL = "XingChenAGI/Xing4.0-29B";
+function normalizeProviderId(raw) {
+  const s = String(raw ?? "").trim().toLowerCase();
+  if (s === "glm" || s === "zhipu" || s === "zhipuai") return "glm";
+  if (s === "siliconflow" || s === "silicon" || s === "sf" || s === "silicon-flow") {
+    return "siliconflow";
+  }
+  return "agnes";
+}
 function assertAgnesFreeModel(model) {
   if (!AGNES_FREE_FLASH.test(model)) {
     throw new Error(
@@ -55,6 +65,13 @@ function assertGlmFreeModel(model) {
   if (!GLM_FREE_FLASH.test(model)) {
     throw new Error(
       `Refusing GLM model "${model}": society-chat only allows free flash ids matching /glm-4-flash/i (e.g. glm-4-flash, glm-4-flash-250414).`
+    );
+  }
+}
+function assertSiliconflowFreeModel(model) {
+  if (!SILICONFLOW_FREE.test(model.trim())) {
+    throw new Error(
+      `Refusing SiliconFlow model "${model}": society-chat only allows free XingChenAGI/Xing4.0-29B.`
     );
   }
 }
@@ -87,16 +104,174 @@ function requireGlmConfig(modelOverride) {
   assertGlmFreeModel(model);
   return { provider: "glm", apiKey, baseUrl, model };
 }
+function requireSiliconflowConfig(modelOverride) {
+  loadDotEnv();
+  const apiKey = process.env.SILICONFLOW_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error(
+      "SILICONFLOW_API_KEY is missing. Put it in .env (gitignored) or export it."
+    );
+  }
+  const baseUrl = (process.env.SILICONFLOW_BASE_URL?.trim() || "https://api.siliconflow.cn/v1").replace(/\/+$/, "");
+  const model = (modelOverride || process.env.SILICONFLOW_MODEL?.trim() || SILICONFLOW_DEFAULT_MODEL).trim();
+  assertSiliconflowFreeModel(model);
+  return { provider: "siliconflow", apiKey, baseUrl, model };
+}
 function requireProviderConfig(provider, modelOverride) {
-  if (provider === "glm") return requireGlmConfig(modelOverride);
+  const p = normalizeProviderId(provider);
+  if (p === "glm") return requireGlmConfig(modelOverride);
+  if (p === "siliconflow") return requireSiliconflowConfig(modelOverride);
   return requireAgnesConfig(modelOverride);
 }
 function providerModelLabel(cfg) {
   return `${cfg.provider}=${cfg.model}`;
 }
+function societyEnvInt(name2, defaultValue) {
+  const raw = process.env[name2]?.trim();
+  if (raw && /^\d+$/.test(raw)) return Math.max(0, parseInt(raw, 10));
+  return defaultValue;
+}
+
+// src/llm-http.ts
+var LlmHttpError = class extends Error {
+  status;
+  provider;
+  constructor(provider, status, message) {
+    super(message);
+    this.name = "LlmHttpError";
+    this.provider = provider;
+    this.status = status;
+  }
+};
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+function llmMaxAttempts() {
+  return Math.max(1, societyEnvInt("SOCIETY_LLM_MAX_ATTEMPTS", 10) || 10);
+}
+function llmRetryDelayMs(err) {
+  const status = err instanceof LlmHttpError ? err.status : typeof err === "object" && err && "status" in err ? Number(err.status) || 0 : 0;
+  return status === 429 ? 15e3 : 3e4;
+}
+async function withLlmRetries(label, attempt, log) {
+  const max = llmMaxAttempts();
+  let last;
+  for (let i = 1; i <= max; i++) {
+    try {
+      return await attempt();
+    } catch (err) {
+      last = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      const safe = msg.replace(/Bearer\s+\S+/gi, "Bearer [redacted]").replace(/sk-[A-Za-z0-9]+/g, "[redacted]");
+      if (i >= max) {
+        log?.(`${label} failed after ${max} attempts: ${safe}`);
+        throw err instanceof Error ? err : new Error(safe);
+      }
+      const wait = llmRetryDelayMs(err);
+      const status = err instanceof LlmHttpError ? err.status : 0;
+      log?.(
+        `${label} attempt ${i}/${max} failed (status=${status || "n/a"}): ${safe}; retry in ${wait / 1e3}s`
+      );
+      await sleep(wait);
+    }
+  }
+  throw last instanceof Error ? last : new Error(String(last));
+}
 
 // plugins/society-llm/src/index.ts
 var MAX_TOOL_ROUNDS = 3;
+var MAX_BUBBLES = 5;
+var MAX_BUBBLE_CHARS = 2e3;
+function parseAgentTurn(raw) {
+  const text = (raw ?? "").trim();
+  if (!text) return { silent: true, bubbles: [], raw: text };
+  const fromJson = tryParseJsonTurn(text);
+  if (fromJson) return { ...fromJson, raw: text };
+  const lines = text.split(/\r?\n/);
+  let action = null;
+  let cut = lines.length;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (/^ACTION:\s*SILENT\s*$/i.test(line)) {
+      action = "silent";
+      cut = i;
+      break;
+    }
+    if (/^ACTION:\s*REPLY\s*$/i.test(line)) {
+      action = "reply";
+      cut = i;
+      break;
+    }
+  }
+  if (action === "silent") {
+    return { silent: true, bubbles: [], raw: text };
+  }
+  let body = (action ? lines.slice(0, cut).join("\n") : text).trim();
+  if (/^ACTION:\s*SILENT\s*$/i.test(body)) {
+    return { silent: true, bubbles: [], raw: text };
+  }
+  const bubbles = splitBubbles(body);
+  if (bubbles.length === 0) return { silent: true, bubbles: [], raw: text };
+  return { silent: false, bubbles, raw: text };
+}
+function tryParseJsonTurn(text) {
+  let candidate = text.trim();
+  const fence = candidate.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) candidate = fence[1].trim();
+  const objStart = candidate.indexOf("{");
+  const arrStart = candidate.indexOf("[");
+  let slice = null;
+  if (objStart >= 0 && (arrStart < 0 || objStart < arrStart)) {
+    const end = candidate.lastIndexOf("}");
+    if (end > objStart) slice = candidate.slice(objStart, end + 1);
+  } else if (arrStart >= 0) {
+    const end = candidate.lastIndexOf("]");
+    if (end > arrStart) slice = candidate.slice(arrStart, end + 1);
+  }
+  if (!slice) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(slice);
+  } catch {
+    return null;
+  }
+  if (Array.isArray(parsed)) {
+    const bubbles = parsed.map((x) => String(x ?? "").trim()).filter(Boolean).slice(0, MAX_BUBBLES).map((b) => b.slice(0, MAX_BUBBLE_CHARS));
+    if (bubbles.length === 0) return { silent: true, bubbles: [] };
+    return { silent: false, bubbles };
+  }
+  if (parsed && typeof parsed === "object") {
+    const o = parsed;
+    if (o.reply === false || o.silent === true) {
+      return { silent: true, bubbles: [] };
+    }
+    if (Array.isArray(o.bubbles)) {
+      const bubbles = o.bubbles.map((x) => String(x ?? "").trim()).filter(Boolean).slice(0, MAX_BUBBLES).map((b) => b.slice(0, MAX_BUBBLE_CHARS));
+      if (bubbles.length === 0) return { silent: true, bubbles: [] };
+      return { silent: false, bubbles };
+    }
+    if (typeof o.text === "string" && o.text.trim()) {
+      return { silent: false, bubbles: splitBubbles(o.text.trim()) };
+    }
+    if (o.reply === true && typeof o.body === "string") {
+      return { silent: false, bubbles: splitBubbles(o.body.trim()) };
+    }
+  }
+  return null;
+}
+function splitBubbles(body) {
+  const trimmed = body.trim();
+  if (!trimmed) return [];
+  if (trimmed.includes("|||")) {
+    return trimmed.split("|||").map((s) => s.trim()).filter(Boolean).slice(0, MAX_BUBBLES).map((b) => b.slice(0, MAX_BUBBLE_CHARS));
+  }
+  const numbered = trimmed.match(/^\s*\d+[.)、]\s+.+/gm);
+  if (numbered && numbered.length >= 2) {
+    const parts = numbered.map((line) => line.replace(/^\s*\d+[.)、]\s+/, "").trim()).filter(Boolean).slice(0, MAX_BUBBLES).map((b) => b.slice(0, MAX_BUBBLE_CHARS));
+    if (parts.length >= 2) return parts;
+  }
+  return [trimmed.slice(0, MAX_BUBBLE_CHARS)];
+}
 var SocietyLlmService = class extends Service {
   static inject = ["societyIdentity", "societyMemory", "societySoul", "societyTools"];
   constructor(ctx) {
@@ -105,7 +280,7 @@ var SocietyLlmService = class extends Service {
   /** Resolve endpoint for this agent (llm.json / profile / defaults). Never logs keys. */
   resolveConfig(agentId) {
     const pref = this.ctx.societyIdentity.getLlmPreference(agentId);
-    const provider = pref.provider === "glm" ? "glm" : "agnes";
+    const provider = normalizeProviderId(pref.provider);
     return requireProviderConfig(provider, pref.model);
   }
   /** Safe label for logs: provider=model */
@@ -123,9 +298,13 @@ var SocietyLlmService = class extends Service {
       soulSection,
       memorySection,
       "\u89C4\u5219\uFF1A",
-      "- \u59CB\u7EC8\u4FDD\u6301\u4E0A\u8FF0\u4EBA\u8BBE\u3001\u7075\u9B42\u72B6\u6001\u4E0E\u8BB0\u5FC6\uFF0C\u7528\u4E2D\u6587\u7B80\u77ED\u56DE\u590D\uFF08\u901A\u5E38 1\uFF5E3 \u53E5\uFF09\u3002",
-      "- \u53EA\u8F93\u51FA\u4F60\u8981\u5BF9\u5BF9\u65B9\u8BF4\u7684\u6B63\u6587\uFF0C\u4E0D\u8981\u52A0\u300CAlice:\u300D\u4E4B\u7C7B\u524D\u7F00\uFF0C\u4E0D\u8981\u89E3\u91CA\u4F60\u662F AI \u6216\u6A21\u578B\u3002",
-      "- \u4E0D\u8981\u8F93\u51FA\u601D\u8003\u8FC7\u7A0B\u6216 reasoning\u3002"
+      "- \u59CB\u7EC8\u4FDD\u6301\u4E0A\u8FF0\u4EBA\u8BBE\u3001\u7075\u9B42\u72B6\u6001\u4E0E\u8BB0\u5FC6\uFF0C\u7528\u4E2D\u6587\u7B80\u77ED\u8BF4\u8BDD\u3002",
+      "- \u4E0D\u8981\u52A0\u300CAlice:\u300D\u4E4B\u7C7B\u524D\u7F00\uFF0C\u4E0D\u8981\u89E3\u91CA\u4F60\u662F AI \u6216\u6A21\u578B\u3002",
+      "- \u4E0D\u8981\u8F93\u51FA\u601D\u8003\u8FC7\u7A0B\u6216 reasoning\u3002",
+      "- \u6536\u5230\u6D88\u606F\u540E\u5148\u5224\u65AD\u8981\u4E0D\u8981\u5F00\u53E3\uFF1A\u82E5\u6D88\u606F\u5728\u70B9\u540D\u4F60\u3001\u95EE\u5019\u4F60\u3001\u95EE\u4F60\u95EE\u9898\u3001\u6216\u79C1\u4FE1\u7ED9\u4F60\uFF0C\u5E94\u5F53\u56DE\u590D\uFF0C\u4E0D\u8981 SILENT\u3002",
+      '- \u7FA4\u804A\u91CC\u522B\u4EBA\u4E92\u76F8\u5BF9\u8BDD\u3001\u8BDD\u9898\u4E0E\u4F60\u65E0\u5173\u3001\u6216\u5DF2\u6709\u5145\u5206\u56DE\u5E94\u65F6\uFF0C\u53EF\u53EA\u8F93\u51FA\u4E00\u884C ACTION:SILENT\uFF08\u6216 JSON {"reply":false}\uFF09\uFF0C\u4E0D\u8981\u62A2\u7740\u5237\u5C4F\u3002',
+      '- \u82E5\u8981\u56DE\u590D\uFF1A\u53EF\u628A\u957F\u8BDD\u62C6\u6210 2\uFF5E4 \u6761\u77ED\u6C14\u6CE1\uFF0C\u7528 ||| \u5206\u9694\uFF1B\u6216\u8F93\u51FA JSON {"reply":true,"bubbles":["\u7B2C\u4E00\u53E5","\u7B2C\u4E8C\u53E5"]}\uFF1B\u4E5F\u53EF\u5728\u6700\u540E\u4E00\u884C\u5199 ACTION:REPLY\u3002',
+      "- \u5355\u6761\u6C14\u6CE1\u5C3D\u91CF\u4E00\u4E24\u53E5\uFF1B\u6574\u8F6E\u6700\u591A\u7EA6 4 \u6761\u6C14\u6CE1\u3002"
     ];
     if (withTools) {
       lines.push(
@@ -134,7 +313,7 @@ var SocietyLlmService = class extends Service {
         "- \u53EA\u6709\u5BF9\u65B9\u660E\u786E\u8981\u6C42\u751F\u56FE\u65F6\u624D\u8C03\u7528 generate_image\uFF1B\u4E0D\u8981\u4E3B\u52A8\u5237\u56FE\u3002",
         "- \u9700\u8981\u843D\u76D8\u65F6\u7528 write_file\uFF1B\u8DEF\u5F84\u5FC5\u987B\u662F\u76F8\u5BF9\u8DEF\u5F84\uFF0C\u7981\u6B62 .. \u4E0E\u7EDD\u5BF9\u8DEF\u5F84\u3002",
         "- run_command \u5728\u6C99\u7BB1\u5185\u6267\u884C\uFF0C\u9ED8\u8BA4\u65E0\u7F51\u7EDC\uFF1Bargv[0] \u5FC5\u987B\u662F /bin/ \u6216 /usr/bin/ \u4E0B\u7684\u7EDD\u5BF9\u8DEF\u5F84\u3002",
-        "- \u5DE5\u5177\u8C03\u7528\u7ED3\u675F\u540E\uFF0C\u7528\u7B80\u77ED\u4E2D\u6587\u5411\u5BF9\u65B9\u8BF4\u660E\u7ED3\u679C\uFF08\u4F8B\u5982\u6587\u4EF6\u540D\uFF09\uFF0C\u4E0D\u8981\u7C98\u8D34\u5927\u6BB5\u5DE5\u5177\u539F\u59CB\u8F93\u51FA\u3002"
+        "- \u5DE5\u5177\u8C03\u7528\u7ED3\u675F\u540E\uFF0C\u7528\u7B80\u77ED\u4E2D\u6587\u5411\u5BF9\u65B9\u8BF4\u660E\u7ED3\u679C\uFF08\u4F8B\u5982\u6587\u4EF6\u540D\uFF09\uFF0C\u4E0D\u8981\u7C98\u8D34\u5927\u6BB5\u5DE5\u5177\u539F\u59CB\u8F93\u51FA\uFF1B\u4ECD\u53EF\u7528 ||| \u62C6\u591A\u6C14\u6CE1\uFF0C\u6216 ACTION:SILENT\u3002"
       );
     }
     return lines.join("\n");
@@ -142,25 +321,29 @@ var SocietyLlmService = class extends Service {
   buildUserPrompt(agentId, stimulus) {
     const agent = this.ctx.societyIdentity.require(agentId);
     const msg = stimulus.message;
+    const decideHint = "\u5148\u51B3\u5B9A\u8981\u4E0D\u8981\u56DE\uFF1A\u82E5\u5BF9\u65B9\u5728\u95EE\u5019/\u70B9\u540D/\u95EE\u4F60\uFF0C\u5FC5\u987B\u56DE\u590D\uFF1B\u4EC5\u5F53\u4E0E\u4F60\u65E0\u5173\u6216\u65E0\u9700\u63D2\u8BDD\u65F6\u624D\u8F93\u51FA ACTION:SILENT\u3002\u8981\u56DE\u5219\u7528\u77ED\u6C14\u6CE1\uFF08\u53EF\u7528 ||| \u62C6\u5206\uFF09\u3002";
     if (msg) {
       if (msg.kind === "room" && msg.roomId) {
         const roomLabel = stimulus.roomName ? `\u300C${stimulus.roomName}\u300D` : "";
         return [
           `\u4F60\u5728\u7FA4\u804A${roomLabel}\u4E2D\u6536\u5230\u4E00\u6761\u6D88\u606F\u3002`,
           `\u539F\u59CB\u6295\u9012\uFF1A${msg.body}`,
-          `\u8BF7\u4EE5 ${agent.displayName} \u7684\u8EAB\u4EFD\u56DE\u590D\u8FD9\u6761\u7FA4\u6D88\u606F\u3002`
+          decideHint,
+          `\u82E5\u5F00\u53E3\uFF0C\u8BF7\u4EE5 ${agent.displayName} \u7684\u8EAB\u4EFD\u8BF4\u8BDD\u3002`
         ].join("\n");
       }
       if (msg.kind === "direct") {
         return [
-          `\u4F60\u6536\u5230\u6765\u81EA ${msg.from} \u7684\u79C1\u4FE1\uFF1A`,
+          `\u4F60\u6536\u5230\u6765\u81EA ${msg.from} \u7684\u79C1\u4FE1\uFF08\u79C1\u4FE1\u9ED8\u8BA4\u5E94\u56DE\u590D\uFF0C\u9664\u975E\u662F\u9A9A\u6270/\u65E0\u610F\u4E49\u5237\u5C4F\uFF09\uFF1A`,
           msg.body,
-          `\u8BF7\u4EE5 ${agent.displayName} \u7684\u8EAB\u4EFD\u56DE\u590D\u8FD9\u6761\u79C1\u4FE1\u3002`
+          "\u7528\u77ED\u6C14\u6CE1\u56DE\u590D\uFF1B\u957F\u8BDD\u53EF\u7528 ||| \u62C6\u5206\u3002\u4E00\u822C\u4E0D\u8981 SILENT\u3002",
+          `\u8BF7\u4EE5 ${agent.displayName} \u7684\u8EAB\u4EFD\u8BF4\u8BDD\u3002`
         ].join("\n");
       }
       return [
         `\u7CFB\u7EDF\u901A\u77E5\uFF1A${msg.body}`,
-        `\u8BF7\u4EE5 ${agent.displayName} \u7684\u8EAB\u4EFD\u4F5C\u51FA\u7B80\u77ED\u56DE\u5E94\uFF08\u5982\u65E0\u9700\u56DE\u5E94\u53EF\u56DE\u590D\u300C\u597D\u7684\u300D\uFF09\u3002`
+        decideHint,
+        `\u82E5\u5F00\u53E3\uFF0C\u8BF7\u4EE5 ${agent.displayName} \u7684\u8EAB\u4EFD\u4F5C\u7B80\u77ED\u56DE\u5E94\u3002`
       ].join("\n");
     }
     const text = stimulus.text?.trim();
@@ -184,11 +367,22 @@ var SocietyLlmService = class extends Service {
     if (!cleaned) throw new Error(`Empty LLM content for agent ${agentId}`);
     return cleaned;
   }
+  /** Same as replyAsAgent but parsed into silence / bubbles. */
+  async replyTurnAsAgent(agentId, stimulus) {
+    const raw = await this.replyAsAgent(agentId, stimulus);
+    return parseAgentTurn(raw);
+  }
   /**
    * Agent turn with OpenAI tool calling (bound to this agentId's workspace).
-   * Max MAX_TOOL_ROUNDS tool rounds; final assistant text is the room/DM reply.
+   * Max MAX_TOOL_ROUNDS tool rounds; final assistant text is the room/DM reply body.
    */
   async actAsAgent(agentId, stimulus) {
+    const turn = await this.actTurnAsAgent(agentId, stimulus);
+    if (turn.silent) return "ACTION:SILENT";
+    return turn.raw;
+  }
+  /** Tool-capable turn returning parsed silence / bubbles. */
+  async actTurnAsAgent(agentId, stimulus) {
     this.ctx.societyIdentity.require(agentId);
     const cfg = this.resolveConfig(agentId);
     this.ctx.logger("society-llm").info(`chat ${agentId} ${providerModelLabel(cfg)} (tools)`);
@@ -232,48 +426,70 @@ var SocietyLlmService = class extends Service {
         if (round < MAX_TOOL_ROUNDS) {
           messages.push({
             role: "user",
-            content: "\u8BF7\u6839\u636E\u5DE5\u5177\u7ED3\u679C\uFF0C\u7528\u4E2D\u6587\u7B80\u77ED\u56DE\u590D\u5BF9\u65B9\uFF08\u4E0D\u8981\u518D\u8C03\u7528\u5DE5\u5177\uFF09\u3002"
+            content: "\u8BF7\u6839\u636E\u5DE5\u5177\u7ED3\u679C\u51B3\u5B9A\uFF1A\u4E0D\u56DE\u5219 ACTION:SILENT\uFF1B\u8981\u56DE\u5219\u7528\u4E2D\u6587\u77ED\u6C14\u6CE1\uFF08\u53EF\u7528 |||\uFF09\uFF0C\u4E0D\u8981\u518D\u8C03\u7528\u5DE5\u5177\u3002"
           });
           const final = await this.chatCompletions(messages, cfg, { tools: false });
           const text = (final.content ?? "").trim();
-          if (text) return text;
+          if (text) return parseAgentTurn(text);
         }
         throw new Error(`Empty LLM content for agent ${agentId} after tool loop`);
       }
-      return cleaned;
+      return parseAgentTurn(cleaned);
     }
     throw new Error(`actAsAgent exceeded tool rounds for ${agentId}`);
   }
   async chatCompletions(messages, cfg, opts) {
+    const log = (msg) => this.ctx.logger("society-llm").warn(msg);
+    return withLlmRetries(
+      `${cfg.provider} chat/completions`,
+      () => this.chatCompletionsOnce(messages, cfg, opts),
+      log
+    );
+  }
+  async chatCompletionsOnce(messages, cfg, opts) {
     const url = `${cfg.baseUrl}/chat/completions`;
     const body = {
       model: cfg.model,
       messages,
       temperature: 0.7,
-      max_tokens: 1024
+      max_tokens: 1536
     };
     if (opts.tools && opts.toolDefs?.length) {
       body.tools = opts.toolDefs;
       body.tool_choice = "auto";
     }
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${cfg.apiKey}`
-      },
-      body: JSON.stringify(body)
-    });
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${cfg.apiKey}`
+        },
+        body: JSON.stringify(body)
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new LlmHttpError(cfg.provider, 0, `${cfg.provider} network error: ${msg}`);
+    }
     const raw = await res.text();
     let data;
     try {
       data = JSON.parse(raw);
     } catch {
-      throw new Error(`${cfg.provider} API returned non-JSON (HTTP ${res.status})`);
+      throw new LlmHttpError(
+        cfg.provider,
+        res.status,
+        `${cfg.provider} API returned non-JSON (HTTP ${res.status})`
+      );
     }
     if (!res.ok) {
       const msg = data.error?.message || `HTTP ${res.status}`;
-      throw new Error(`${cfg.provider} chat/completions failed: ${msg}`);
+      throw new LlmHttpError(
+        cfg.provider,
+        res.status,
+        `${cfg.provider} chat/completions failed: ${msg}`
+      );
     }
     const choice = data.choices?.[0]?.message;
     let tool_calls = choice?.tool_calls?.length ? choice.tool_calls : void 0;
@@ -291,7 +507,9 @@ var SocietyLlmService = class extends Service {
     if (!tool_calls?.length) {
       const trimmed = (content ?? "").trim();
       if (!trimmed) {
-        throw new Error(
+        throw new LlmHttpError(
+          cfg.provider,
+          res.status,
           `${cfg.provider} response missing message.content (reasoning_content ignored)`
         );
       }
@@ -309,6 +527,7 @@ export {
   SocietyLlmService,
   apply,
   inject,
-  name
+  name,
+  parseAgentTurn
 };
 //# sourceMappingURL=society-llm.js.map

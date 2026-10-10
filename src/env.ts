@@ -28,7 +28,9 @@ export function loadDotEnv(filePath = path.join(PROJECT_ROOT, '.env')): void {
   }
 }
 
-export type LlmProviderId = 'agnes' | 'glm'
+export type LlmProviderId = 'agnes' | 'glm' | 'siliconflow'
+
+export const ALL_LLM_PROVIDERS: LlmProviderId[] = ['agnes', 'glm', 'siliconflow']
 
 export interface LlmEndpointConfig {
   provider: LlmProviderId
@@ -43,6 +45,21 @@ export type AgnesConfig = LlmEndpointConfig
 const AGNES_FREE_FLASH = /^(agnes-2\.5-flash|agnes-3\.0-flash)$/i
 /** Free GLM flash only (glm-4-flash, glm-4-flash-250414, …). */
 const GLM_FREE_FLASH = /glm-4-flash/i
+/** Free SiliconFlow model only (exact id). */
+const SILICONFLOW_FREE = /^XingChenAGI\/Xing4\.0-29B$/i
+export const SILICONFLOW_DEFAULT_MODEL = 'XingChenAGI/Xing4.0-29B'
+
+/** Normalize provider strings from llm.json / UI (never invent paid providers). */
+export function normalizeProviderId(raw: unknown): LlmProviderId {
+  const s = String(raw ?? '')
+    .trim()
+    .toLowerCase()
+  if (s === 'glm' || s === 'zhipu' || s === 'zhipuai') return 'glm'
+  if (s === 'siliconflow' || s === 'silicon' || s === 'sf' || s === 'silicon-flow') {
+    return 'siliconflow'
+  }
+  return 'agnes'
+}
 
 export function assertAgnesFreeModel(model: string): void {
   if (!AGNES_FREE_FLASH.test(model)) {
@@ -56,6 +73,14 @@ export function assertGlmFreeModel(model: string): void {
   if (!GLM_FREE_FLASH.test(model)) {
     throw new Error(
       `Refusing GLM model "${model}": society-chat only allows free flash ids matching /glm-4-flash/i (e.g. glm-4-flash, glm-4-flash-250414).`,
+    )
+  }
+}
+
+export function assertSiliconflowFreeModel(model: string): void {
+  if (!SILICONFLOW_FREE.test(model.trim())) {
+    throw new Error(
+      `Refusing SiliconFlow model "${model}": society-chat only allows free XingChenAGI/Xing4.0-29B.`,
     )
   }
 }
@@ -95,11 +120,34 @@ export function requireGlmConfig(modelOverride?: string): LlmEndpointConfig {
   return { provider: 'glm', apiKey, baseUrl, model }
 }
 
+/** Resolve SiliconFlow OpenAI-compatible settings. Never logs the key. */
+export function requireSiliconflowConfig(modelOverride?: string): LlmEndpointConfig {
+  loadDotEnv()
+  const apiKey = process.env.SILICONFLOW_API_KEY?.trim()
+  if (!apiKey) {
+    throw new Error(
+      'SILICONFLOW_API_KEY is missing. Put it in .env (gitignored) or export it.',
+    )
+  }
+  const baseUrl = (
+    process.env.SILICONFLOW_BASE_URL?.trim() || 'https://api.siliconflow.cn/v1'
+  ).replace(/\/+$/, '')
+  const model = (
+    modelOverride ||
+    process.env.SILICONFLOW_MODEL?.trim() ||
+    SILICONFLOW_DEFAULT_MODEL
+  ).trim()
+  assertSiliconflowFreeModel(model)
+  return { provider: 'siliconflow', apiKey, baseUrl, model }
+}
+
 export function requireProviderConfig(
   provider: LlmProviderId,
   modelOverride?: string,
 ): LlmEndpointConfig {
-  if (provider === 'glm') return requireGlmConfig(modelOverride)
+  const p = normalizeProviderId(provider)
+  if (p === 'glm') return requireGlmConfig(modelOverride)
+  if (p === 'siliconflow') return requireSiliconflowConfig(modelOverride)
   return requireAgnesConfig(modelOverride)
 }
 
@@ -122,21 +170,28 @@ export function societyEnvInt(name: string, defaultValue: number): number {
   return defaultValue
 }
 
-/** Providers that currently have an API key configured (order: agnes, glm). */
+/** Providers that currently have an API key configured (order: agnes, glm, siliconflow). */
 export function configuredFreeProviders(): LlmProviderId[] {
   loadDotEnv()
   const out: LlmProviderId[] = []
   if (process.env.AGNES_API_KEY?.trim()) out.push('agnes')
   if (process.env.GLM_API_KEY?.trim()) out.push('glm')
+  if (process.env.SILICONFLOW_API_KEY?.trim()) out.push('siliconflow')
   return out
 }
 
 /** Default free model id for a provider (env override still free-guarded at require*). */
 export function defaultFreeModelFor(provider: LlmProviderId): string {
   loadDotEnv()
-  if (provider === 'glm') {
+  const p = normalizeProviderId(provider)
+  if (p === 'glm') {
     const m = (process.env.GLM_MODEL?.trim() || 'glm-4-flash').trim()
     assertGlmFreeModel(m)
+    return m
+  }
+  if (p === 'siliconflow') {
+    const m = (process.env.SILICONFLOW_MODEL?.trim() || SILICONFLOW_DEFAULT_MODEL).trim()
+    assertSiliconflowFreeModel(m)
     return m
   }
   const m = (process.env.AGNES_MODEL?.trim() || 'agnes-3.0-flash').trim()

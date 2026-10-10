@@ -12,11 +12,14 @@
  * - same agent cannot reply twice in a row (needs other-agent stimulus between)
  * - per-agent cooldown + global cooldown
  * - each inbox message id handled at most once
- * - daily-ish LLM call budget in memory.json
+ * - LLM call counters in memory.json are display-only (no daily hard cap)
  * - limited parallel replies (SOCIETY_MAX_PARALLEL_REPLIES, prefer different LLM providers)
+ * - agents may ACTION:SILENT; replies may be multi-bubble (|||)
  */
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { AgentId, InboxMessage, RoomId } from '../../../src/types.ts'
+import { sleep } from '../../../src/llm-http.ts'
+import { parseAgentTurn } from '../../society-llm/src/index.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -25,7 +28,7 @@ declare module '@deepseek-ai/cordis' {
   interface Events {
     'society/agent-replied'(payload: {
       agentId: AgentId
-      kind: 'room' | 'direct' | 'diary' | 'idle-skip'
+      kind: 'room' | 'direct' | 'diary' | 'idle-skip' | 'silent'
       body: string
       roomId?: string
       to?: AgentId
@@ -55,8 +58,10 @@ export interface AutoReplyOptions {
   agentCooldownMs?: number
   /** Idle thought if last act older than this (default 3000). */
   idleStaleMs?: number
-  /** Daily-ish LLM call budget per agent (default SOCIETY_DAILY_LLM_BUDGET || 40). */
+  /** @deprecated Ignored — free models have no daily hard cap; counters remain for display. */
   dailyLlmBudget?: number
+  /** Gap between multi-bubble posts (default SOCIETY_BUBBLE_GAP_MS || 400). */
+  bubbleGapMs?: number
   /** Default plaza room for idle ROOM acts. */
   defaultRoomId?: RoomId
   /**
@@ -67,7 +72,7 @@ export interface AutoReplyOptions {
 }
 
 export interface TickActionResult {
-  action: 'reply' | 'idle-room' | 'idle-dm' | 'idle-diary' | 'idle-none' | 'skip' | 'capped' | 'none'
+  action: 'reply' | 'silent' | 'idle-room' | 'idle-dm' | 'idle-diary' | 'idle-none' | 'skip' | 'capped' | 'none'
   agentId?: AgentId
   body?: string
   provider?: string
@@ -89,15 +94,6 @@ function envInt(name: string, fallback: number): number {
 
 function defaultMaxExchanges(): number {
   return envInt('SOCIETY_MAX_EXCHANGES', 3)
-}
-
-function todayKey(): string {
-  // Asia/Shanghai calendar day (box is UTC+8)
-  const d = new Date()
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, '0')
-  const day = String(d.getDate()).padStart(2, '0')
-  return `${y}-${m}-${day}`
 }
 
 function parseIdleAction(raw: string): {
@@ -157,7 +153,7 @@ export class SocietySchedulerService extends Service {
   private cooldownMs = 50
   private agentCooldownMs = 0
   private idleStaleMs = 3_000
-  private dailyLlmBudget = 40
+  private bubbleGapMs = 400
   private maxParallelReplies = 2
   private defaultRoomId: RoomId | null = null
 
@@ -255,7 +251,7 @@ export class SocietySchedulerService extends Service {
     this.cooldownMs = opts?.cooldownMs ?? 50
     this.agentCooldownMs = opts?.agentCooldownMs ?? envInt('SOCIETY_AGENT_COOLDOWN_MS', 0)
     this.idleStaleMs = opts?.idleStaleMs ?? envInt('SOCIETY_IDLE_STALE_MS', 3_000)
-    this.dailyLlmBudget = opts?.dailyLlmBudget ?? envInt('SOCIETY_DAILY_LLM_BUDGET', 40)
+    this.bubbleGapMs = opts?.bubbleGapMs ?? envInt('SOCIETY_BUBBLE_GAP_MS', 400)
     const parallelRaw = opts?.maxParallelReplies ?? envInt('SOCIETY_MAX_PARALLEL_REPLIES', 2)
     this.maxParallelReplies = Math.max(1, Math.min(8, parallelRaw || 1))
     if (opts?.defaultRoomId) this.defaultRoomId = opts.defaultRoomId
@@ -294,11 +290,6 @@ export class SocietySchedulerService extends Service {
     return true
   }
 
-  private budgetOk(agentId: AgentId): boolean {
-    const calls = this.ctx.societyMemory.getLlmCallsToday(agentId)
-    return calls < this.dailyLlmBudget
-  }
-
   private async respectCooldowns(agentId: AgentId): Promise<boolean> {
     const now = Date.now()
     const sinceGlobal = now - this.lastExchangeAt
@@ -316,7 +307,6 @@ export class SocietySchedulerService extends Service {
   private scoreAgent(agentId: AgentId): number {
     if (!this.agentAllowed(agentId)) return -1
     if (this.inFlight.has(agentId)) return -1
-    if (!this.budgetOk(agentId)) return -1
 
     const now = Date.now()
     const lastAct = this.lastActAt.get(agentId) ?? 0
@@ -438,8 +428,8 @@ export class SocietySchedulerService extends Service {
     const unread = this.ctx.societyMailbox.list(agentId, { unreadOnly: true })
     if (unread.length > 0) {
       const msg = unread[0]!
-      const ok = await this.processUnread(agentId, msg)
-      return { action: ok ? 'reply' : 'skip', agentId, provider }
+      const outcome = await this.processUnread(agentId, msg)
+      return { action: outcome, agentId, provider }
     }
 
     // Idle thought only if stale enough (never idle before any exchange — wait for seed drain)
@@ -456,26 +446,64 @@ export class SocietySchedulerService extends Service {
     return { action: idle.action, agentId, body: idle.body, provider }
   }
 
-  private async processUnread(agentId: AgentId, message: InboxMessage): Promise<boolean> {
-    if (this.exchangeCount >= this.maxExchanges) return false
+  /** Post one-or-more bubbles to a room or DM with a small human-like gap. */
+  private async deliverBubbles(opts: {
+    agentId: AgentId
+    bubbles: string[]
+    stimulusId: string
+    roomId?: RoomId
+    dmTo?: AgentId
+  }): Promise<void> {
+    const { agentId, bubbles, stimulusId, roomId, dmTo } = opts
+    for (let i = 0; i < bubbles.length; i++) {
+      const body = bubbles[i]!
+      if (i > 0 && this.bubbleGapMs > 0) await sleep(this.bubbleGapMs)
+      if (roomId) {
+        this.ctx.societyRooms.post({ roomId, from: agentId, body })
+        this.ctx.emit('society/agent-replied', {
+          agentId,
+          kind: 'room',
+          body,
+          roomId,
+          stimulusId,
+        })
+      } else if (dmTo) {
+        this.ctx.societyMailbox.deliver({
+          to: dmTo,
+          from: agentId,
+          kind: 'direct',
+          body,
+        })
+        this.ctx.emit('society/agent-replied', {
+          agentId,
+          kind: 'direct',
+          body,
+          to: dmTo,
+          stimulusId,
+        })
+      }
+    }
+  }
+
+  private async processUnread(
+    agentId: AgentId,
+    message: InboxMessage,
+  ): Promise<'reply' | 'silent' | 'skip'> {
+    if (this.exchangeCount >= this.maxExchanges) return 'skip'
     if (this.handledMessageIds.has(message.id)) {
       this.ctx.societyMailbox.markRead(agentId, message.id)
-      return false
+      return 'skip'
     }
-    if (this.inFlight.has(agentId)) return false
+    if (this.inFlight.has(agentId)) return 'skip'
     if (this.lastReplyAgentId === agentId) {
       this.ctx.logger('society-scheduler').info(
         `skip ${agentId}: would be consecutive self-reply (need other-agent stimulus)`,
       )
-      return false
-    }
-    if (!this.budgetOk(agentId)) {
-      this.ctx.logger('society-scheduler').info(`skip ${agentId}: daily LLM budget exhausted`)
-      return false
+      return 'skip'
     }
     const cool = await this.respectCooldowns(agentId)
-    if (!cool) return false
-    if (this.exchangeCount >= this.maxExchanges) return false
+    if (!cool) return 'skip'
+    if (this.exchangeCount >= this.maxExchanges) return 'skip'
 
     this.handledMessageIds.add(message.id)
     this.inFlight.add(agentId)
@@ -489,52 +517,62 @@ export class SocietySchedulerService extends Service {
           ? this.ctx.societyRooms.get(message.roomId)?.name
           : undefined
 
-      const replyText = await this.ctx.societyLlm.actAsAgent(agentId, {
-        message,
-        roomName,
-      })
+      let turn
+      try {
+        turn = await this.ctx.societyLlm.actTurnAsAgent(agentId, {
+          message,
+          roomName,
+        })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        this.ctx.logger('society-scheduler').warn(
+          `LLM soft-fail ${agentId} (no post): ${msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')}`,
+        )
+        this.lastActAt.set(agentId, Date.now())
+        return 'skip'
+      }
 
-      if (this.exchangeCount >= this.maxExchanges) return false
+      this.lastActAt.set(agentId, Date.now())
+
+      if (turn.silent || turn.bubbles.length === 0) {
+        this.ctx.logger('society-scheduler').info(`silent ${agentId} stimulus=${message.id.slice(0, 8)}`)
+        this.ctx.emit('society/agent-replied', {
+          agentId,
+          kind: 'silent',
+          body: '[SILENT]',
+          roomId: message.roomId,
+          stimulusId: message.id,
+        })
+        return 'silent'
+      }
+
+      if (this.exchangeCount >= this.maxExchanges) return 'skip'
       this.exchangeCount += 1
       this.lastReplyAgentId = agentId
       this.lastExchangeAt = Date.now()
-      this.lastActAt.set(agentId, Date.now())
 
       if (message.kind === 'room' && message.roomId) {
-        this.ctx.societyRooms.post({
-          roomId: message.roomId,
-          from: agentId,
-          body: replyText,
-        })
-        this.ctx.emit('society/agent-replied', {
+        await this.deliverBubbles({
           agentId,
-          kind: 'room',
-          body: replyText,
-          roomId: message.roomId,
+          bubbles: turn.bubbles,
           stimulusId: message.id,
+          roomId: message.roomId,
         })
       } else if (message.kind === 'direct') {
         const to = message.from
         if (to === 'system' || to === 'room') {
           this.ctx.logger('society-scheduler').warn(`skip DM reply: cannot address from=${to}`)
-          return false
+          return 'skip'
         }
-        this.ctx.societyMailbox.deliver({
-          to,
-          from: agentId,
-          kind: 'direct',
-          body: replyText,
-        })
-        this.ctx.emit('society/agent-replied', {
+        await this.deliverBubbles({
           agentId,
-          kind: 'direct',
-          body: replyText,
-          to,
+          bubbles: turn.bubbles,
           stimulusId: message.id,
+          dmTo: to,
         })
       }
       await this.consolidateAfterAct(agentId)
-      return true
+      return 'reply'
     } finally {
       this.inFlight.delete(agentId)
     }
@@ -548,7 +586,6 @@ export class SocietySchedulerService extends Service {
       // Prefer letting someone else go; soft skip
       return { action: 'skip' }
     }
-    if (!this.budgetOk(agentId)) return { action: 'skip' }
     const cool = await this.respectCooldowns(agentId)
     if (!cool) return { action: 'skip' }
     if (this.inFlight.has(agentId)) return { action: 'skip' }
@@ -630,45 +667,38 @@ export class SocietySchedulerService extends Service {
         if (!to || !this.ctx.societyIdentity.get(to) || to === agentId) {
           return { action: 'idle-none', body: parsed.body }
         }
+        const bubbles = parseAgentTurn(parsed.body || '……').bubbles
+        const parts = bubbles.length ? bubbles : [parsed.body || '……']
         this.exchangeCount += 1
         this.lastReplyAgentId = agentId
         this.lastExchangeAt = Date.now()
-        this.ctx.societyMailbox.deliver({
-          to,
-          from: agentId,
-          kind: 'direct',
-          body: parsed.body || '……',
-        })
-        this.ctx.emit('society/agent-replied', {
+        await this.deliverBubbles({
           agentId,
-          kind: 'direct',
-          body: parsed.body || '',
-          to,
+          bubbles: parts,
           stimulusId: `idle-${this.tickCount}`,
+          dmTo: to,
         })
         await this.consolidateAfterAct(agentId)
-        return { action: 'idle-dm', body: parsed.body }
+        return { action: 'idle-dm', body: parts.join(' ||| ') }
       }
 
       // room
       if (!room) return { action: 'idle-none', body: parsed.body }
-      this.exchangeCount += 1
-      this.lastReplyAgentId = agentId
-      this.lastExchangeAt = Date.now()
-      this.ctx.societyRooms.post({
-        roomId: room.id,
-        from: agentId,
-        body: parsed.body || '……',
-      })
-      this.ctx.emit('society/agent-replied', {
-        agentId,
-        kind: 'room',
-        body: parsed.body || '',
-        roomId: room.id,
-        stimulusId: `idle-${this.tickCount}`,
-      })
-      await this.consolidateAfterAct(agentId)
-      return { action: 'idle-room', body: parsed.body }
+      {
+        const bubbles = parseAgentTurn(parsed.body || '……').bubbles
+        const parts = bubbles.length ? bubbles : [parsed.body || '……']
+        this.exchangeCount += 1
+        this.lastReplyAgentId = agentId
+        this.lastExchangeAt = Date.now()
+        await this.deliverBubbles({
+          agentId,
+          bubbles: parts,
+          stimulusId: `idle-${this.tickCount}`,
+          roomId: room.id,
+        })
+        await this.consolidateAfterAct(agentId)
+        return { action: 'idle-room', body: parts.join(' ||| ') }
+      }
     } finally {
       this.inFlight.delete(agentId)
     }
@@ -691,7 +721,6 @@ export class SocietySchedulerService extends Service {
       )
       return
     }
-    if (!this.budgetOk(agentId)) return
 
     // Wait briefly for a parallel slot (Agnes+GLM can share the cap).
     const slotDeadline = Date.now() + 30_000
@@ -726,29 +755,46 @@ export class SocietySchedulerService extends Service {
           ? this.ctx.societyRooms.get(message.roomId)?.name
           : undefined
 
-      const replyText = await this.ctx.societyLlm.actAsAgent(agentId, {
-        message,
-        roomName,
-      })
+      let turn
+      try {
+        turn = await this.ctx.societyLlm.actTurnAsAgent(agentId, {
+          message,
+          roomName,
+        })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        this.ctx.logger('society-scheduler').warn(
+          `LLM soft-fail ${agentId} (no post): ${msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')}`,
+        )
+        this.lastActAt.set(agentId, Date.now())
+        return
+      }
+
+      this.lastActAt.set(agentId, Date.now())
+
+      if (turn.silent || turn.bubbles.length === 0) {
+        this.ctx.logger('society-scheduler').info(`silent ${agentId} stimulus=${message.id.slice(0, 8)}`)
+        this.ctx.emit('society/agent-replied', {
+          agentId,
+          kind: 'silent',
+          body: '[SILENT]',
+          roomId: message.roomId,
+          stimulusId: message.id,
+        })
+        return
+      }
 
       if (this.exchangeCount >= this.maxExchanges) return
       this.exchangeCount += 1
       this.lastReplyAgentId = agentId
       this.lastExchangeAt = Date.now()
-      this.lastActAt.set(agentId, Date.now())
 
       if (message.kind === 'room' && message.roomId) {
-        this.ctx.societyRooms.post({
-          roomId: message.roomId,
-          from: agentId,
-          body: replyText,
-        })
-        this.ctx.emit('society/agent-replied', {
+        await this.deliverBubbles({
           agentId,
-          kind: 'room',
-          body: replyText,
-          roomId: message.roomId,
+          bubbles: turn.bubbles,
           stimulusId: message.id,
+          roomId: message.roomId,
         })
       } else if (message.kind === 'direct') {
         const to = message.from
@@ -756,18 +802,11 @@ export class SocietySchedulerService extends Service {
           this.ctx.logger('society-scheduler').warn(`skip DM reply: cannot address from=${to}`)
           return
         }
-        this.ctx.societyMailbox.deliver({
-          to,
-          from: agentId,
-          kind: 'direct',
-          body: replyText,
-        })
-        this.ctx.emit('society/agent-replied', {
+        await this.deliverBubbles({
           agentId,
-          kind: 'direct',
-          body: replyText,
-          to,
+          bubbles: turn.bubbles,
           stimulusId: message.id,
+          dmTo: to,
         })
       }
       await this.consolidateAfterAct(agentId)

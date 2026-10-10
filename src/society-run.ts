@@ -11,7 +11,7 @@
  *   SOCIETY_COOLDOWN_MS=800
  *   SOCIETY_AGENT_COOLDOWN_MS=400
  *   SOCIETY_IDLE_STALE_MS=2500
- *   SOCIETY_DAILY_LLM_BUDGET=40
+ *   (no daily LLM hard cap; SOCIETY_DAILY_LLM_BUDGET ignored)
  *   SOCIETY_MAX_PARALLEL_REPLIES=2
  *   AGNES_MODEL=agnes-3.0-flash (free only)
  *
@@ -48,11 +48,10 @@ async function main() {
   const cooldownMs = envInt('SOCIETY_COOLDOWN_MS', 800)
   const agentCooldownMs = envInt('SOCIETY_AGENT_COOLDOWN_MS', 400)
   const idleStaleMs = envInt('SOCIETY_IDLE_STALE_MS', 2_500)
-  const dailyLlmBudget = envInt('SOCIETY_DAILY_LLM_BUDGET', 40)
   const maxParallelReplies = Math.max(1, envInt('SOCIETY_MAX_PARALLEL_REPLIES', 2) || 1)
 
   console.log(
-    `✓ caps: maxTicks=${maxTicks} maxExchanges=${maxExchanges} tickMs=${tickMs} cooldownMs=${cooldownMs} agentCooldownMs=${agentCooldownMs} idleStaleMs=${idleStaleMs} dailyLlmBudget=${dailyLlmBudget} maxParallelReplies=${maxParallelReplies}`,
+    `✓ caps: maxTicks=${maxTicks} maxExchanges=${maxExchanges} tickMs=${tickMs} cooldownMs=${cooldownMs} agentCooldownMs=${agentCooldownMs} idleStaleMs=${idleStaleMs} maxParallelReplies=${maxParallelReplies} (LLM budget unlimited)`,
   )
   console.log('  stop: Ctrl+C / SIGINT / SIGTERM, or wait for caps')
 
@@ -80,7 +79,6 @@ async function main() {
     cooldownMs,
     agentCooldownMs,
     idleStaleMs,
-    dailyLlmBudget,
     maxParallelReplies,
   })
 

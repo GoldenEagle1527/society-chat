@@ -17,7 +17,7 @@ import {
 } from './paths.ts'
 import { listDmThreads } from './dm-threads.ts'
 
-const SECRET_KEY_RE = /(api[_-]?key|secret|password|token|authorization|bearer|agnes_api|glm_api)/i
+const SECRET_KEY_RE = /(api[_-]?key|secret|password|token|authorization|bearer|agnes_api|glm_api|siliconflow_api)/i
 
 export type ObserveChatKind = 'group' | 'dm' | 'self'
 
