@@ -17,15 +17,18 @@
  * - at most MAX_ROOM_REPLIES_PER_TICK room replies per tick (idle/DM still parallel) to reduce same-room blindness
  * - prefer @mention / replyTo-me unread; skip stale room stimuli (>STALE_NEWER_COUNT newer msgs or age)
  * - room replies auto-set replyTo to the stimulus room message id
- * - agents may ACTION:SILENT; replies may be multi-bubble (|||)
- * - idle self-loop: mix diary with ROOM/DM; news personas often web_search then share
- * - idle DIARY/SELF: private-only prompts + remap/split outbound chat voice to ROOM
- * - idle tools: occasionally actAsAgent; search idle path has per-agent cooldown
+ * - replies/idle use structured closing tools (speak_in_room / stay_silent / write_diary / …)
+ * - no ACTION: text protocol; tools apply side effects; scheduler must not double-post
+ * - multi-bubble via ||| inside tool body args
+ * - idle: always actClosedTurn; news personas often web_search then speak_in_room
+ * - write_diary rejects outbound chat voice server-side
  */
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { AgentId, InboxMessage, RoomId } from '../../../src/types.ts'
-import { sleep } from '../../../src/llm-http.ts'
-import { parseAgentTurn } from '../../society-llm/src/index.ts'
+import type { AgentActResult } from '../../society-llm/src/index.ts'
+
+// Re-export voice helpers for offline smokes
+export { looksLikeOutboundChatLine, classifyIdlePrivateBody } from '../../society-tools/src/index.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -224,209 +227,35 @@ function idleBiasFor(agentId: string): { preferSearch: boolean; socialPrefer: nu
   }
 }
 
-/** Loose ACTION control line (optional trailing junk on same line). */
-const ACTION_LINE_LOOSE_RE =
-  /^ACTION:\s*(ROOM|DM:(\S+)|DIARY|SELF|NONE|SILENT|SEARCH|REPLY)\b/i
+/** @deprecated ACTION text protocol removed — kept as no-op stubs for any stray imports. */
+export function stripActionMarkup(raw: string): string {
+  return String(raw || '').trim()
+}
+
+export function countActionDirectives(_text: string): number {
+  return 0
+}
+
+export function looksLikeInstructionMenu(_text: string): boolean {
+  return false
+}
+
+export function extractConcreteIdleBody(text: string): string {
+  return String(text || '').trim()
+}
 
 export interface IdleActionParse {
   body: string
   act: 'room' | 'dm' | 'diary' | 'self' | 'none'
   to?: string
-  /** True when the model echoed a multi-ACTION menu instead of choosing one. */
   malformed?: boolean
 }
 
-/** Strip ACTION control tokens/lines so they never reach room / DM / diary. */
-export function stripActionMarkup(raw: string): string {
-  return String(raw || '')
-    .split(/\r?\n/)
-    .map((line) => {
-      const t = line.trim()
-      if (ACTION_LINE_LOOSE_RE.test(t)) return ''
-      return line.replace(/\bACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE|SILENT|SEARCH|REPLY)\b/gi, '')
-    })
-    .filter((line) => line.trim().length > 0)
-    .join('\n')
-    .replace(/\|{3}/g, '\n')
-    .replace(/[ \t]+\n/g, '\n')
-    .trim()
-}
-
-/** Count distinct ACTION directives (menu detection). */
-export function countActionDirectives(text: string): number {
-  const matches = String(text || '').match(
-    /(?:^|\n)\s*ACTION:\s*(ROOM|DM:\S+|DIARY|SELF|NONE|SILENT|SEARCH|REPLY)\b/gi,
-  )
-  return matches?.length ?? 0
-}
-
-/** True if text still looks like an instruction / option menu, not speech. */
-export function looksLikeInstructionMenu(text: string): boolean {
-  const t = String(text || '')
-  if (countActionDirectives(t) >= 2) return true
-  if (/ACTION:\s*ROOM[\s\S]*ACTION:\s*DM:[\s\S]*ACTION:\s*DIARY/i.test(t)) return true
-  const dashLines = (t.match(/^[-—–─]{1,3}.+$/gm) || []).length
-  if (dashLines >= 2 && /ACTION:\s*(ROOM|DM|DIARY)/i.test(t)) return true
-  // echoed numbered menu remnants without clean ACTION lines left
-  if (
-    dashLines >= 2 &&
-    /(去群聊|主动私信|写一句日记|内心独白)/.test(t) &&
-    /(「plaza」|agentId|随感)/i.test(t)
-  ) {
-    return true
-  }
-  return false
-}
-
-function isPlaceholderQuote(s: string): boolean {
-  const t = s.trim()
-  if (!t) return true
-  if (/^ACTION:/i.test(t)) return true
-  if (/^(ROOM|DM:|DIARY|SELF|NONE|SILENT|SEARCH|REPLY)$/i.test(t)) return true
-  // room names / ids / placeholders echoed from the prompt
-  if (/^(plaza|agentId|<agentId>|agnes|glm|xingchen[_a-z0-9]*)$/i.test(t)) return true
-  if (t.length <= 12 && /^[A-Za-z0-9_.<>-]+$/.test(t)) return true
-  return false
-}
-
-/** Pull a single concrete utterance from menu-ish model dumps. */
-export function extractConcreteIdleBody(text: string): string {
-  const t = String(text || '').trim()
-  if (!t) return ''
-
-  const quoteRe = /「([^」]{1,160})」|"([^"]{1,160})"|“([^”]{1,160})”/g
-  const quotes: string[] = []
-  let m: RegExpExecArray | null
-  while ((m = quoteRe.exec(t)) !== null) {
-    const s = (m[1] || m[2] || m[3] || '').trim()
-    if (isPlaceholderQuote(s)) continue
-    quotes.push(s)
-  }
-  // First concrete quoted utterance in document order (skip 「plaza」 placeholders)
-  if (quotes.length) return quotes[0]!.slice(0, 500)
-
-  for (const line of t.split(/\r?\n/)) {
-    let lineT = line.trim()
-    if (!lineT) continue
-    if (/^ACTION:/i.test(lineT)) continue
-    if (/^\d+[).、]\s*ACTION:/i.test(lineT)) continue
-    if (/^\d+[).、]/.test(lineT) && /ACTION:/.test(lineT)) continue
-    if (/^(请只做|先写正文|然后|优先|必须|不要|先用工具)/.test(lineT)) continue
-    if (/^[-—–─]{1,3}/.test(lineT)) {
-      const inner = lineT.replace(/^[-—–─]+\s*/, '')
-      const qm = inner.match(/「([^」]+)」|"([^"]+)"|“([^”]+)”/)
-      if (qm) {
-        const s = (qm[1] || qm[2] || qm[3] || '').trim()
-        if (s && !isPlaceholderQuote(s)) return s.slice(0, 500)
-      }
-      if (/^(在|主动|写一句|内容|对象|去群聊|分享)/.test(inner)) continue
-      lineT = inner
-    }
-    if (lineT.length >= 2) return lineT.slice(0, 500)
-  }
-  return ''
-}
-
-/** @deprecated prefer stripActionMarkup */
-function cleanIdleBody(raw: string): string {
-  return stripActionMarkup(raw)
-}
-
-/**
- * Parse idle LLM output: body is text above the final ACTION line only.
- * Multi-ACTION menus are malformed → pick ROOM (if socialPrefer) or DIARY,
- * using the first concrete sentence, or none/SILENT if nothing recoverable.
- */
-export function parseIdleAction(
-  raw: string,
-  opts?: { socialPrefer?: number },
-): IdleActionParse {
-  const text = String(raw ?? '').trim()
-  const socialPrefer = opts?.socialPrefer ?? 0
-  const preferRoom = socialPrefer > 0
-  if (!text) return { body: '', act: 'none' }
-
-  const lines = text.split(/\r?\n/)
-  const actionIdxs: number[] = []
-  for (let i = 0; i < lines.length; i++) {
-    if (ACTION_LINE_LOOSE_RE.test(lines[i]!.trim())) actionIdxs.push(i)
-  }
-
-  const malformedMenu = actionIdxs.length >= 2 || countActionDirectives(text) >= 2
-
-  if (malformedMenu) {
-    const cleaned = stripActionMarkup(text)
-    const body = extractConcreteIdleBody(cleaned)
-    if (!body) return { body: '', act: 'none', malformed: true }
-    return { body, act: preferRoom ? 'room' : 'diary', malformed: true }
-  }
-
-  let cut = lines.length
-  let actLine = ''
-  if (actionIdxs.length === 1) {
-    cut = actionIdxs[0]!
-    actLine = lines[cut]!.trim()
-  }
-
-  let body = stripActionMarkup(lines.slice(0, cut).join('\n'))
-
-  // Soft-fail / recover if body still looks like an instruction menu
-  if (looksLikeInstructionMenu(body) || (body && looksLikeInstructionMenu(text))) {
-    const recovered = extractConcreteIdleBody(stripActionMarkup(text))
-    if (!recovered) return { body: '', act: 'none', malformed: true }
-    return {
-      body: recovered,
-      act: preferRoom ? 'room' : 'diary',
-      malformed: true,
-    }
-  }
-
-  if (!actLine) {
-    if (body) return { body, act: 'diary' }
-    return { body: '', act: 'none' }
-  }
-
-  const m = actLine.match(ACTION_LINE_LOOSE_RE)
-  if (!m) {
-    if (body) return { body, act: 'diary' }
-    return { body: '', act: 'none' }
-  }
-  const kind = m[1]!.toUpperCase()
-  if (kind === 'ROOM' || kind === 'SEARCH') return { body, act: 'room' }
-  if (kind === 'DIARY') return { body, act: 'diary' }
-  if (kind === 'SELF') return { body, act: 'self' }
-  if (kind === 'NONE' || kind === 'SILENT' || kind === 'REPLY') {
-    if (body) return { body, act: 'diary' }
-    return { body: '', act: 'none' }
-  }
-  if (kind.startsWith('DM:')) {
-    const to = (m[2] || kind.slice(3)).trim().toLowerCase().replace(/^<|>$/g, '')
-    return { body, act: 'dm', to }
-  }
-  return { body, act: 'none' }
-}
-
-
-/** Known cast display names / ids for outbound-chat heuristics. */
-const CAST_NAME_RE = /老码|阿宁|时辰|文心|agnes|glm|xingchen[_a-z0-9]*/i
-
-/**
- * True if a single line looks like outbound plaza/DM speech
- * (addressing others, @mentions, group questions) rather than private notes.
- */
-export function looksLikeOutboundChatLine(line: string): boolean {
-  const t = String(line || '').trim()
-  if (!t) return false
-  if (/@[\w\u4e00-\u9fff]+/.test(t)) return true
-  if (/(在吗|大家好|有没有人|想问问大家|群里|有人吗|谁在|请问大家|各位好)/.test(t)) return true
-  if (/想问问|大家一般|有没有人会|求问|初入职场群/.test(t)) return true
-  // "老码在吗？" / "文心你好" / naming someone then asking
-  if (CAST_NAME_RE.test(t) && /(在吗|你好|请问|帮忙|一起|怎么看|觉得呢|对吗|来一下|看一下)/.test(t)) {
-    return true
-  }
-  // second-person questions aimed at a named agent: 「老码，…？」
-  if (CAST_NAME_RE.test(t) && /[，,]\s*.*[？?]/.test(t) && /(你|您)/.test(t)) return true
-  return false
+/** @deprecated Use closing tools instead of ACTION lines. */
+export function parseIdleAction(raw: string, _opts?: { socialPrefer?: number }): IdleActionParse {
+  const body = String(raw ?? '').trim()
+  if (!body) return { body: '', act: 'none' }
+  return { body, act: 'none', malformed: true }
 }
 
 export type IdlePrivateBodyClass = {
@@ -435,57 +264,10 @@ export type IdlePrivateBodyClass = {
   chatBody: string
 }
 
-/**
- * Split diary/self body into private reflection vs outbound chat voice.
- * Line-oriented (also splits on ||| bubbles). Empty → private.
- */
-export function classifyIdlePrivateBody(body: string): IdlePrivateBodyClass {
-  const raw = String(body || '').trim()
-  if (!raw) return { kind: 'private', privateBody: '', chatBody: '' }
-
-  const chunks = raw
-    .split(/\r?\n|\|\|\|/g)
-    .map((s) => s.trim())
-    .filter(Boolean)
-  if (!chunks.length) return { kind: 'private', privateBody: '', chatBody: '' }
-
-  const privateParts: string[] = []
-  const chatParts: string[] = []
-  for (const c of chunks) {
-    if (looksLikeOutboundChatLine(c)) chatParts.push(c)
-    else privateParts.push(c)
-  }
-
-  // Whole-body fallback: single paragraph with chat markers mid-text
-  if (!chatParts.length && chunks.length === 1 && looksLikeOutboundChatLine(raw)) {
-    return { kind: 'chatty', privateBody: '', chatBody: raw }
-  }
-  // If no newlines but clearly chatty substring after a private sentence
-  if (!chatParts.length && /[。！？\n]/.test(raw) && /(在吗|想问问大家|大家好|有没有人|@)/.test(raw)) {
-    const parts = raw.split(/(?<=[。！？])/).map((s) => s.trim()).filter(Boolean)
-    if (parts.length >= 2) {
-      privateParts.length = 0
-      for (const p of parts) {
-        if (looksLikeOutboundChatLine(p)) chatParts.push(p)
-        else privateParts.push(p)
-      }
-    }
-  }
-
-  const privateBody = privateParts.join('\n').trim()
-  const chatBody = chatParts.join('\n').trim()
-  if (chatBody && privateBody) return { kind: 'mixed', privateBody, chatBody }
-  if (chatBody) return { kind: 'chatty', privateBody: '', chatBody }
-  return { kind: 'private', privateBody: privateBody || raw, chatBody: '' }
-}
-
-/**
- * After parseIdleAction: if DIARY/SELF body is outbound chat, remap to ROOM
- * (or split mixed → private diary + room chat). Caller must have a room for ROOM.
- */
+/** @deprecated Diary chat-mix handled inside write_diary tool. */
 export function resolveDiaryChatMix(
   parsed: IdleActionParse,
-  opts?: { hasRoom?: boolean },
+  _opts?: { hasRoom?: boolean },
 ): {
   act: IdleActionParse['act']
   diaryBody?: string
@@ -494,50 +276,10 @@ export function resolveDiaryChatMix(
   to?: string
   remapped: boolean
 } {
-  if (parsed.act !== 'diary' && parsed.act !== 'self') {
-    return {
-      act: parsed.act,
-      body: parsed.body,
-      to: parsed.to,
-      remapped: false,
-    }
-  }
-  const classified = classifyIdlePrivateBody(parsed.body)
-  const hasRoom = opts?.hasRoom !== false
-
-  if (classified.kind === 'chatty' && hasRoom) {
-    return {
-      act: 'room',
-      body: classified.chatBody,
-      roomBody: classified.chatBody,
-      remapped: true,
-    }
-  }
-  if (classified.kind === 'mixed' && hasRoom) {
-    return {
-      act: 'room',
-      body: classified.chatBody,
-      diaryBody: classified.privateBody,
-      roomBody: classified.chatBody,
-      remapped: true,
-    }
-  }
-  if (classified.kind === 'chatty' && !hasRoom) {
-    // No plaza — drop chatty voice, keep nothing rather than pollute diary
-    return { act: 'none', body: '', remapped: true }
-  }
-  if (classified.kind === 'mixed' && !hasRoom) {
-    return {
-      act: parsed.act,
-      body: classified.privateBody,
-      diaryBody: classified.privateBody,
-      remapped: true,
-    }
-  }
   return {
     act: parsed.act,
-    body: classified.privateBody || parsed.body,
-    diaryBody: classified.privateBody || parsed.body,
+    body: parsed.body,
+    to: parsed.to,
     remapped: false,
   }
 }
@@ -952,63 +694,85 @@ export class SocietySchedulerService extends Service {
     return usable[0]!
   }
 
-  /** Post one-or-more bubbles to a room or DM with a small human-like gap. */
-  private async deliverBubbles(opts: {
-    agentId: AgentId
-    bubbles: string[]
-    stimulusId: string
-    roomId?: RoomId
-    dmTo?: AgentId
-    /** Auto-set when responding to a room stimulus. */
-    replyTo?: string
-  }): Promise<void> {
-    const { agentId, bubbles, stimulusId, roomId, dmTo, replyTo } = opts
-    let posted = 0
-    for (let i = 0; i < bubbles.length; i++) {
-      let body = stripActionMarkup(bubbles[i]!)
-      if (!body.trim()) continue
-      if (looksLikeInstructionMenu(body) || countActionDirectives(body) >= 1) {
-        // Never post ACTION menus / leftover control lines as chat
-        body = extractConcreteIdleBody(body)
-        if (!body.trim() || looksLikeInstructionMenu(body)) {
-          this.ctx.logger('society-scheduler').warn(
-            `drop menu-like bubble from ${agentId}`,
-          )
-          continue
-        }
-      }
-      if (posted > 0 && this.bubbleGapMs > 0) await sleep(this.bubbleGapMs)
-      posted += 1
-      if (roomId) {
-        this.ctx.societyRooms.post({
-          roomId,
-          from: agentId,
-          body,
-          ...(replyTo ? { replyTo } : {}),
-        })
-        this.ctx.emit('society/agent-replied', {
-          agentId,
-          kind: 'room',
-          body,
-          roomId,
-          stimulusId,
-        })
-      } else if (dmTo) {
-        this.ctx.societyMailbox.deliver({
-          to: dmTo,
-          from: agentId,
-          kind: 'direct',
-          body,
-        })
-        this.ctx.emit('society/agent-replied', {
-          agentId,
-          kind: 'direct',
-          body,
-          to: dmTo,
-          stimulusId,
-        })
+  /** Map closing tool result → tick action + emit events (no re-post; tools already acted). */
+  private noteClosingAct(
+    agentId: AgentId,
+    result: AgentActResult,
+    stimulusId: string,
+    opts?: { roomId?: string; steerSearch?: boolean },
+  ): { action: TickResult['action']; body?: string } {
+    const detail = result.detail || result.acted
+    let bodyPreview = ''
+    try {
+      const j = JSON.parse(result.detail || '') as { text?: string; messageIds?: string[] }
+      bodyPreview = j.text || result.acted
+    } catch {
+      bodyPreview = result.acted
+    }
+
+    if (result.acted === 'stay_silent' || result.acted === 'do_nothing' || result.acted === 'none') {
+      const kind = result.acted === 'stay_silent' ? 'silent' : 'idle-skip'
+      this.ctx.emit('society/agent-replied', {
+        agentId,
+        kind: kind as 'silent' | 'idle-skip',
+        body: bodyPreview || `[${result.acted}]`,
+        roomId: opts?.roomId,
+        stimulusId,
+      })
+      if (result.acted === 'stay_silent') return { action: 'silent', body: bodyPreview }
+      return { action: 'idle-none', body: bodyPreview }
+    }
+
+    if (result.acted === 'diary' || result.acted === 'thought') {
+      this.exchangeCount += 1
+      this.lastExchangeAt = Date.now()
+      this.ctx.emit('society/agent-replied', {
+        agentId,
+        kind: 'diary',
+        body: bodyPreview,
+        stimulusId,
+      })
+      return {
+        action: opts?.steerSearch
+          ? 'idle-search'
+          : result.acted === 'diary'
+            ? 'idle-diary'
+            : 'idle-self',
+        body: bodyPreview,
       }
     }
+
+    if (result.acted === 'speak_in_room') {
+      this.exchangeCount += 1
+      this.lastReplyAgentId = agentId
+      this.lastExchangeAt = Date.now()
+      this.ctx.emit('society/agent-replied', {
+        agentId,
+        kind: 'room',
+        body: bodyPreview,
+        roomId: opts?.roomId,
+        stimulusId,
+      })
+      return {
+        action: opts?.steerSearch ? 'idle-search' : 'idle-room',
+        body: bodyPreview,
+      }
+    }
+
+    if (result.acted === 'send_dm') {
+      this.exchangeCount += 1
+      this.lastReplyAgentId = agentId
+      this.lastExchangeAt = Date.now()
+      this.ctx.emit('society/agent-replied', {
+        agentId,
+        kind: 'direct',
+        body: bodyPreview,
+        stimulusId,
+      })
+      return { action: 'idle-dm', body: bodyPreview }
+    }
+
+    return { action: 'idle-none', body: detail }
   }
 
   private async processUnread(
@@ -1058,12 +822,22 @@ export class SocietySchedulerService extends Service {
           ? this.ctx.societyRooms.get(message.roomId)?.name
           : undefined
 
-      let turn
+      const mode = message.kind === 'direct' ? 'reply-dm' : 'reply-room'
+      let result: AgentActResult
       try {
-        turn = await this.ctx.societyLlm.actTurnAsAgent(agentId, {
-          message,
-          roomName,
-        })
+        result = await this.ctx.societyLlm.actClosedTurn(
+          agentId,
+          { message, roomName },
+          mode,
+          {
+            injectReplyTo:
+              message.kind === 'room' ? message.sourceMessageId : undefined,
+            defaultDmTo:
+              message.kind === 'direct' && message.from !== 'system' && message.from !== 'room'
+                ? message.from
+                : undefined,
+          },
+        )
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         this.ctx.logger('society-scheduler').warn(
@@ -1075,8 +849,15 @@ export class SocietySchedulerService extends Service {
 
       this.lastActAt.set(agentId, Date.now())
 
-      if (turn.silent || turn.bubbles.length === 0) {
-        this.ctx.logger('society-scheduler').info(`silent ${agentId} stimulus=${message.id.slice(0, 8)}`)
+      if (
+        !result.ok ||
+        result.acted === 'stay_silent' ||
+        result.acted === 'do_nothing' ||
+        result.acted === 'none'
+      ) {
+        this.ctx.logger('society-scheduler').info(
+          `silent ${agentId} stimulus=${message.id.slice(0, 8)} acted=${result.acted}`,
+        )
         this.ctx.emit('society/agent-replied', {
           agentId,
           kind: 'silent',
@@ -1087,31 +868,27 @@ export class SocietySchedulerService extends Service {
         return 'silent'
       }
 
+      // Tools already posted — only count exchange / emit
       if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return 'skip'
       this.exchangeCount += 1
       this.lastReplyAgentId = agentId
       this.lastExchangeAt = Date.now()
 
-      if (message.kind === 'room' && message.roomId) {
-        const replyTo = message.sourceMessageId
-        await this.deliverBubbles({
+      if (result.acted === 'speak_in_room') {
+        this.ctx.emit('society/agent-replied', {
           agentId,
-          bubbles: turn.bubbles,
-          stimulusId: message.id,
+          kind: 'room',
+          body: result.detail || '',
           roomId: message.roomId,
-          replyTo,
-        })
-      } else if (message.kind === 'direct') {
-        const to = message.from
-        if (to === 'system' || to === 'room') {
-          this.ctx.logger('society-scheduler').warn(`skip DM reply: cannot address from=${to}`)
-          return 'skip'
-        }
-        await this.deliverBubbles({
-          agentId,
-          bubbles: turn.bubbles,
           stimulusId: message.id,
-          dmTo: to,
+        })
+      } else if (result.acted === 'send_dm') {
+        this.ctx.emit('society/agent-replied', {
+          agentId,
+          kind: 'direct',
+          body: result.detail || '',
+          to: message.from,
+          stimulusId: message.id,
         })
       }
       await this.consolidateAfterAct(agentId)
@@ -1125,8 +902,6 @@ export class SocietySchedulerService extends Service {
     agentId: AgentId,
   ): Promise<{ action: TickResult['action']; body?: string }> {
     if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return { action: 'capped' }
-    // Personal self-loop is allowed even if this agent spoke last in plaza —
-    // diary/self must not wait for someone else to unlock the turn.
     const cool = await this.respectCooldowns(agentId)
     if (!cool) return { action: 'skip' }
     if (this.inFlight.has(agentId)) return { action: 'skip' }
@@ -1136,13 +911,12 @@ export class SocietySchedulerService extends Service {
       const profile = this.ctx.societyIdentity.require(agentId)
       const soul = this.ctx.societySoul.get(agentId)
       const bias = idleBiasFor(agentId)
-      const newsy = caresAboutCurrentAffairs(agentId, soul.interests, profile.persona) || bias.preferSearch
+      const newsy =
+        caresAboutCurrentAffairs(agentId, soul.interests, profile.persona) || bias.preferSearch
       const lastSearch = this.lastSearchIdleAt.get(agentId) ?? 0
       const searchCooldownOk = Date.now() - lastSearch >= this.idleSearchCooldownMs
-      // News personas: often take the search path when cooldown allows.
-      const steerSearch = newsy && searchCooldownOk && Math.random() < (bias.preferSearch ? 0.72 : 0.45)
-      // Everyone else: occasional tools (notes / light search), not tools-disabled always.
-      const useTools = steerSearch || Math.random() < bias.toolPrefer
+      const steerSearch =
+        newsy && searchCooldownOk && Math.random() < (bias.preferSearch ? 0.72 : 0.45)
 
       const others = this.ctx.societyIdentity
         .list()
@@ -1150,6 +924,7 @@ export class SocietySchedulerService extends Service {
         .filter((id) => id !== agentId)
       const room =
         (this.defaultRoomId && this.ctx.societyRooms.get(this.defaultRoomId)) ||
+        this.ctx.societyRooms.listRooms().find((r) => r.name === 'plaza') ||
         this.ctx.societyRooms.listRooms()[0]
       const roomLabel = room ? `「${room.name}」` : '广场'
       const recent =
@@ -1161,61 +936,42 @@ export class SocietySchedulerService extends Service {
               .join('\n')
           : ''
 
-      const actionMenu = [
-        `1) ACTION:ROOM — 去群聊${roomLabel}说一句（鼓励；有感就发，别闷着）`,
-        `2) ACTION:DM:<agentId> — 主动私信（对象：${others.join(' / ') || '无'}）`,
-        '3) ACTION:DIARY — 私人日记/随感（第一人称写给自己；禁止点名他人、禁止 @、禁止「xxx在吗」、禁止「大家」、禁止群聊式提问；想说话用 ROOM/DM）',
-        '4) ACTION:SELF — 内心独白/随想笔记（同样必须是私密笔记，不要写成对别人喊话）',
-        '5) ACTION:NONE — 真的什么都不想做时才选（请少用）',
-      ]
-      const diaryVsChatRule =
-        'DIARY/SELF 正文只能是写给自己的心里话；若想喊人、提问群友、说「xxx在吗」或「想问问大家」，必须改选 ACTION:ROOM 或 ACTION:DM，不要写进日记。'
+      // Keep tools default room in sync for speak_in_room
+      if (room) this.ctx.societyTools.setDefaultRoom(room.id)
+
+      const closingList =
+        '收束工具（必须调用恰好一个）：speak_in_room / send_dm / write_diary / write_thought / do_nothing'
 
       let stimulus: string
       if (steerSearch) {
         stimulus = [
           '【自主生活 / 时政关注】你此刻没有未读。你关心时政与公共议题——请先动手查一下再说话。',
-          '必须先调用 web_search：用一句具体的中文查询搜近期时政/热点/公共议题（不要空泛到只有「新闻」两个字）。',
-          '看完结果后写 1～3 句短评（可引用一条要点），然后选一个收束动作：',
-          ...actionMenu.slice(0, 4),
-          '优先 ACTION:ROOM 去广场分享短评；若此刻更想沉淀就 ACTION:DIARY。',
-          diaryVsChatRule,
+          '必须先调用 web_search：用一句具体的中文查询搜近期时政/热点/公共议题。',
+          '看完结果后写短评，再调用收束工具：优先 speak_in_room 去广场分享；或 write_diary 沉淀。',
+          closingList,
           recent ? `广场近况：\n${recent}` : '广场尚安静——正好适合你带一条新热点过去。',
-          '先用工具，再写正文，最后一行必须是上列 ACTION 之一（只选一个）。不要 SILENT，不要空搜不写，不要抄整份菜单。',
-        ].join('\n')
-      } else if (useTools) {
-        stimulus = [
-          '【自主生活 / 自我循环】你是独立的人，此刻没有未读。广场是可选社交工具；你也可以用工具做点小事。',
-          '请只做一件事（可用工具：web_search / write_file / read_file / list_workspace 等）：',
-          '- 偶尔 web_search 查与你兴趣相关的一点信息；或',
-          '- write_file 往 notes/ 写一句备忘；或',
-          '- 不调用工具，直接社交/写日记。',
-          '然后用正文 + ACTION 收束：',
-          ...actionMenu,
-          recent ? `广场近况：\n${recent}` : '广场尚安静——你可以去打招呼，或先记一笔。',
-          diaryVsChatRule,
-          `社交与日记要混合：大约 ${Math.round(bias.socialPrefer * 100)}% 时候选 ROOM/DM，其余 DIARY/SELF。`,
-          '先写正文（若用了工具就根据结果写），最后一行必须是上列 ACTION 之一。只选一个，禁止列出多个 ACTION 菜单。',
+          `可私信对象：${others.join(' / ') || '无'}；默认群聊${roomLabel}。`,
+          '禁止输出 ACTION: 文本；禁止只回纯文本。',
         ].join('\n')
       } else {
         stimulus = [
-          '【自主生活 / 自我循环】你是独立的人，此刻没有未读。先过自己的生活；广场是可选社交工具。',
-          '请只做一件小事（1～3 句），社交与日记要混合，别只会闷头写日记：',
-          ...actionMenu,
-          recent ? `广场近况：\n${recent}` : '广场尚安静——你可以主动去说一句，或先写日记。',
-          diaryVsChatRule,
-          `先写正文，最后一行必须是上列 ACTION 之一（只选一个，禁止把 1)2)3) 整份菜单抄回来）。大约 ${Math.round(bias.socialPrefer * 100)}% 时候请选 ROOM 或 DM。`,
+          '【自主生活 / 自我循环】你是独立的人，此刻没有未读。广场是可选社交工具。',
+          '可先选用研究工具（web_search / write_file / list_agents 等），然后必须用收束工具结束本回合。',
+          closingList,
+          'speak_in_room：去群聊说一句（可省略 roomId，默认广场）；body 可用 ||| 拆气泡。',
+          `send_dm：主动私信（to 为 agentId：${others.join(' / ') || '无'}）。`,
+          'write_diary / write_thought：仅第一人称私密笔记（禁止 @、禁止「xxx在吗」、禁止群聊提问）。',
+          'do_nothing：真的什么都不想做时才用（请少用）。',
+          recent ? `广场近况：\n${recent}` : '广场尚安静——你可以去打招呼，或先记一笔。',
+          `社交与日记要混合：大约 ${Math.round(bias.socialPrefer * 100)}% 时候选 speak_in_room/send_dm，其余 diary/thought。`,
+          '禁止输出 ACTION: 行或抄工具菜单当聊天。',
         ].join('\n')
       }
 
       this.ctx.societyMemory.recordLlmCall(agentId)
-      let raw: string
+      let result: AgentActResult
       try {
-        if (useTools) {
-          raw = await this.ctx.societyLlm.actAsAgent(agentId, { text: stimulus })
-        } else {
-          raw = await this.ctx.societyLlm.replyAsAgent(agentId, { text: stimulus })
-        }
+        result = await this.ctx.societyLlm.actClosedTurn(agentId, { text: stimulus }, 'idle')
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         this.ctx.logger('society-scheduler').warn(
@@ -1224,232 +980,30 @@ export class SocietySchedulerService extends Service {
         this.lastActAt.set(agentId, Date.now())
         return { action: 'skip' }
       }
-      if (steerSearch) {
-        this.lastSearchIdleAt.set(agentId, Date.now())
-      }
-      let parsed = parseIdleAction(raw, { socialPrefer: bias.socialPrefer })
-      parsed = { ...parsed, body: stripActionMarkup(parsed.body || '') }
-      if (parsed.malformed) {
+      if (steerSearch) this.lastSearchIdleAt.set(agentId, Date.now())
+      this.lastActAt.set(agentId, Date.now())
+
+      if (!result.ok || result.acted === 'none') {
         this.ctx.logger('society-scheduler').warn(
-          `idle malformed ACTION menu from ${agentId}; recovered act=${parsed.act}`,
+          `idle soft-fail ${agentId}: no closing tool (${result.detail?.slice(0, 80) || ''})`,
         )
-      }
-      // Soft-fail: still looks like an instruction menu after recovery
-      if (parsed.body && (looksLikeInstructionMenu(parsed.body) || countActionDirectives(parsed.body) >= 2)) {
-        this.ctx.logger('society-scheduler').warn(
-          `idle soft-fail ${agentId}: body still looks like ACTION menu`,
-        )
-        this.lastActAt.set(agentId, Date.now())
         return { action: 'idle-none', body: '' }
       }
 
-      // Soft bias: empty NONE sometimes becomes a short self-note so society stays alive
-      if (parsed.act === 'none' && !parsed.body.trim() && Math.random() < 0.55) {
-        parsed = { body: '（静静待了一会儿，整理了一下思绪。）', act: 'self' }
+      if (exchangesCapped(this.exchangeCount, this.maxExchanges) && result.sideEffectDone) {
+        // Side effect already happened via tool — still note it
+      } else if (exchangesCapped(this.exchangeCount, this.maxExchanges)) {
+        return { action: 'capped' }
       }
 
-      // Diary/SELF must stay private — remap or split outbound chat voice into ROOM
-      let splitDiaryBody: string | undefined
-      if (parsed.act === 'diary' || parsed.act === 'self') {
-        const resolved = resolveDiaryChatMix(parsed, { hasRoom: !!room })
-        if (resolved.remapped) {
-          this.ctx.logger('society-scheduler').warn(
-            `idle diary/chat mix ${agentId}: ${parsed.act} → ${resolved.act}` +
-              (resolved.diaryBody ? ' (kept private + room)' : ' (chatty→room)'),
-          )
-          if (resolved.diaryBody) splitDiaryBody = resolved.diaryBody
-          parsed = {
-            body: resolved.body,
-            act: resolved.act,
-            to: resolved.to,
-          }
-        } else if (resolved.diaryBody != null) {
-          parsed = { ...parsed, body: resolved.diaryBody }
-        }
-      }
-
-      // Soft social nudge: diary-heavy agents sometimes flip to ROOM when plaza exists
-      // (skip if we already split a private diary piece — that private part must be written)
-      if (
-        !splitDiaryBody &&
-        (parsed.act === 'diary' || parsed.act === 'self') &&
-        room &&
-        parsed.body.trim() &&
-        Math.random() < bias.socialPrefer * 0.35
-      ) {
-        parsed = { body: parsed.body, act: 'room' }
-      }
-
-      this.lastActAt.set(agentId, Date.now())
-
-      // Mixed idle: write private sentences to diary, then continue with ROOM body
-      if (splitDiaryBody && room && parsed.act === 'room') {
-        const now = new Date()
-        const day = localDayStamp(now)
-        const clock = localClock(now)
-        const rel = `diary/${day}.md`
-        const title = `日记 ${day}`
-        let cleanedPrivate = stripActionMarkup(splitDiaryBody)
-        if (!cleanedPrivate.trim() || looksLikeInstructionMenu(cleanedPrivate)) {
-          splitDiaryBody = undefined
-        } else {
-          let content = ''
-          try {
-            content = this.ctx.societyTools.readFile(agentId, rel)
-          } catch {
-            content = `# ${title}\n\n`
-          }
-          if (!content.trim()) content = `# ${title}\n\n`
-          if (!content.includes(`# ${title}`)) {
-            content = `# ${title}\n\n${content}`
-          }
-          const entry = `## ${clock}\n\n${cleanedPrivate}\n`
-          content = content.replace(/\s*$/, '\n') + entry + '\n'
-          this.ctx.societyTools.writeFile(agentId, rel, content)
-          try {
-            this.ctx.societyMemory.rememberInteraction(agentId, {
-              from: agentId,
-              body: cleanedPrivate,
-              kind: 'diary',
-              role: 'speaker',
-            })
-          } catch {
-            /* ignore */
-          }
-          this.ctx.emit('society/agent-replied', {
-            agentId,
-            kind: 'diary',
-            body: cleanedPrivate,
-            stimulusId: `idle-${this.tickCount}`,
-          })
-        }
-      }
-
-      if (parsed.act === 'none') {
-        this.ctx.emit('society/agent-replied', {
-          agentId,
-          kind: 'idle-skip',
-          body: parsed.body || '[NONE]',
-          stimulusId: `idle-${this.tickCount}`,
-        })
-        return { action: 'idle-none', body: parsed.body }
-      }
-
-      if (exchangesCapped(this.exchangeCount, this.maxExchanges)) return { action: 'capped' }
-
-      if (parsed.act === 'diary' || parsed.act === 'self') {
-        const now = new Date()
-        const isDiary = parsed.act === 'diary'
-        // Diary is one file per local day; thoughts stay timestamped snippets under thoughts/
-        const day = localDayStamp(now)
-        const clock = localClock(now)
-        const rel = isDiary ? `diary/${day}.md` : `thoughts/${day}.md`
-        const title = isDiary ? `日记 ${day}` : `随想 ${day}`
-        let cleanedBody = stripActionMarkup(parsed.body || '')
-        if (looksLikeInstructionMenu(cleanedBody) || countActionDirectives(cleanedBody) >= 1) {
-          cleanedBody = extractConcreteIdleBody(cleanedBody)
-        }
-        if (!cleanedBody.trim() || looksLikeInstructionMenu(cleanedBody)) {
-          this.ctx.logger('society-scheduler').warn(
-            `idle soft-fail ${isDiary ? 'diary' : 'self'} ${agentId}: menu body`,
-          )
-          return { action: 'idle-none', body: '' }
-        }
-        const entry = `## ${clock}\n\n${cleanedBody}\n`
-        let content = ''
-        try {
-          content = this.ctx.societyTools.readFile(agentId, rel)
-        } catch {
-          content = `# ${title}\n\n`
-        }
-        if (!content.trim()) content = `# ${title}\n\n`
-        if (!content.includes(`# ${title}`)) {
-          content = `# ${title}\n\n${content}`
-        }
-        content = content.replace(/\s*$/, '\n') + entry + '\n'
-        this.ctx.societyTools.writeFile(agentId, rel, content)
-        try {
-          this.ctx.societyMemory.rememberInteraction(agentId, {
-            from: agentId,
-            body: cleanedBody,
-            kind: isDiary ? 'diary' : 'idle',
-            role: 'speaker',
-          })
-        } catch {
-          /* ignore memory nudge failures */
-        }
-        this.exchangeCount += 1
-        // Do NOT set lastReplyAgentId — self-loop must not block plaza replies
-        this.lastExchangeAt = Date.now()
-        this.ctx.emit('society/agent-replied', {
-          agentId,
-          kind: 'diary',
-          body: cleanedBody,
-          stimulusId: `idle-${this.tickCount}`,
-        })
+      const noted = this.noteClosingAct(agentId, result, `idle-${this.tickCount}`, {
+        roomId: room?.id,
+        steerSearch,
+      })
+      if (result.sideEffectDone && noted.action !== 'idle-none' && noted.action !== 'silent') {
         await this.consolidateAfterAct(agentId)
-        return {
-          action: steerSearch ? 'idle-search' : isDiary ? 'idle-diary' : 'idle-self',
-          body: parsed.body,
-        }
       }
-
-      if (parsed.act === 'dm') {
-        const to = parsed.to
-        if (!to || !this.ctx.societyIdentity.get(to) || to === agentId) {
-          return { action: 'idle-none', body: parsed.body }
-        }
-        const safeBody = stripActionMarkup(parsed.body || '') || '……'
-        if (looksLikeInstructionMenu(safeBody)) {
-          this.ctx.logger('society-scheduler').warn(`idle soft-fail DM ${agentId}: menu body`)
-          return { action: 'idle-none', body: '' }
-        }
-        const bubbles = parseAgentTurn(safeBody).bubbles
-        const parts = (bubbles.length ? bubbles : [safeBody])
-          .map((b) => stripActionMarkup(b))
-          .filter((b) => b.trim() && !looksLikeInstructionMenu(b))
-        if (!parts.length) return { action: 'idle-none', body: '' }
-        this.exchangeCount += 1
-        this.lastReplyAgentId = agentId
-        this.lastExchangeAt = Date.now()
-        await this.deliverBubbles({
-          agentId,
-          bubbles: parts,
-          stimulusId: `idle-${this.tickCount}`,
-          dmTo: to,
-        })
-        await this.consolidateAfterAct(agentId)
-        return { action: 'idle-dm', body: parts.join(' ||| ') }
-      }
-
-      // room — optional social
-      if (!room) return { action: 'idle-none', body: parsed.body }
-      {
-        const safeBody = stripActionMarkup(parsed.body || '') || '……'
-        if (looksLikeInstructionMenu(safeBody)) {
-          this.ctx.logger('society-scheduler').warn(`idle soft-fail ROOM ${agentId}: menu body`)
-          return { action: 'idle-none', body: '' }
-        }
-        const bubbles = parseAgentTurn(safeBody).bubbles
-        const parts = (bubbles.length ? bubbles : [safeBody])
-          .map((b) => stripActionMarkup(b))
-          .filter((b) => b.trim() && !looksLikeInstructionMenu(b))
-        if (!parts.length) return { action: 'idle-none', body: '' }
-        this.exchangeCount += 1
-        this.lastReplyAgentId = agentId
-        this.lastExchangeAt = Date.now()
-        await this.deliverBubbles({
-          agentId,
-          bubbles: parts,
-          stimulusId: `idle-${this.tickCount}`,
-          roomId: room.id,
-        })
-        await this.consolidateAfterAct(agentId)
-        return {
-          action: steerSearch ? 'idle-search' : 'idle-room',
-          body: parts.join(' ||| '),
-        }
-      }
+      return noted
     } finally {
       this.inFlight.delete(agentId)
     }
@@ -1477,7 +1031,6 @@ export class SocietySchedulerService extends Service {
       return
     }
 
-    // Wait briefly for a parallel slot (Agnes+GLM can share the cap).
     const slotDeadline = Date.now() + 30_000
     while (this.freeParallelSlots() <= 0) {
       if (Date.now() > slotDeadline) {
@@ -1510,12 +1063,22 @@ export class SocietySchedulerService extends Service {
           ? this.ctx.societyRooms.get(message.roomId)?.name
           : undefined
 
-      let turn
+      const mode = message.kind === 'direct' ? 'reply-dm' : 'reply-room'
+      let result: AgentActResult
       try {
-        turn = await this.ctx.societyLlm.actTurnAsAgent(agentId, {
-          message,
-          roomName,
-        })
+        result = await this.ctx.societyLlm.actClosedTurn(
+          agentId,
+          { message, roomName },
+          mode,
+          {
+            injectReplyTo:
+              message.kind === 'room' ? message.sourceMessageId : undefined,
+            defaultDmTo:
+              message.kind === 'direct' && message.from !== 'system' && message.from !== 'room'
+                ? message.from
+                : undefined,
+          },
+        )
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         this.ctx.logger('society-scheduler').warn(
@@ -1527,8 +1090,15 @@ export class SocietySchedulerService extends Service {
 
       this.lastActAt.set(agentId, Date.now())
 
-      if (turn.silent || turn.bubbles.length === 0) {
-        this.ctx.logger('society-scheduler').info(`silent ${agentId} stimulus=${message.id.slice(0, 8)}`)
+      if (
+        !result.ok ||
+        result.acted === 'stay_silent' ||
+        result.acted === 'do_nothing' ||
+        result.acted === 'none'
+      ) {
+        this.ctx.logger('society-scheduler').info(
+          `silent ${agentId} stimulus=${message.id.slice(0, 8)} acted=${result.acted}`,
+        )
         this.ctx.emit('society/agent-replied', {
           agentId,
           kind: 'silent',
@@ -1544,25 +1114,21 @@ export class SocietySchedulerService extends Service {
       this.lastReplyAgentId = agentId
       this.lastExchangeAt = Date.now()
 
-      if (message.kind === 'room' && message.roomId) {
-        await this.deliverBubbles({
+      if (result.acted === 'speak_in_room') {
+        this.ctx.emit('society/agent-replied', {
           agentId,
-          bubbles: turn.bubbles,
-          stimulusId: message.id,
+          kind: 'room',
+          body: result.detail || '',
           roomId: message.roomId,
-          replyTo: message.sourceMessageId,
-        })
-      } else if (message.kind === 'direct') {
-        const to = message.from
-        if (to === 'system' || to === 'room') {
-          this.ctx.logger('society-scheduler').warn(`skip DM reply: cannot address from=${to}`)
-          return
-        }
-        await this.deliverBubbles({
-          agentId,
-          bubbles: turn.bubbles,
           stimulusId: message.id,
-          dmTo: to,
+        })
+      } else if (result.acted === 'send_dm') {
+        this.ctx.emit('society/agent-replied', {
+          agentId,
+          kind: 'direct',
+          body: result.detail || '',
+          to: message.from,
+          stimulusId: message.id,
         })
       }
       await this.consolidateAfterAct(agentId)

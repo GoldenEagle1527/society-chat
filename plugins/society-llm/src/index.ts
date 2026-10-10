@@ -7,7 +7,8 @@
  * Never logs API keys.
  *
  * Retries: 429 → 15s; other errors → 30s; max 10 attempts.
- * Turns: optional silence + multi-bubble (||| / JSON).
+ * Turns: structured closing tools (speak_in_room / stay_silent / write_diary / …).
+ * Multi-bubble via ||| inside tool args. No ACTION: text protocol.
  */
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { AgentId, InboxMessage, RoomMessage } from '../../../src/types.ts'
@@ -19,7 +20,10 @@ import {
   type LlmProviderId,
 } from '../../../src/env.ts'
 import { LlmHttpError, withLlmRetries } from '../../../src/llm-http.ts'
-import type { ToolDefinition } from '../../society-tools/src/index.ts'
+import {
+  isClosingToolName,
+  type ToolDefinition,
+} from '../../society-tools/src/index.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -51,6 +55,30 @@ export interface AgentTurn {
   bubbles: string[]
   raw: string
 }
+
+/** Result of a tool-closed idle or reply turn (side effects already applied by tools). */
+export type ClosingActKind =
+  | 'speak_in_room'
+  | 'send_dm'
+  | 'diary'
+  | 'thought'
+  | 'do_nothing'
+  | 'stay_silent'
+  | 'none'
+
+export interface AgentActResult {
+  /** Which closing tool succeeded (or none if soft-fail). */
+  acted: ClosingActKind
+  ok: boolean
+  /** Tool JSON / summary for logs. */
+  detail?: string
+  /** Research tools used before closing. */
+  researchTools: string[]
+  /** True when a closing tool already posted/wrote — scheduler must not double-deliver. */
+  sideEffectDone: boolean
+}
+
+export type ActMode = 'idle' | 'reply-room' | 'reply-dm'
 
 interface OpenAiToolCall {
   id: string
@@ -231,21 +259,20 @@ export class SocietyLlmService extends Service {
       '- 始终保持上述人设、灵魂状态与记忆，用中文简短说话。',
       '- 不要加「Alice:」之类前缀，不要解释你是 AI 或模型。',
       '- 不要输出思考过程或 reasoning。',
-      '- 收到消息后先判断要不要开口：若消息 @点名你、回复你的话、问候你、问你问题、或私信给你，应当回复，不要 SILENT。',
-      '- 群聊里别人互相对话、话题与你无关、刺激已被更新的话题盖过且你未被 @，可只输出一行 ACTION:SILENT（或 JSON {"reply":false}），不要抢着刷屏。',
-      '- 点名某人时在正文里写 @显示名（例如 @阿宁）；回复某条时系统会自动挂 replyTo，你只需对准说话对象。',
-      '- 若要回复：可把长话拆成 2～4 条短气泡，用 ||| 分隔；或输出 JSON {"reply":true,"bubbles":["第一句","第二句"]}；也可在最后一行写 ACTION:REPLY。',
-      '- 单条气泡尽量一两句；整轮最多约 4 条气泡。不要扮演别人发言。',
+      '- 收到消息后先判断要不要开口：若消息 @点名你、回复你的话、问候你、问你问题、或私信给你，应当回复（调用 speak_in_room / send_dm），不要 stay_silent。',
+      '- 群聊里别人互相对话、话题与你无关、刺激已被更新的话题盖过且你未被 @，调用 stay_silent，不要抢着刷屏。',
+      '- 点名某人时在正文里写 @显示名（例如 @阿宁）；回复某条时系统会自动挂 replyTo。',
+      '- 长话可在工具参数 body 里用 ||| 拆成 2～4 条短气泡。单条尽量一两句。不要扮演别人发言。',
+      '- 禁止输出 ACTION: 控制行或把工具菜单抄进聊天；只能通过工具完成发言/日记/沉默。',
     ]
     if (withTools) {
       lines.push(
-        '- 你可以使用工具：write_file / read_file / list_workspace（仅限自己的 workspace）、run_command（bubblewrap 沙箱）、web_search、generate_image。',
-        '- 社交工具：create_room / invite_to_room / list_rooms / list_agents / post_room / send_dm / spawn_agent（可自建侧边群聊；spawn_agent 可诞生新 Agent，受人数上限约束）。',
-        '- 若兴趣含时政/新闻/辩论/政治：空闲时请主动 web_search 查近期热点，再简短分享或记日记，不要只会空想。',
-        '- 只有对方明确要求生图时才调用 generate_image；不要主动刷图。',
-        '- 需要落盘时用 write_file；路径必须是相对路径，禁止 .. 与绝对路径。',
-        '- run_command 在沙箱内执行，默认无网络；argv[0] 必须是 /bin/ 或 /usr/bin/ 下的绝对路径。',
-        '- 工具调用结束后，用简短中文向对方说明结果（例如文件名），不要粘贴大段工具原始输出；仍可用 ||| 拆多气泡，或 ACTION:SILENT。',
+        '- 研究工具（可选）：web_search / write_file / read_file / list_workspace / list_agents / list_rooms / run_command / generate_image。',
+        '- 收束工具（本回合必须最终调用其一）：speak_in_room / send_dm / write_diary / write_thought / do_nothing（空闲）或 stay_silent / speak_in_room / send_dm（回复）。',
+        '- write_diary / write_thought 只能写给自己的第一人称私密内容；想喊人、提问群友、说「xxx在吗」必须用 speak_in_room 或 send_dm。',
+        '- 若兴趣含时政/新闻/辩论/政治：空闲时请先 web_search 再 speak_in_room 或 write_diary。',
+        '- 只有对方明确要求生图时才调用 generate_image。',
+        '- 路径必须相对 workspace；run_command 的 argv[0] 必须是 /bin/ 或 /usr/bin/ 下绝对路径。',
       )
     }
     return lines.join('\n')
@@ -255,7 +282,7 @@ export class SocietyLlmService extends Service {
     const agent = this.ctx.societyIdentity.require(agentId)
     const msg = stimulus.message
     const decideHint =
-      '先决定要不要回：若对方 @你 / 回复你 / 问候或问你，必须回复；若刺激已被更新话题盖过且你未被点名，输出 ACTION:SILENT。要回则用短气泡（可用 |||；点名别人用 @显示名）。'
+      '先决定要不要回：若对方 @你 / 回复你 / 问候或问你，必须调用 speak_in_room（或私信 send_dm）；若刺激已被更新话题盖过且你未被点名，调用 stay_silent。要回则在工具 body 里写短气泡（可用 |||；点名别人用 @显示名）。不要输出 ACTION: 文本。'
     if (msg) {
       if (msg.kind === 'room' && msg.roomId) {
         const roomLabel = stimulus.roomName ? `「${stimulus.roomName}」` : ''
@@ -299,7 +326,7 @@ export class SocietyLlmService extends Service {
         return [
           `你收到来自 ${fromLabel}（${msg.from}）的私信（私信默认应回复，除非是骚扰/无意义刷屏）：`,
           msg.body,
-          '用短气泡回复；长话可用 ||| 拆分。一般不要 SILENT。',
+          '用 send_dm 回复；长话可用 ||| 拆分。一般不要 stay_silent。',
           `请以 ${agent.displayName} 的身份说话。`,
         ].join('\n')
       }
@@ -339,47 +366,121 @@ export class SocietyLlmService extends Service {
   }
 
   /**
-   * Agent turn with OpenAI tool calling (bound to this agentId's workspace).
-   * Max MAX_TOOL_ROUNDS tool rounds; final assistant text is the room/DM reply body.
+   * @deprecated Prefer actClosedTurn — text returns are no longer posted by scheduler.
+   * Kept for birth/tools smokes that only need tool execution mid-turn.
    */
   async actAsAgent(agentId: AgentId, stimulus: ReplyStimulus): Promise<string> {
-    const turn = await this.actTurnAsAgent(agentId, stimulus)
-    if (turn.silent) return 'ACTION:SILENT'
-    return turn.raw
+    const result = await this.actClosedTurn(agentId, stimulus, 'reply-room')
+    return JSON.stringify(result)
   }
 
-  /** Tool-capable turn returning parsed silence / bubbles. */
+  /** @deprecated Use actClosedTurn; maps closing tools to legacy AgentTurn shape. */
   async actTurnAsAgent(agentId: AgentId, stimulus: ReplyStimulus): Promise<AgentTurn> {
+    const mode: ActMode =
+      stimulus.message?.kind === 'direct' ? 'reply-dm' : 'reply-room'
+    const result = await this.actClosedTurn(agentId, stimulus, mode)
+    if (result.acted === 'stay_silent' || result.acted === 'do_nothing' || result.acted === 'none') {
+      return { silent: true, bubbles: [], raw: result.detail || '' }
+    }
+    // Side effects already done by tools — bubbles empty so scheduler does not re-post
+    return { silent: false, bubbles: [], raw: result.detail || result.acted }
+  }
+
+  /**
+   * Tool-closed turn: optional research tools, then MUST call exactly one closing tool.
+   * Providers get tool_choice=auto (required not universally supported); if model returns
+   * only text, one nudge retry; still no closing tool → soft-fail acted=none (no post).
+   */
+  async actClosedTurn(
+    agentId: AgentId,
+    stimulus: ReplyStimulus,
+    mode: ActMode,
+    opts?: { injectReplyTo?: string; defaultDmTo?: string },
+  ): Promise<AgentActResult> {
     this.ctx.societyIdentity.require(agentId)
     const cfg = this.resolveConfig(agentId)
-    this.ctx.logger('society-llm').info(`chat ${agentId} ${providerModelLabel(cfg)} (tools)`)
-    const tools = this.ctx.societyTools.getToolDefinitions()
+    this.ctx.logger('society-llm').info(
+      `chat ${agentId} ${providerModelLabel(cfg)} (closing-tools mode=${mode})`,
+    )
+
+    const tools =
+      mode === 'idle'
+        ? this.ctx.societyTools.getIdleToolDefinitions()
+        : this.ctx.societyTools.getReplyToolDefinitions(mode === 'reply-dm' ? 'direct' : 'room')
+
+    const userContent =
+      mode === 'idle'
+        ? stimulus.text || this.buildUserPrompt(agentId, stimulus)
+        : this.buildUserPrompt(agentId, stimulus)
+
+    const closingHint =
+      mode === 'idle'
+        ? [
+            '【收束规则】可先用研究工具（如 web_search），但本回合结束前必须调用且仅调用一个收束工具：',
+            'speak_in_room（去广场/群聊说话；可省略 roomId） / send_dm / write_diary / write_thought / do_nothing。',
+            '禁止输出 ACTION: 行，禁止只回纯文本。日记必须是写给自己的私密话。',
+          ].join('\n')
+        : [
+            '【收束规则】可先用研究工具，但本回合结束前必须调用且仅调用一个收束工具：',
+            mode === 'reply-dm'
+              ? 'send_dm（回对方）或 stay_silent。'
+              : 'speak_in_room（回复当前刺激；系统会自动带 replyTo）或 stay_silent；一般不要改去私信。',
+            '禁止输出 ACTION: 行，禁止只回纯文本当回复。',
+          ].join('\n')
+
     const messages: ChatMessage[] = [
       { role: 'system', content: this.buildSystemPrompt(agentId, true) },
-      { role: 'user', content: this.buildUserPrompt(agentId, stimulus) },
+      { role: 'user', content: `${userContent}\n\n${closingHint}` },
     ]
 
-    for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
-      const allowTools = round < MAX_TOOL_ROUNDS
+    const researchTools: string[] = []
+    let nudged = false
+
+    for (let round = 0; round <= MAX_TOOL_ROUNDS + 1; round++) {
+      const allowTools = true
       const result = await this.chatCompletions(messages, cfg, {
         tools: allowTools,
         toolDefs: tools,
+        toolChoice: 'auto',
       })
 
-      if (result.tool_calls?.length && allowTools) {
+      if (result.tool_calls?.length) {
         messages.push({
           role: 'assistant',
           content: result.content,
           tool_calls: result.tool_calls,
         })
+
+        let closing: AgentActResult | null = null
         for (const tc of result.tool_calls) {
+          let argsJson = tc.function.arguments || '{}'
+          if (tc.function.name === 'speak_in_room' && opts?.injectReplyTo) {
+            try {
+              const args = JSON.parse(argsJson) as Record<string, unknown>
+              if (!args.replyTo) args.replyTo = opts.injectReplyTo
+              if (!args.roomId && stimulus.message?.roomId) args.roomId = stimulus.message.roomId
+              argsJson = JSON.stringify(args)
+            } catch {
+              /* keep original */
+            }
+          }
+          if (tc.function.name === 'send_dm' && opts?.defaultDmTo) {
+            try {
+              const args = JSON.parse(argsJson) as Record<string, unknown>
+              if (!args.to) args.to = opts.defaultDmTo
+              argsJson = JSON.stringify(args)
+            } catch {
+              /* keep original */
+            }
+          }
+
           const toolResult = await this.ctx.societyTools.execute(
             agentId,
             tc.function.name,
-            tc.function.arguments || '{}',
+            argsJson,
           )
           this.ctx.logger('society-llm').info(
-            `tool ${agentId} ${tc.function.name} → ${toolResult.slice(0, 120)}`,
+            `tool ${agentId} ${tc.function.name} → ${toolResult.slice(0, 160)}`,
           )
           messages.push({
             role: 'tool',
@@ -387,34 +488,72 @@ export class SocietyLlmService extends Service {
             name: tc.function.name,
             content: toolResult,
           })
+
+          if (isClosingToolName(tc.function.name)) {
+            const parsed = parseClosingToolResult(tc.function.name, toolResult)
+            if (parsed.ok) {
+              closing = { ...parsed, researchTools }
+            } else if (parsed.acted === 'diary' || parsed.acted === 'thought') {
+              // Chatty reject — nudge to use speak_in_room; do not treat as success
+              messages.push({
+                role: 'user',
+                content:
+                  '上一次日记/随想因像群聊喊话被拒绝。请改用 speak_in_room 或 send_dm 说话，或写真正私密的第一人称日记。必须再调用一个收束工具。',
+              })
+            } else {
+              closing = { ...parsed, researchTools }
+            }
+          } else {
+            researchTools.push(tc.function.name)
+          }
         }
+
+        if (closing?.ok) return closing
+        // Continue loop for more research or retry after diary reject
         continue
       }
 
+      // Text-only response — nudge once then soft-fail
       const cleaned = (result.content ?? '').trim()
-      if (!cleaned) {
-        if (round < MAX_TOOL_ROUNDS) {
-          messages.push({
-            role: 'user',
-            content:
-              '请根据工具结果决定：不回则 ACTION:SILENT；要回则用中文短气泡（可用 |||），不要再调用工具。',
-          })
-          const final = await this.chatCompletions(messages, cfg, { tools: false })
-          const text = (final.content ?? '').trim()
-          if (text) return parseAgentTurn(text)
-        }
-        throw new Error(`Empty LLM content for agent ${agentId} after tool loop`)
+      if (!nudged) {
+        nudged = true
+        messages.push({
+          role: 'assistant',
+          content: cleaned || null,
+        })
+        messages.push({
+          role: 'user',
+          content:
+            '不要只输出文字。请立刻调用一个收束工具（speak_in_room / send_dm / write_diary / write_thought / do_nothing 或 stay_silent）完成本回合。',
+        })
+        continue
       }
-      return parseAgentTurn(cleaned)
+
+      this.ctx.logger('society-llm').warn(
+        `closing soft-fail ${agentId}: text-only after nudge (${cleaned.slice(0, 80)})`,
+      )
+      return {
+        acted: 'none',
+        ok: false,
+        detail: cleaned.slice(0, 200),
+        researchTools,
+        sideEffectDone: false,
+      }
     }
 
-    throw new Error(`actAsAgent exceeded tool rounds for ${agentId}`)
+    return {
+      acted: 'none',
+      ok: false,
+      detail: 'exceeded tool rounds without closing tool',
+      researchTools,
+      sideEffectDone: false,
+    }
   }
 
   private async chatCompletions(
     messages: ChatMessage[],
     cfg: LlmEndpointConfig,
-    opts: { tools: boolean; toolDefs?: ToolDefinition[] },
+    opts: { tools: boolean; toolDefs?: ToolDefinition[]; toolChoice?: 'auto' | 'required' | 'none' },
   ): Promise<{ content: string | null; tool_calls?: OpenAiToolCall[] }> {
     const log = (msg: string) => this.ctx.logger('society-llm').warn(msg)
     return withLlmRetries(
@@ -427,7 +566,7 @@ export class SocietyLlmService extends Service {
   private async chatCompletionsOnce(
     messages: ChatMessage[],
     cfg: LlmEndpointConfig,
-    opts: { tools: boolean; toolDefs?: ToolDefinition[] },
+    opts: { tools: boolean; toolDefs?: ToolDefinition[]; toolChoice?: 'auto' | 'required' | 'none' },
   ): Promise<{ content: string | null; tool_calls?: OpenAiToolCall[] }> {
     const url = `${cfg.baseUrl}/chat/completions`
     const body: Record<string, unknown> = {
@@ -438,7 +577,8 @@ export class SocietyLlmService extends Service {
     }
     if (opts.tools && opts.toolDefs?.length) {
       body.tools = opts.toolDefs
-      body.tool_choice = 'auto'
+      // Prefer auto: Agnes/GLM/SiliconFlow do not all accept tool_choice=required reliably.
+      body.tool_choice = opts.toolChoice ?? 'auto'
     }
 
     let res: Response
@@ -495,16 +635,67 @@ export class SocietyLlmService extends Service {
     const content = choice?.content ?? null
     if (!tool_calls?.length) {
       const trimmed = (content ?? '').trim()
-      if (!trimmed) {
+      // When tools were offered, empty text is allowed so the closing-tool nudge can run.
+      if (!trimmed && !(opts.tools && opts.toolDefs?.length)) {
         throw new LlmHttpError(
           cfg.provider,
           res.status,
           `${cfg.provider} response missing message.content (reasoning_content ignored)`,
         )
       }
-      return { content: trimmed }
+      return { content: trimmed || null }
     }
     return { content: content ?? null, tool_calls }
+  }
+}
+
+
+function parseClosingToolResult(name: string, toolResult: string): AgentActResult {
+  const sideEffectDone = ['speak_in_room', 'send_dm', 'write_diary', 'write_thought'].includes(name)
+  let acted: ClosingActKind = 'none'
+  if (name === 'speak_in_room') acted = 'speak_in_room'
+  else if (name === 'send_dm') acted = 'send_dm'
+  else if (name === 'write_diary') acted = 'diary'
+  else if (name === 'write_thought') acted = 'thought'
+  else if (name === 'do_nothing') acted = 'do_nothing'
+  else if (name === 'stay_silent') acted = 'stay_silent'
+
+  if (toolResult.startsWith('Error:')) {
+    return {
+      acted,
+      ok: false,
+      detail: toolResult,
+      researchTools: [],
+      sideEffectDone: false,
+    }
+  }
+  try {
+    const j = JSON.parse(toolResult) as { ok?: boolean; acted?: string; error?: string }
+    if (j.ok === false) {
+      return {
+        acted,
+        ok: false,
+        detail: j.error || toolResult,
+        researchTools: [],
+        sideEffectDone: false,
+      }
+    }
+    return {
+      acted,
+      ok: true,
+      detail: toolResult,
+      researchTools: [],
+      sideEffectDone,
+    }
+  } catch {
+    // Non-JSON success strings for legacy tools — treat closing names as ok
+    return {
+      acted,
+      ok: true,
+      detail: toolResult,
+      researchTools: [],
+      sideEffectDone: sideEffectDone && !toolResult.startsWith('Error:'),
+    }
   }
 }
 

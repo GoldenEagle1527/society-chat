@@ -6,7 +6,8 @@
  * Path traversal (.., absolute escape) is rejected.
  * run_command MUST go through societySandbox (bwrap or docker mode); no raw shell.
  * web_search / generate_image HTTP clients use host allowlist from society-sandbox.
- * Social tools: create_room / invite_to_room / list_rooms / list_agents / post_room / send_dm / spawn_agent.
+ * Social tools: create_room / invite_to_room / list_rooms / list_agents / post_room / speak_in_room / send_dm / spawn_agent.
+ * Closing tools (idle/reply): speak_in_room / send_dm / write_diary / write_thought / do_nothing / stay_silent.
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -14,6 +15,9 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import type { AgentId, RoomId } from '../../../src/types.ts'
 import { parseSpawnLlmInput, requireAgnesConfig } from '../../../src/env.ts'
 import { assertUrlAllowed } from '../../society-sandbox/src/index.ts'
+import { isChattyPrivateText, looksLikeOutboundChatLine } from './private-voice.ts'
+
+export { looksLikeOutboundChatLine, classifyIdlePrivateBody, isChattyPrivateText } from './private-voice.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -83,6 +87,155 @@ export function toWorkspaceRelative(workspaceRoot: string, absolutePath: string)
   }
   return rel.split(path.sep).join('/')
 }
+
+/** Closing tools that finish an idle or reply turn (side-effecting social/private acts). */
+export const IDLE_CLOSING_TOOL_NAMES = [
+  'speak_in_room',
+  'send_dm',
+  'write_diary',
+  'write_thought',
+  'do_nothing',
+] as const
+
+export const REPLY_CLOSING_TOOL_NAMES = ['stay_silent', 'speak_in_room', 'send_dm'] as const
+
+export const RESEARCH_TOOL_NAMES = [
+  'web_search',
+  'write_file',
+  'read_file',
+  'list_workspace',
+  'list_agents',
+  'list_rooms',
+  'run_command',
+  'generate_image',
+] as const
+
+export type ClosingActName =
+  | 'speak_in_room'
+  | 'send_dm'
+  | 'diary'
+  | 'thought'
+  | 'do_nothing'
+  | 'stay_silent'
+
+export function isClosingToolName(name: string): boolean {
+  return (
+    (IDLE_CLOSING_TOOL_NAMES as readonly string[]).includes(name) ||
+    name === 'stay_silent'
+  )
+}
+
+function localDayStamp(d = new Date()): string {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+function localClock(d = new Date()): string {
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  return `${hh}:${mm}`
+}
+
+function splitBubbleBodies(body: string): string[] {
+  const trimmed = body.trim()
+  if (!trimmed) return []
+  if (trimmed.includes('|||')) {
+    return trimmed
+      .split('|||')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 5)
+      .map((b) => b.slice(0, 2000))
+  }
+  return [trimmed.slice(0, 2000)]
+}
+
+const CLOSING_TOOL_DEFINITIONS: ToolDefinition[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'speak_in_room',
+      description:
+        'Post to a group chat. Omit roomId to post to plaza. body may use ||| to split 2–4 short bubbles. Optional replyTo message id. Prefer @显示名 to mention someone.',
+      parameters: {
+        type: 'object',
+        properties: {
+          roomId: {
+            type: 'string',
+            description: 'Room id; omit to use plaza (default)',
+          },
+          body: { type: 'string', description: 'What you say (Chinese short bubbles; ||| ok)' },
+          replyTo: {
+            type: 'string',
+            description: 'Optional message id in this room to reply to',
+          },
+        },
+        required: ['body'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'write_diary',
+      description:
+        'Append a PRIVATE diary entry for today (first-person notes to yourself ONLY). Rejects outbound chat voice (@mentions, 「xxx在吗」, asking the group). Use speak_in_room or send_dm to talk to others.',
+      parameters: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: 'Private first-person diary text' },
+        },
+        required: ['text'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'write_thought',
+      description:
+        'Append a PRIVATE inner thought / note for today (not for others). Same privacy rules as write_diary.',
+      parameters: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: 'Private thought text' },
+        },
+        required: ['text'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'do_nothing',
+      description: 'Explicitly end this idle turn without speaking, DIMing, or writing. Use sparingly.',
+      parameters: {
+        type: 'object',
+        properties: {
+          reason: { type: 'string', description: 'Optional short reason' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'stay_silent',
+      description:
+        'Choose NOT to reply to the current room/DM stimulus (when topic moved on, others talking among themselves, and you were not @mentioned).',
+      parameters: {
+        type: 'object',
+        properties: {
+          reason: { type: 'string', description: 'Optional short reason' },
+        },
+        required: [],
+      },
+    },
+  },
+]
 
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
@@ -303,7 +456,8 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'send_dm',
-      description: 'Send a private direct message to another agent.',
+      description:
+        'Send a private direct message to another agent (closing act for idle or DM reply). body may use ||| for multi-bubble.',
       parameters: {
         type: 'object',
         properties: {
@@ -316,6 +470,15 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
 ]
 
+/** Full catalog = base social/file tools + closing tools (dedupe by name). */
+function mergeToolDefs(...groups: ToolDefinition[][]): ToolDefinition[] {
+  const byName = new Map<string, ToolDefinition>()
+  for (const g of groups) {
+    for (const t of g) byName.set(t.function.name, t)
+  }
+  return [...byName.values()]
+}
+
 export class SocietyToolsService extends Service {
   static inject = ['societyIdentity', 'societySandbox', 'societyRooms', 'societyMailbox', 'societySoul', 'societyMemory']
 
@@ -323,9 +486,34 @@ export class SocietyToolsService extends Service {
     super(ctx, 'societyTools')
   }
 
-  /** OpenAI-style tool schemas for chat/completions. */
+  private defaultRoomId: RoomId | null = null
+
+  /** Prefer plaza for speak_in_room when roomId omitted (set by society-live). */
+  setDefaultRoom(roomId: RoomId | null): void {
+    this.defaultRoomId = roomId
+  }
+
+  /** OpenAI-style tool schemas for chat/completions (full catalog). */
   getToolDefinitions(): ToolDefinition[] {
-    return TOOL_DEFINITIONS
+    return mergeToolDefs(TOOL_DEFINITIONS, CLOSING_TOOL_DEFINITIONS)
+  }
+
+  /** Idle self-loop: research tools + idle closing tools. */
+  getIdleToolDefinitions(): ToolDefinition[] {
+    const names = new Set<string>([
+      ...RESEARCH_TOOL_NAMES,
+      ...IDLE_CLOSING_TOOL_NAMES,
+    ])
+    return this.getToolDefinitions().filter((t) => names.has(t.function.name))
+  }
+
+  /** Room/DM reply: research + stay_silent / speak_in_room / send_dm. */
+  getReplyToolDefinitions(kind: 'room' | 'direct'): ToolDefinition[] {
+    const names = new Set<string>([...RESEARCH_TOOL_NAMES, ...REPLY_CLOSING_TOOL_NAMES])
+    if (kind === 'direct') {
+      names.delete('speak_in_room')
+    }
+    return this.getToolDefinitions().filter((t) => names.has(t.function.name))
   }
 
   workspaceOf(agentId: AgentId): string {
@@ -381,8 +569,31 @@ export class SocietyToolsService extends Service {
             String(args.body ?? ''),
             args.replyTo != null ? String(args.replyTo) : undefined,
           )
+        case 'speak_in_room':
+          return this.speakInRoom(
+            agentId,
+            args.roomId != null ? String(args.roomId) : undefined,
+            String(args.body ?? ''),
+            args.replyTo != null ? String(args.replyTo) : undefined,
+          )
         case 'send_dm':
           return this.sendDm(agentId, String(args.to ?? ''), String(args.body ?? ''))
+        case 'write_diary':
+          return this.writeDiary(agentId, String(args.text ?? ''))
+        case 'write_thought':
+          return this.writeThought(agentId, String(args.text ?? ''))
+        case 'do_nothing':
+          return JSON.stringify({
+            ok: true,
+            acted: 'do_nothing',
+            reason: args.reason != null ? String(args.reason) : undefined,
+          })
+        case 'stay_silent':
+          return JSON.stringify({
+            ok: true,
+            acted: 'stay_silent',
+            reason: args.reason != null ? String(args.reason) : undefined,
+          })
         case 'spawn_agent':
           return this.spawnAgent(agentId, args)
         default:
@@ -594,6 +805,8 @@ export class SocietyToolsService extends Service {
       ...(replyTo ? { replyTo } : {}),
     })
     return JSON.stringify({
+      ok: true,
+      acted: 'speak_in_room',
       messageId: msg.id,
       roomId: msg.roomId,
       from: msg.from,
@@ -602,18 +815,130 @@ export class SocietyToolsService extends Service {
     })
   }
 
+  /** Resolve plaza / default room when roomId omitted. */
+  resolveDefaultRoomId(agentId: AgentId): RoomId | null {
+    if (this.defaultRoomId && this.ctx.societyRooms.get(this.defaultRoomId)) {
+      return this.defaultRoomId
+    }
+    const plaza = this.ctx.societyRooms.listRooms().find((r) => r.name === 'plaza')
+    if (plaza && plaza.members.includes(agentId)) return plaza.id
+    const mine = this.ctx.societyRooms.listRooms().find((r) => r.members.includes(agentId))
+    return mine?.id ?? null
+  }
+
+  speakInRoom(agentId: AgentId, roomId: string | undefined, body: string, replyTo?: string): string {
+    const bubbles = splitBubbleBodies(body)
+    if (!bubbles.length) return 'Error: body must be non-empty'
+    const rid = (roomId?.trim() || this.resolveDefaultRoomId(agentId) || '') as RoomId
+    if (!rid) return 'Error: no roomId and no plaza/default room available'
+    const room = this.ctx.societyRooms.get(rid)
+    if (!room) return `Error: room not found: ${rid}`
+    if (!room.members.includes(agentId)) {
+      return `Error: you are not a member of room ${rid}`
+    }
+    const messageIds: string[] = []
+    for (let i = 0; i < bubbles.length; i++) {
+      const msg = this.ctx.societyRooms.post({
+        roomId: rid,
+        from: agentId,
+        body: bubbles[i]!,
+        ...(replyTo && i === 0 ? { replyTo } : {}),
+      })
+      messageIds.push(msg.id)
+    }
+    return JSON.stringify({
+      ok: true,
+      acted: 'speak_in_room',
+      roomId: rid,
+      messageIds,
+      bubbles: bubbles.length,
+      replyTo: replyTo || undefined,
+    })
+  }
+
   sendDm(agentId: AgentId, to: string, body: string): string {
-    const b = body.trim()
-    if (!b) return 'Error: body must be non-empty'
+    const bubbles = splitBubbleBodies(body)
+    if (!bubbles.length) return 'Error: body must be non-empty'
     if (to === agentId) return 'Error: cannot DM yourself'
     this.ctx.societyIdentity.require(to)
-    const msg = this.ctx.societyMailbox.deliver({
+    const messageIds: string[] = []
+    for (const b of bubbles) {
+      const msg = this.ctx.societyMailbox.deliver({
+        to,
+        from: agentId,
+        kind: 'direct',
+        body: b,
+      })
+      messageIds.push(msg.id)
+    }
+    return JSON.stringify({
+      ok: true,
+      acted: 'send_dm',
       to,
       from: agentId,
-      kind: 'direct',
-      body: b,
+      messageIds,
+      bubbles: bubbles.length,
     })
-    return JSON.stringify({ messageId: msg.id, to: msg.to, from: msg.from })
+  }
+
+  private appendDailyNote(
+    agentId: AgentId,
+    kind: 'diary' | 'thought',
+    text: string,
+  ): string {
+    const raw = text.trim()
+    if (!raw) return 'Error: text must be non-empty'
+    if (isChattyPrivateText(raw) || looksLikeOutboundChatLine(raw)) {
+      return JSON.stringify({
+        ok: false,
+        acted: kind,
+        error:
+          'text looks like outbound chat (mentions, 在吗, group questions). Use speak_in_room or send_dm instead; keep diary/thoughts private first-person only.',
+      })
+    }
+    const now = new Date()
+    const day = localDayStamp(now)
+    const clock = localClock(now)
+    const rel = kind === 'diary' ? `diary/${day}.md` : `thoughts/${day}.md`
+    const title = kind === 'diary' ? `日记 ${day}` : `随想 ${day}`
+    let content = ''
+    try {
+      content = this.readFile(agentId, rel)
+    } catch {
+      content = `# ${title}\n\n`
+    }
+    if (!content.trim()) content = `# ${title}\n\n`
+    if (!content.includes(`# ${title}`)) {
+      content = `# ${title}\n\n${content}`
+    }
+    const entry = `## ${clock}\n\n${raw}\n`
+    content = content.replace(/\s*$/, '\n') + entry + '\n'
+    this.writeFile(agentId, rel, content)
+    try {
+      this.ctx.societyMemory.rememberInteraction(agentId, {
+        from: agentId,
+        body: raw,
+        kind: kind === 'diary' ? 'diary' : 'idle',
+        role: 'speaker',
+      })
+    } catch {
+      /* ignore */
+    }
+    return JSON.stringify({
+      ok: true,
+      acted: kind,
+      path: rel,
+      clock,
+      text: raw.slice(0, 200),
+    })
+  }
+
+  writeDiary(agentId: AgentId, text: string): string {
+    return this.appendDailyNote(agentId, 'diary', text)
+  }
+
+  writeThought(agentId: AgentId, text: string): string {
+    return this.appendDailyNote(agentId, 'thought', text)
   }
 
   /**

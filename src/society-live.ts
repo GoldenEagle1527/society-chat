@@ -125,6 +125,7 @@ async function main(): Promise<void> {
     }
   }
   ctx.societyScheduler.setDefaultRoom(room.id)
+  ctx.societyTools.setDefaultRoom(room.id)
   console.log(`✓ room: ${room.name} (${room.id.slice(0, 8)}…) members=${room.members.join(',') || '(empty)'}`)
 
   // New births during live: join plaza + allowlist so they show up and can act
