@@ -153,9 +153,30 @@ export class SocietyWorldService extends Service {
         formatSnapshotLine(snap),
         '生存只看 energy_pool / core_integrity（不是心情）。能池空会饿死；死亡由引擎裁定。',
         '工具：world_observe 读邻域；world_act 提交微操（nudge/pull/adsorb/catalyze/bite/digest/wait/revive）。',
-        '引擎立法：能池≥餍足阈值时咬果 → REFUSED_SATIATED；同目标连啃成本升、收益降。刚好够优于囤满。',
+        `行动成本：revive=${snap.revive_cost}（最贵）、adsorb=${snap.action_costs.adsorb}、bite=${snap.action_costs.bite}、pull=${snap.action_costs.pull}、wait=${snap.action_costs.wait}。`,
+        '引擎立法：能池≥餍足阈值时咬果 → REFUSED_SATIATED（事件 refused_satiated）；同目标连啃成本升、收益降。刚好够优于囤满。',
+        '有效 pull/adsorb/稳态 wait 会从废热回收小额 micro_reward（守恒，不凭空造能）。',
         '能池够用时默认试探假说/挪粒子/复活同伴；咬果仅濒饿。聊天是外壳；探测笔记可记假设/错误码。',
       ]
+      if (snap.corpses?.length) {
+        lines.push('【尸体警报 — 可 revive】')
+        for (const c of snap.corpses) {
+          lines.push(
+            `- ${c.corpse_of} 尸体 ${c.organic_id} @(${c.pos.x},${c.pos.y}) 锁能=${c.energy_locked} 复活成本=${c.revive_cost} 距离=${c.dist}`,
+          )
+        }
+      }
+      if (snap.dying?.length) {
+        lines.push('【濒死同伴】')
+        for (const d of snap.dying) {
+          lines.push(
+            `- ${d.actor_id} @(${d.pos.x},${d.pos.y}) pool=${d.energy_pool} core=${d.core_integrity} starve=${d.starve_ticks}`,
+          )
+        }
+      }
+      if (snap.alerts?.length) {
+        lines.push('警报：' + snap.alerts.join(' | '))
+      }
       if (snap.events_recent.length) {
         lines.push('近期世界事件：')
         for (const e of snap.events_recent.slice(-5)) lines.push(`- ${formatEventLine(e)}`)

@@ -148,8 +148,21 @@ export function formatSnapshotLine(snap: ObserveSnapshot): string {
     `stomach=${s.stomach ?? 0}`,
     `视野粒子=${snap.view.particles.length}`,
     `有机=${snap.organics.length}`,
+    `revive_cost=${snap.revive_cost}`,
   ]
   if (fruit) parts.push(`硕果剩余=${fruit.energy_locked}`)
+  if (snap.corpses?.length) {
+    parts.push(
+      `尸体×${snap.corpses.length}=` +
+        snap.corpses
+          .map((c) => `${c.corpse_of}@(${c.pos.x},${c.pos.y})/锁${c.energy_locked}`)
+          .join(','),
+    )
+  }
+  if (snap.dying?.length) {
+    parts.push(`濒死=${snap.dying.map((d) => d.actor_id).join(',')}`)
+  }
+  if (snap.alerts?.length) parts.push(`⚠${snap.alerts[0]}`)
   if (snap.last_errors[0]) parts.push(`last_err=${snap.last_errors[0].code}`)
   return parts.join(' · ')
 }

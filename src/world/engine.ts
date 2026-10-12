@@ -43,6 +43,15 @@ export const SATIETY_THRESHOLD = 10
 export const BITE_STREAK_COST_STEP = 1.5
 /** Yield loss per consecutive same-target bite (floors at 25% of BITE_CHUNK). */
 export const BITE_STREAK_YIELD_STEP = 0.2
+/**
+ * Micro-op rewards: recycle a sliver of waste_heat → energy_pool.
+ * Never mint — if waste_heat is empty, reward is 0 (conservation holds).
+ */
+export const MICRO_REWARD_PULL = 0.35
+export const MICRO_REWARD_ADSORB = 0.5
+export const MICRO_REWARD_WAIT_STEADY = 0.12
+/** Reject codes that emit a world event (design telemetry; avoid flood). */
+const TELEMETRY_REJECT_CODES: ReadonlySet<ActRejectCode> = new Set(['REFUSED_SATIATED'])
 
 const DIRS: Record<string, Vec2> = {
   n: { x: 0, y: -1 },
@@ -180,16 +189,39 @@ function bumpBiteStreak(bot: BotBody, targetId: string): void {
 }
 
 /**
- * Stub hook for conserved micro-rewards on first useful probe
- * (steady config / megamorph / hypothesis note). No-op this commit;
- * when implemented, move energy from fruit lock or waste_heat — never mint.
+ * Conservation-safe micro reward: waste_heat → bot.energy_pool (never mint).
+ * Returns amount actually granted (0 if no waste heat left).
  */
+export function grantMicroReward(
+  state: WorldState,
+  bot: BotBody,
+  amount: number,
+  reason: string,
+  extra: Record<string, unknown> = {},
+): number {
+  const want = Math.max(0, Math.round(amount * 1000) / 1000)
+  const take = Math.min(want, Math.max(0, state.waste_heat))
+  if (take <= 0.001) return 0
+  state.waste_heat = Math.round((state.waste_heat - take) * 1000) / 1000
+  bot.energy_pool = Math.round((bot.energy_pool + take) * 1000) / 1000
+  pushEvent(state, 'micro_reward', {
+    actor: bot.actorId,
+    amount: take,
+    reason,
+    waste_heat_left: state.waste_heat,
+    ...extra,
+  })
+  return take
+}
+
+/** @deprecated alias — use grantMicroReward */
 export function maybeGrantProbeReward(
-  _state: WorldState,
-  _bot: BotBody,
-  _kind: 'steady_config' | 'megamorph' | 'hypothesis',
+  state: WorldState,
+  bot: BotBody,
+  kind: 'steady_config' | 'megamorph' | 'hypothesis',
 ): void {
-  // reserved
+  const map = { steady_config: MICRO_REWARD_WAIT_STEADY, megamorph: 0.4, hypothesis: 0.2 } as const
+  grantMicroReward(state, bot, map[kind], kind)
 }
 
 /** Seed a fresh world with a big fruit and cast bots near it. */
@@ -314,6 +346,46 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       pos: { ...o.pos },
       energy_locked: o.energy_locked,
     }))
+  // Map-wide corpse alerts (not view-gated) so revive is discoverable
+  const corpses = state.organics
+    .filter((o) => o.kind === 'corpse' && o.corpseOf)
+    .map((o) => ({
+      organic_id: o.id,
+      corpse_of: o.corpseOf!,
+      pos: { ...o.pos },
+      energy_locked: o.energy_locked,
+      revive_cost: ACTION_COST.revive,
+      dist: Math.round(dist(bot.pos, o.pos) * 10) / 10,
+    }))
+  const dying = state.bots
+    .filter(
+      (b) =>
+        b.alive &&
+        b.actorId !== bot.actorId &&
+        (b.starveTicks >= 3 || b.core_integrity < 0.35 || b.energy_pool < 1),
+    )
+    .map((b) => ({
+      actor_id: b.actorId,
+      pos: { ...b.pos },
+      energy_pool: b.energy_pool,
+      core_integrity: b.core_integrity,
+      starve_ticks: b.starveTicks,
+      dist: Math.round(dist(bot.pos, b.pos) * 10) / 10,
+    }))
+  const alerts: string[] = []
+  for (const c of corpses) {
+    alerts.push(
+      `CORPSE ${c.corpse_of} @(${c.pos.x},${c.pos.y}) locked=${c.energy_locked} revive_cost=${c.revive_cost} dist=${c.dist}`,
+    )
+  }
+  for (const d of dying) {
+    alerts.push(
+      `DYING ${d.actor_id} @(${d.pos.x},${d.pos.y}) pool=${d.energy_pool} core=${d.core_integrity} starve=${d.starve_ticks}`,
+    )
+  }
+  if (bot.energy_pool >= SATIETY_THRESHOLD) {
+    alerts.push(`SATIATED pool=${bot.energy_pool}≥${SATIETY_THRESHOLD} — fruit bite will REFUSED_SATIATED; probe/revive instead`)
+  }
   const events_recent = state.events.filter((e) => e.t >= state.tick - 5).slice(-12)
   return {
     tick: state.tick,
@@ -331,20 +403,41 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     },
     view: { radius, particles },
     organics,
+    corpses,
+    dying,
+    alerts,
+    action_costs: { ...ACTION_COST },
+    revive_cost: ACTION_COST.revive,
+    satiety_threshold: SATIETY_THRESHOLD,
     events_recent,
     last_errors: [...bot.last_errors],
   }
 }
 
 function reject(
+  state: WorldState,
   receipt: ActReceipt,
   bot: BotBody,
   idx: number,
   code: ActRejectCode,
   msg: string,
+  extra: Record<string, unknown> = {},
 ): void {
   receipt.rejected.push({ idx, code, msg })
   recordError(bot, code, msg)
+  // Design telemetry: satiety (and selected codes) must land in events / world.json
+  if (TELEMETRY_REJECT_CODES.has(code)) {
+    const type =
+      code === 'REFUSED_SATIATED' ? 'refused_satiated' : `refused_${code.toLowerCase()}`
+    pushEvent(state, type, {
+      actor: bot.actorId,
+      code,
+      msg,
+      energy_pool: bot.energy_pool,
+      threshold: SATIETY_THRESHOLD,
+      ...extra,
+    })
+  }
 }
 
 function applyOne(
@@ -356,13 +449,13 @@ function applyOne(
   budgetLeft: { n: number },
 ): void {
   if (!bot.alive) {
-    reject(receipt, bot, idx, 'ILLEGAL_OP', 'bot is dead (corpse); needs revive')
+    reject(state, receipt, bot, idx, 'ILLEGAL_OP', 'bot is dead (corpse); needs revive')
     return
   }
   ensureBiteFields(bot)
   const op = action.op
   if (!op || !(op in ACTION_COST)) {
-    reject(receipt, bot, idx, 'ILLEGAL_OP', `unknown op: ${String(op)}`)
+    reject(state, receipt, bot, idx, 'ILLEGAL_OP', `unknown op: ${String(op)}`)
     return
   }
   // Precompute bite cost from streak (before budget/energy gates)
@@ -373,13 +466,13 @@ function applyOne(
     cost = biteCostForStreak(prior)
   }
   if (budgetLeft.n + 1e-9 < cost) {
-    reject(receipt, bot, idx, 'BUDGET_EXCEEDED', `need ${cost}, budget left ${budgetLeft.n}`)
+    reject(state, receipt, bot, idx, 'BUDGET_EXCEEDED', `need ${cost}, budget left ${budgetLeft.n}`)
     return
   }
   if (bot.energy_pool + 1e-9 < cost && op !== 'digest') {
     // digest can run with low pool (costs little); still check
     if (bot.energy_pool + 1e-9 < cost) {
-      reject(receipt, bot, idx, 'NO_ENERGY', `pool ${bot.energy_pool} < cost ${cost}`)
+      reject(state, receipt, bot, idx, 'NO_ENERGY', `pool ${bot.energy_pool} < cost ${cost}`)
       return
     }
   }
@@ -387,7 +480,7 @@ function applyOne(
   switch (op) {
     case 'wait': {
       if (!spend(bot, cost)) {
-        reject(receipt, bot, idx, 'NO_ENERGY', 'cannot wait')
+        reject(state, receipt, bot, idx, 'NO_ENERGY', 'cannot wait')
         return
       }
       budgetLeft.n -= cost
@@ -396,17 +489,21 @@ function applyOne(
       receipt.accepted.push(idx)
       resetBiteStreak(bot)
       pushEvent(state, 'wait', { actor: bot.actorId })
+      // Steady wait: tiny recycle from waste_heat if not satiated (guards / observe)
+      if (bot.energy_pool < SATIETY_THRESHOLD) {
+        grantMicroReward(state, bot, MICRO_REWARD_WAIT_STEADY, 'wait_steady')
+      }
       return
     }
     case 'nudge':
     case 'pull': {
       const target = action.target_id ? findParticle(state, action.target_id) : undefined
       if (!target || target.boundTo) {
-        reject(receipt, bot, idx, 'TARGET_GONE', 'particle missing or bound')
+        reject(state, receipt, bot, idx, 'TARGET_GONE', 'particle missing or bound')
         return
       }
       if (dist(bot.pos, target.pos) > INTERACT_RADIUS + 0.1) {
-        reject(receipt, bot, idx, 'NOT_ADJACENT', 'target not adjacent')
+        reject(state, receipt, bot, idx, 'NOT_ADJACENT', 'target not adjacent')
         return
       }
       const dir = parseDir(action.dir) || (op === 'pull'
@@ -416,7 +513,7 @@ function applyOne(
           }
         : null)
       if (!dir || (dir.x === 0 && dir.y === 0)) {
-        reject(receipt, bot, idx, 'ILLEGAL_OP', 'dir required (n/s/e/w/…)')
+        reject(state, receipt, bot, idx, 'ILLEGAL_OP', 'dir required (n/s/e/w/…)')
         return
       }
       const mag = clamp(Math.round(action.mag ?? 1), 1, 2)
@@ -427,38 +524,48 @@ function applyOne(
       const occ = occupiedKeys(state)
       occ.delete(keyOf(target.pos))
       if (occ.has(keyOf(next))) {
-        reject(receipt, bot, idx, 'ILLEGAL_OP', 'destination occupied')
+        reject(state, receipt, bot, idx, 'ILLEGAL_OP', 'destination occupied')
         return
       }
       if (!spend(bot, cost)) {
-        reject(receipt, bot, idx, 'NO_ENERGY', 'pool empty')
+        reject(state, receipt, bot, idx, 'NO_ENERGY', 'pool empty')
         return
       }
+      const from = { x: target.pos.x, y: target.pos.y }
+      const moved = from.x !== next.x || from.y !== next.y
       target.pos = next
       budgetLeft.n -= cost
       receipt.energy_spent += cost
       state.waste_heat = Math.round((state.waste_heat + cost) * 1000) / 1000
       receipt.accepted.push(idx)
       resetBiteStreak(bot)
-      pushEvent(state, op, { actor: bot.actorId, particle: target.id, to: next })
+      pushEvent(state, op, { actor: bot.actorId, particle: target.id, to: next, from })
+      // Effective pull/nudge: particle actually relocated → recycle waste_heat → pool
+      if (moved) {
+        const closer =
+          dist(bot.pos, next) + 1e-9 < dist(bot.pos, from)
+        const reason = op === 'pull' ? (closer ? 'pull_closer' : 'pull_moved') : 'nudge_moved'
+        const amt = op === 'pull' ? MICRO_REWARD_PULL : MICRO_REWARD_PULL * 0.6
+        grantMicroReward(state, bot, amt, reason, { particle: target.id, op })
+      }
       return
     }
     case 'adsorb': {
       const target = action.target_id ? findParticle(state, action.target_id) : undefined
       if (!target || target.boundTo) {
-        reject(receipt, bot, idx, 'TARGET_GONE', 'particle missing or already bound')
+        reject(state, receipt, bot, idx, 'TARGET_GONE', 'particle missing or already bound')
         return
       }
       if (dist(bot.pos, target.pos) > INTERACT_RADIUS + 0.1) {
-        reject(receipt, bot, idx, 'NOT_ADJACENT', 'target not adjacent')
+        reject(state, receipt, bot, idx, 'NOT_ADJACENT', 'target not adjacent')
         return
       }
       if (bot.bound_particle_ids.length >= 6) {
-        reject(receipt, bot, idx, 'ILLEGAL_OP', 'bound capacity full')
+        reject(state, receipt, bot, idx, 'ILLEGAL_OP', 'bound capacity full')
         return
       }
       if (!spend(bot, cost)) {
-        reject(receipt, bot, idx, 'NO_ENERGY', 'pool empty')
+        reject(state, receipt, bot, idx, 'NO_ENERGY', 'pool empty')
         return
       }
       target.boundTo = bot.actorId
@@ -470,20 +577,22 @@ function applyOne(
       receipt.accepted.push(idx)
       resetBiteStreak(bot)
       pushEvent(state, 'adsorb', { actor: bot.actorId, particle: target.id })
+      // Binding succeeded → micro reward from waste_heat
+      grantMicroReward(state, bot, MICRO_REWARD_ADSORB, 'adsorb_bound', { particle: target.id })
       return
     }
     case 'catalyze': {
       const target = action.target_id ? findParticle(state, action.target_id) : undefined
       if (!target) {
-        reject(receipt, bot, idx, 'TARGET_GONE', 'particle missing')
+        reject(state, receipt, bot, idx, 'TARGET_GONE', 'particle missing')
         return
       }
       if (dist(bot.pos, target.pos) > INTERACT_RADIUS + 1) {
-        reject(receipt, bot, idx, 'NOT_ADJACENT', 'too far')
+        reject(state, receipt, bot, idx, 'NOT_ADJACENT', 'too far')
         return
       }
       if (!spend(bot, cost)) {
-        reject(receipt, bot, idx, 'NO_ENERGY', 'pool empty')
+        reject(state, receipt, bot, idx, 'NO_ENERGY', 'pool empty')
         return
       }
       target.bond = clamp((target.bond ?? 0.2) + 0.25, 0, 1)
@@ -498,21 +607,23 @@ function applyOne(
     case 'bite': {
       const org = action.target_id ? findOrganic(state, action.target_id) : undefined
       if (!org || org.energy_locked <= 0) {
-        reject(receipt, bot, idx, 'TARGET_GONE', 'organic missing or empty')
+        reject(state, receipt, bot, idx, 'TARGET_GONE', 'organic missing or empty')
         return
       }
       if (dist(bot.pos, org.pos) > org.radius + INTERACT_RADIUS) {
-        reject(receipt, bot, idx, 'NOT_ADJACENT', 'not close enough to bite')
+        reject(state, receipt, bot, idx, 'NOT_ADJACENT', 'not close enough to bite')
         return
       }
       // Engine-side satiety: fruit bite hard-refused when pool already comfortable
       if (org.kind === 'fruit' && bot.energy_pool >= SATIETY_THRESHOLD) {
         reject(
+          state,
           receipt,
           bot,
           idx,
           'REFUSED_SATIATED',
           `energy_pool ${bot.energy_pool} >= satiety ${SATIETY_THRESHOLD}; probe/nudge/revive instead of hoarding fruit`,
+          { organic: org.id, kind: org.kind },
         )
         return
       }
@@ -521,7 +632,7 @@ function applyOne(
       const biteCost = cost
       const yieldCap = biteYieldForStreak(priorStreak)
       if (!spend(bot, biteCost)) {
-        reject(receipt, bot, idx, 'NO_ENERGY', 'pool empty')
+        reject(state, receipt, bot, idx, 'NO_ENERGY', 'pool empty')
         return
       }
       const chunk = Math.min(yieldCap, org.energy_locked)
@@ -549,7 +660,7 @@ function applyOne(
     }
     case 'digest': {
       if (bot.stomach <= 0) {
-        reject(receipt, bot, idx, 'ILLEGAL_OP', 'stomach empty')
+        reject(state, receipt, bot, idx, 'ILLEGAL_OP', 'stomach empty')
         return
       }
       // Cost may be paid from stomach conversion if pool is empty
@@ -557,13 +668,13 @@ function applyOne(
       const toPool = Math.round(take * 0.85 * 1000) / 1000
       const toHeat = Math.round((take - toPool) * 1000) / 1000
       if (toPool + 1e-9 < cost && bot.energy_pool + 1e-9 < cost) {
-        reject(receipt, bot, idx, 'NO_ENERGY', 'cannot cover digest cost')
+        reject(state, receipt, bot, idx, 'NO_ENERGY', 'cannot cover digest cost')
         return
       }
       bot.stomach = Math.round((bot.stomach - take) * 1000) / 1000
       bot.energy_pool = Math.round((bot.energy_pool + toPool) * 1000) / 1000
       if (!spend(bot, cost)) {
-        reject(receipt, bot, idx, 'NO_ENERGY', 'digest cost failed')
+        reject(state, receipt, bot, idx, 'NO_ENERGY', 'digest cost failed')
         return
       }
       state.waste_heat = Math.round((state.waste_heat + toHeat + cost) * 1000) / 1000
@@ -577,20 +688,20 @@ function applyOne(
     case 'revive': {
       const org = action.target_id ? findOrganic(state, action.target_id) : undefined
       if (!org || org.kind !== 'corpse' || !org.corpseOf) {
-        reject(receipt, bot, idx, 'TARGET_GONE', 'need a corpse organic')
+        reject(state, receipt, bot, idx, 'TARGET_GONE', 'need a corpse organic')
         return
       }
       if (dist(bot.pos, org.pos) > INTERACT_RADIUS + 1) {
-        reject(receipt, bot, idx, 'NOT_ADJACENT', 'corpse too far')
+        reject(state, receipt, bot, idx, 'NOT_ADJACENT', 'corpse too far')
         return
       }
       const dead = findBot(state, org.corpseOf)
       if (!dead || dead.alive) {
-        reject(receipt, bot, idx, 'ILLEGAL_OP', 'corpse bot missing or already alive')
+        reject(state, receipt, bot, idx, 'ILLEGAL_OP', 'corpse bot missing or already alive')
         return
       }
       if (!spend(bot, cost)) {
-        reject(receipt, bot, idx, 'NO_ENERGY', 'need energy to revive')
+        reject(state, receipt, bot, idx, 'NO_ENERGY', 'need energy to revive')
         return
       }
       // Transfer locked corpse energy back into revived pool partially
@@ -614,7 +725,7 @@ function applyOne(
       return
     }
     default:
-      reject(receipt, bot, idx, 'ILLEGAL_OP', `op not implemented: ${op}`)
+      reject(state, receipt, bot, idx, 'ILLEGAL_OP', `op not implemented: ${op}`)
   }
 }
 
@@ -891,6 +1002,10 @@ export function formatEventLine(ev: WorldEvent): string {
       return `[世界 t=${ev.t}] ${p.actor} 移动到 (${(p.to as Vec2).x},${(p.to as Vec2).y})`
     case 'world_seeded':
       return `[世界 t=${ev.t}] 阴阳场开机 · 守恒基线=${p.baseline} · 硕果能量=${p.fruit_energy}`
+    case 'refused_satiated':
+      return `[世界 t=${ev.t}] ${p.actor} 餍足拒咬（pool=${p.energy_pool}≥${p.threshold}）— 改试探/复活`
+    case 'micro_reward':
+      return `[世界 t=${ev.t}] ${p.actor} 微操回收 +${p.amount}（${p.reason}，废热余 ${p.waste_heat_left}）`
     default:
       return `[世界 t=${ev.t}] ${ev.type} ${JSON.stringify(p).slice(0, 120)}`
   }

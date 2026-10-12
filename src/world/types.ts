@@ -110,6 +110,26 @@ export interface ObserveOrganic {
   energy_locked: number
 }
 
+/** Corpse / dying alert for observe (map-wide, not view-gated). */
+export interface ObserveCorpseAlert {
+  organic_id: string
+  corpse_of: string
+  pos: Vec2
+  energy_locked: number
+  revive_cost: number
+  /** Distance from observer; omit if observer has no body. */
+  dist?: number
+}
+
+export interface ObserveDyingAlert {
+  actor_id: string
+  pos: Vec2
+  energy_pool: number
+  core_integrity: number
+  starve_ticks: number
+  dist?: number
+}
+
 export interface ObserveSnapshot {
   tick: number
   self: ObserveSelf
@@ -118,6 +138,16 @@ export interface ObserveSnapshot {
     particles: ObserveParticle[]
   }
   organics: ObserveOrganic[]
+  /** Map-wide corpses — prominent so agents can path to revive. */
+  corpses: ObserveCorpseAlert[]
+  /** Alive bots near death (starve / low core). */
+  dying: ObserveDyingAlert[]
+  /** Short human-readable alerts (corpse / dying / satiety). */
+  alerts: string[]
+  /** Full op cost table (includes revive). */
+  action_costs: Record<WorldOp, number>
+  revive_cost: number
+  satiety_threshold: number
   events_recent: WorldEvent[]
   last_errors: BotBody['last_errors']
 }

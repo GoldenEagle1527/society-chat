@@ -76,7 +76,11 @@ function main(): void {
     `expected REFUSED_SATIATED, got ${JSON.stringify(satiated.rejected)}`,
   )
   assert.ok(!satiated.accepted.includes(0), 'satiated bite not accepted')
-  console.log(`✓ REFUSED_SATIATED pool=${bot.energy_pool} threshold=${SATIETY_THRESHOLD}`)
+  assert.ok(
+    state.events.some((e) => e.type === 'refused_satiated' && e.payload.actor === 'agnes'),
+    'refused_satiated must appear in world.events',
+  )
+  console.log(`✓ REFUSED_SATIATED pool=${bot.energy_pool} threshold=${SATIETY_THRESHOLD} + event`)
 
   // --- Diminishing returns ---
   // Move stomach back to waste so only bite yields are measured; keep conservation
@@ -160,6 +164,42 @@ function main(): void {
   assert.ok(state.organics.some((o) => o.kind === 'corpse' && o.corpseOf === 'glm'))
   assert.ok(conservationOk(state, 0.35), `after starve Σ=${totalEnergy(state)} base=${state.conservation_baseline}`)
   console.log(`✓ starve→corpse conservation Σ=${totalEnergy(state)}`)
+
+  // --- corpses / revive_cost in observe ---
+  const snap2 = observe(state, 'agnes')
+  assert.ok(snap2.corpses.some((c) => c.corpse_of === 'glm'), 'corpses alert must list glm')
+  assert.equal(snap2.revive_cost, 8)
+  assert.equal(snap2.action_costs.revive, 8)
+  assert.ok(snap2.alerts.some((a) => a.includes('CORPSE')), 'alerts mention corpse')
+  console.log(`✓ observe corpses=${snap2.corpses.length} revive_cost=${snap2.revive_cost}`)
+
+  // --- micro_reward on adsorb (need waste_heat + free particle) ---
+  const freeP = state.particles.find((p) => !p.boundTo)
+  assert.ok(freeP, 'need free particle')
+  // Ensure waste heat for reward; move particle next to agnes
+  if (state.waste_heat < 2) {
+    state.waste_heat = Math.round((state.waste_heat + 5) * 1000) / 1000
+    // balance: pull from fruit lock
+    const fr = state.organics.find((o) => o.kind === 'fruit')
+    if (fr) fr.energy_locked = Math.round((fr.energy_locked - 5) * 1000) / 1000
+  }
+  bot.pos = { ...freeP!.pos }
+  const poolBefore = bot.energy_pool
+  const heatBefore = state.waste_heat
+  const evBefore = state.events.length
+  transferPool(bot, state, Math.max(bot.energy_pool, 3))
+  const ads = act(state, {
+    actor_id: 'agnes',
+    budget_energy: 5,
+    actions: [{ op: 'adsorb', target_id: freeP!.id }],
+  })
+  assert.ok(ads.accepted.includes(0), `adsorb accepted ${JSON.stringify(ads)}`)
+  const rewards = state.events.slice(evBefore).filter((e) => e.type === 'micro_reward')
+  assert.ok(rewards.some((e) => e.payload.reason === 'adsorb_bound'), 'micro_reward adsorb_bound')
+  assert.ok(conservationOk(state, 0.4), `after adsorb reward Σ=${totalEnergy(state)}`)
+  console.log(
+    `✓ micro_reward adsorb pool ${poolBefore}→${bot.energy_pool} heat ${heatBefore}→${state.waste_heat} amt=${rewards[0]?.payload.amount}`,
+  )
 
   console.log('=== WORLD-SMOKE OK ===')
 }
