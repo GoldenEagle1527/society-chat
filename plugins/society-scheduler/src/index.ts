@@ -717,6 +717,219 @@ export class SocietySchedulerService extends Service {
   }
 
   /**
+   * Synced turn-based world tick:
+   * 1) beginSyncedTurn (act ops do not stepPhysics)
+   * 2) ask ALL living agents in parallel (timeout → wait fill)
+   * 3) endSyncedTurn → one shared physics/metabolism step
+   * No free-running metabolism while models think.
+   */
+  async runSyncedWorldTurn(opts?: {
+    timeoutMs?: number
+  }): Promise<{
+    tick: number
+    worldTick: number
+    results: Array<{
+      agentId: AgentId
+      status: 'ok' | 'timeout' | 'error' | 'rest' | 'dead' | 'wait_fill'
+      action?: string
+    }>
+  }> {
+    const timeoutMs = Math.max(
+      5_000,
+      opts?.timeoutMs ?? Math.min(agentTickBudgetMs(), 90_000),
+    )
+    this.tickCount += 1
+    this.roomRepliesThisTick = 0
+
+    const state = this.ctx.societyWorld.getState()
+    const living = (state?.bots || [])
+      .filter((b) => b.alive && b.actorId !== 'human')
+      .map((b) => b.actorId as AgentId)
+
+    this.ctx.societyWorld.beginSyncedTurn()
+
+    const results = await Promise.all(
+      living.map(async (agentId) => {
+        if (!this.ctx.societyWorld.isAlive(agentId)) {
+          return { agentId, status: 'dead' as const }
+        }
+        getRestUntil(agentId)
+        if (isAgentResting(agentId)) {
+          try {
+            recordSkip(agentId, 'resting')
+          } catch {
+            /* */
+          }
+          this.applyWaitFill(agentId)
+          return { agentId, status: 'rest' as const, action: 'wait_fill' }
+        }
+
+        try {
+          recordWake(agentId)
+        } catch {
+          /* */
+        }
+
+        const work = this.forceIdleWorldTurn(agentId)
+        const raced = await Promise.race([
+          work.then((r) => ({ tag: 'ok' as const, r })),
+          sleepMs(timeoutMs).then(() => ({ tag: 'timeout' as const })),
+        ])
+
+        if (raced.tag === 'timeout') {
+          try {
+            recordSkip(agentId, 'timeout')
+          } catch {
+            /* */
+          }
+          this.applyWaitFill(agentId)
+          // Inner work may still finish; ignore late world_act under defer (next turns ok)
+          void work.catch(() => undefined)
+          return { agentId, status: 'timeout' as const, action: 'wait_fill' }
+        }
+
+        const action = raced.r.action
+        if (raced.r.didWorldOp) {
+          return { agentId, status: 'ok' as const, action }
+        }
+        this.applyWaitFill(agentId)
+        return { agentId, status: 'wait_fill' as const, action: action || 'wait_fill' }
+      }),
+    )
+
+    this.ctx.societyWorld.endSyncedTurn()
+    const w = this.ctx.societyWorld.getState()
+    try {
+      recordSchedulerTick('synced')
+      if (w && typeof w.tick === 'number') setLedgerWorldTick(w.tick)
+    } catch {
+      /* */
+    }
+
+    return {
+      tick: this.tickCount,
+      worldTick: w?.tick ?? 0,
+      results,
+    }
+  }
+
+  /** Default physics wait when agent timed out or did not world_act this turn. */
+  private applyWaitFill(agentId: AgentId): void {
+    try {
+      if (!this.ctx.societyWorld.isAlive(agentId)) return
+      this.ctx.societyWorld.act({
+        actor_id: agentId,
+        budget_energy: 1,
+        actions: [{ op: 'wait' }],
+      })
+    } catch (err) {
+      schedWarn(
+        this.ctx,
+        `wait_fill fail ${agentId}: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
+  }
+
+  /**
+   * Always invoke one idle LLM turn for synced world (no idle_stale / cooldown skip).
+   * Does not enqueue async retry — caller wait_fills on failure.
+   */
+  private async forceIdleWorldTurn(
+    agentId: AgentId,
+  ): Promise<{ action: TickResult['action']; body?: string; didWorldOp: boolean }> {
+    if (this.inFlight.has(agentId)) {
+      return { action: 'skip', didWorldOp: false }
+    }
+    this.inFlight.add(agentId)
+    try {
+      const profile = this.ctx.societyIdentity.require(agentId)
+      if (!this.ctx.societyWorld.isAlive(agentId)) {
+        return { action: 'skip', didWorldOp: false }
+      }
+
+      const others = this.ctx.societyIdentity
+        .list()
+        .map((a) => a.id)
+        .filter((id) => id !== agentId)
+      const room =
+        (this.defaultRoomId && this.ctx.societyRooms.get(this.defaultRoomId)) ||
+        this.ctx.societyRooms.listRooms().find((r) => r.name === 'plaza') ||
+        this.ctx.societyRooms.listRooms()[0]
+      const roomLabel = room ? `「${room.name}」` : '广场'
+      const history = room != null ? this.ctx.societyRooms.historyOf(room.id) : []
+      const recent = history
+        .slice(-4)
+        .map((m) => `${m.from}: ${m.body.slice(0, 60)}`)
+        .join('\n')
+
+      if (room) this.ctx.societyTools.setDefaultRoom(room.id)
+
+      let worldLine = ''
+      try {
+        worldLine = this.ctx.societyWorld.promptWorldSection(agentId)
+      } catch {
+        try {
+          worldLine = this.ctx.societyWorld.formatSnapshotFor(agentId)
+        } catch {
+          worldLine = '世界状态暂不可用'
+        }
+      }
+
+      const stimulus = [
+        formatBeijingNow(),
+        `【阴阳场·同步回合 t_sched=${this.tickCount}】全员并行决策；本回合结束后才结算物理/代谢。`,
+        worldLine,
+        '必须收束：优先 world_observe 再 world_act（bite/digest/nudge/pull/adsorb/catalyze/wait/revive）。',
+        '也可 speak_in_room 短句，但未 world_act 时引擎会代填 wait。',
+        '收束工具（必须恰好一个）：world_act / speak_in_room / send_dm / do_nothing / rest',
+        recent ? `广场近况：\n${recent}` : '广场安静。',
+        `可私信：${others.join(' / ') || '无'}；默认群${roomLabel}。`,
+        `语气参考：${profile.persona.slice(0, 120)}`,
+      ].join('\n')
+
+      this.ctx.societyMemory.recordLlmCall(agentId)
+      const idleStimulusKey = `sync-${this.tickCount}-${agentId}`
+      let result: AgentActResult
+      try {
+        result = await this.ctx.societyLlm.actClosedTurn(agentId, { text: stimulus }, 'idle')
+        try {
+          recordLlm(agentId, true)
+        } catch {
+          /* */
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        const safe = msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+        try {
+          recordLlm(agentId, false)
+        } catch {
+          /* */
+        }
+        schedWarn(this.ctx, `sync-turn LLM fail ${agentId}: ${safe}`)
+        this.lastActAt.set(agentId, Date.now())
+        return { action: 'skip', didWorldOp: false }
+      }
+
+      this.lastActAt.set(agentId, Date.now())
+      const worldOp = result.acted === 'world_act' || result.acted === 'rest'
+
+      if (!result.ok || result.acted === 'none') {
+        return { action: 'skip', didWorldOp: false }
+      }
+
+      const noted = this.noteClosingAct(agentId, result, idleStimulusKey, {
+        roomId: room?.id,
+      })
+      if (result.sideEffectDone && noted.action !== 'idle-none' && noted.action !== 'silent') {
+        await this.consolidateAfterAct(agentId)
+      }
+      return { action: noted.action, body: noted.body, didWorldOp: worldOp }
+    } finally {
+      this.inFlight.delete(agentId)
+    }
+  }
+
+    /**
    * Single-agent slice with a hard time budget.
    * Hung LLM fetch must not block Promise.all / tickRunning forever.
    * On timeout we return skip immediately; the inner work may still finish and

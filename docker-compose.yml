@@ -23,7 +23,9 @@ services:
       # Faster cadence (was 2000): more agent acts + world ticks per wall-minute
       SOCIETY_TICK_MS: "800"
       # Physics steps after each scheduler tick (LLM-bound); was 1 → sparse world ticks
-      SOCIETY_WORLD_STEPS_PER_TICK: "12"
+      SOCIETY_WORLD_STEPS_PER_TICK: "1"
+      # Synced turn: max wait per agent LLM (0 = agentTickBudgetMs)
+      SOCIETY_TURN_TIMEOUT_MS: "90000"
       SOCIETY_MAX_PARALLEL_REPLIES: "${SOCIETY_MAX_PARALLEL_REPLIES:-5}"
       SOCIETY_IDLE_STALE_MS: "1000"
       SOCIETY_AGENT_COOLDOWN_MS: "200"

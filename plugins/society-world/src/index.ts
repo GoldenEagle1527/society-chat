@@ -42,6 +42,8 @@ export class SocietyWorldService extends Service {
   private state: WorldState | null = null
   private plazaRoomId: string | null = null
   private lastPostedEventIdx = 0
+  /** When true, act() applies ops but does not stepPhysics (synced turn). */
+  private deferSettle = false
 
   constructor(ctx: Context) {
     super(ctx, 'societyWorld')
@@ -78,10 +80,24 @@ export class SocietyWorldService extends Service {
     return engineObserve(state, actorId)
   }
 
+  beginSyncedTurn(): void {
+    this.deferSettle = true
+  }
+
+  /** Apply one physics/metabolism tick and clear defer. */
+  endSyncedTurn(): WorldEvent[] {
+    this.deferSettle = false
+    return this.step()
+  }
+
+  isDeferSettle(): boolean {
+    return this.deferSettle
+  }
+
   act(req: ActRequest): ActReceipt {
     const state = this.requireState()
     const before = state.events.length
-    const receipt = engineAct(state, req)
+    const receipt = engineAct(state, req, { settle: !this.deferSettle })
     this.persist()
     this.emitNewEvents(before)
     return receipt

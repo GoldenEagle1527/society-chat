@@ -1206,7 +1206,11 @@ function killBot(state: WorldState, bot: BotBody, reason: string): void {
   pushEvent(state, 'death', { actor: bot.actorId, reason, corpse: corpse.id })
 }
 
-export function act(state: WorldState, req: ActRequest): ActReceipt {
+export function act(
+  state: WorldState,
+  req: ActRequest,
+  opts?: { settle?: boolean },
+): ActReceipt {
   const bot = findBot(state, req.actor_id)
   const receipt: ActReceipt = {
     accepted: [],
@@ -1223,9 +1227,11 @@ export function act(state: WorldState, req: ActRequest): ActReceipt {
   for (let i = 0; i < actions.length; i++) {
     applyOne(state, bot, actions[i]!, i, receipt, budgetLeft)
   }
-  // After acts, advance physics one tick
-  stepPhysics(state)
-  receipt.tick_advanced = state.tick
+  // Turn-based: defer settle so all agents act, then one shared stepPhysics
+  if (opts?.settle !== false) {
+    stepPhysics(state)
+    receipt.tick_advanced = state.tick
+  }
   state.updatedAt = new Date().toISOString()
   return receipt
 }

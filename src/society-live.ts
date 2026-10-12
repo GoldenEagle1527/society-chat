@@ -142,7 +142,7 @@ async function main(): Promise<void> {
   )
   resetCallLedger({
     worldTickStart: world.tick,
-    note: 'Window starts at society-live boot after seed/ensure.',
+    note: 'Synced turn-based live: one physics settle per full parallel agent round.',
   })
   console.log(`[live] call-ledger reset → ${CALL_LEDGER_FILE}`)
   console.log(`✓ room: ${room.name} (${room.id.slice(0, 8)}…) members=${room.members.join(',') || '(empty)'}`)
@@ -508,37 +508,26 @@ async function main(): Promise<void> {
     if (!tickRunning) {
       tickRunning = true
       try {
-        const result = await ctx.societyScheduler.runTick()
-        // Passive world clock: several physics steps per live tick so metabolism
-        // advances even when LLM runTick is slow (wall-clock ≫ TICK_MS).
-        const worldSteps = envInt('SOCIETY_WORLD_STEPS_PER_TICK', 12)
-        for (let wi = 0; wi < worldSteps; wi++) {
+        // Synced turn-based: ALL living agents in parallel → then ONE physics settle.
+        // No free-running metabolism while models think.
+        const turnTimeout = envInt('SOCIETY_TURN_TIMEOUT_MS', 0) || undefined
+        const result = await ctx.societyScheduler.runSyncedWorldTurn(
+          turnTimeout ? { timeoutMs: turnTimeout } : undefined,
+        )
+        ticksDone = result.tick
+        if (result.tick % 2 === 0) {
           try {
-            ctx.societyWorld.step()
+            flushCallLedger()
           } catch {
-            break /* world not seeded yet */
+            /* */
           }
         }
-        ticksDone = result.tick
-        if (result.tick % 5 === 0) {
-          try { flushCallLedger() } catch { /* */ }
-        }
-        const parallelBits =
-          result.parallel && result.parallel.length > 1
-            ? ` parallel=[${result.parallel
-                .map((p) => `${p.agentId || '?'}:${p.action}`)
-                .join(', ')}]`
-            : ''
-        const line =
-          `[tick ${result.tick}] action=${result.action}` +
-          (result.agentId ? ` agent=${result.agentId}` : '') +
-          parallelBits +
-          ` exchanges=${result.exchanges}/${result.maxExchanges}`
-        if (result.action !== 'none' && result.action !== 'skip') {
-          console.log(line)
-        } else if (result.tick % 15 === 0) {
-          console.log(`${line} (heartbeat)`)
-        }
+        const bits = result.results
+          .map((r) => `${r.agentId}:${r.status}${r.action ? '/' + r.action : ''}`)
+          .join(', ')
+        console.log(
+          `[world-turn ${result.tick}] worldTick=${result.worldTick} agents=[${bits}]`,
+        )
       } catch (err) {
         console.error('[tick error]', err instanceof Error ? err.message : err)
       } finally {
@@ -547,7 +536,8 @@ async function main(): Promise<void> {
     }
 
     if (stopping) break
-    await new Promise((r) => setTimeout(r, tickMs))
+    // Brief pause between synced turns (not a free-run clock)
+    await new Promise((r) => setTimeout(r, Math.min(tickMs, 500)))
   }
 
   try {
