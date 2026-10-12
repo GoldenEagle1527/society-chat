@@ -602,6 +602,74 @@ function moveReducesDist(from: Vec2, dir: Vec2, target: Vec2, width: number, hei
 }
 
 
+/** Compass label from `from` toward `to` (n/s/e/w/ne/…). */
+export function compassDir(from: Vec2, to: Vec2): string {
+  const dx = Math.sign(to.x - from.x)
+  const dy = Math.sign(to.y - from.y)
+  if (dx === 0 && dy === 0) return 'here'
+  if (dx === 0 && dy < 0) return 'n'
+  if (dx === 0 && dy > 0) return 's'
+  if (dy === 0 && dx > 0) return 'e'
+  if (dy === 0 && dx < 0) return 'w'
+  if (dx > 0 && dy < 0) return 'ne'
+  if (dx < 0 && dy < 0) return 'nw'
+  if (dx > 0 && dy > 0) return 'se'
+  return 'sw'
+}
+
+const PREP_ALLOWED = 'move / pull / nudge（朝对面）· revive · digest · bite(clump)'
+
+/** Human-readable REFUSED_CONDENSE_PREP message (UX only). */
+function formatCondensePrepRefuse(
+  bot: BotBody,
+  state: WorldState,
+  pre: CondensePrereqInfo,
+  refusedOp: string,
+  detail?: string,
+): string {
+  const yin = `阴${pre.local_yin}/${CONDENSE_MIN_YIN}`
+  const yang = `阳${pre.local_yang}/${CONDENSE_MIN_YANG}`
+  const mix = pre.mix_ok ? '已齐窗' : '未齐窗'
+  let oppLine = '对面：暂无（场上无对应粒子）'
+  if (pre.nearest_opposite) {
+    const p = findParticle(state, pre.nearest_opposite.id)
+    const dir = p ? compassDir(bot.pos, p.pos) : '?'
+    oppLine = `对面：${pre.nearest_opposite.kind} ${pre.nearest_opposite.id} 方向=${dir} 距离=${pre.nearest_opposite.dist}`
+  }
+  const why = detail ? `；${detail}` : ''
+  return (
+    `齐窗未成（缺 ${pre.missing}；${yin} ${yang} — ${mix}）。` +
+    `允许：${PREP_ALLOWED}。` +
+    `${oppLine}。` +
+    `已拒：${refusedOp}${why}`
+  )
+}
+
+function buildWindowProgress(
+  bot: BotBody,
+  state: WorldState,
+  pre: CondensePrereqInfo,
+): {
+  label: '齐窗进度'
+  yin: { have: number; need: number }
+  yang: { have: number; need: number }
+  mix_ok: boolean
+  text: string
+} {
+  const yin = { have: pre.local_yin, need: CONDENSE_MIN_YIN }
+  const yang = { have: pre.local_yang, need: CONDENSE_MIN_YANG }
+  let opp = ''
+  if (pre.nearest_opposite) {
+    const p = findParticle(state, pre.nearest_opposite.id)
+    const dir = p ? compassDir(bot.pos, p.pos) : '?'
+    opp = `；对面 ${pre.nearest_opposite.kind} ${pre.nearest_opposite.id} 在${dir} d=${pre.nearest_opposite.dist}`
+  }
+  const status = pre.mix_ok ? '已齐窗，可 condense' : `未齐窗（缺 ${pre.missing}）— 可 move/pull/nudge 朝对面`
+  const text = `齐窗进度：阴${yin.have}/${yin.need} 阳${yang.have}/${yang.need} — ${status}${opp}`
+  return { label: '齐窗进度', yin, yang, mix_ok: pre.mix_ok, text }
+}
+
+
 /** True if this relocate reverses the bot's previous pull/nudge on the same particle. */
 export function isPullOscillation(
   bot: BotBody,
@@ -956,14 +1024,10 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       if (!suggested_ops.includes('condense')) suggested_ops.unshift('condense')
     } else if (!condenseInfo.mix_ok || condenseInfo.refuse_cooldown) {
       const pinned: WorldOp[] = ['pull', 'nudge', 'move']
-      if (condenseInfo.nearest_opposite) {
-        alerts.push(
-          `CONDENSE_MIX missing=${condenseInfo.missing} local_yin=${condenseInfo.local_yin} local_yang=${condenseInfo.local_yang} — ONLY pull/nudge/move toward ${condenseInfo.nearest_opposite.kind} ${condenseInfo.nearest_opposite.id} (d=${condenseInfo.nearest_opposite.dist}) r=${CONDENSE_WINDOW_RADIUS}`,
-        )
-      } else {
-        alerts.push(
-          `CONDENSE_MIX missing=${condenseInfo.missing} local_yin=${condenseInfo.local_yin} local_yang=${condenseInfo.local_yang} — bring opposite into r=${CONDENSE_WINDOW_RADIUS}`,
-        )
+      {
+        const wp = buildWindowProgress(bot, state, condenseInfo)
+        alerts.push(wp.text)
+        alerts.push(`允许动作：${PREP_ALLOWED}`)
       }
       if (condenseInfo.cooldown_ticks_left > 0) {
         alerts.push(
@@ -1032,7 +1096,20 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     fruit: { energy_locked: Math.round(fruitLocked * 1000) / 1000, gone: fruit_gone },
     fruit_gone,
     clumps: clumpsList,
-    condense: {
+    ...(() => {
+      const wp = buildWindowProgress(bot, state, condenseInfo)
+      const opp = condenseInfo.nearest_opposite
+        ? (() => {
+            const p = findParticle(state, condenseInfo.nearest_opposite!.id)
+            return {
+              ...condenseInfo.nearest_opposite,
+              ...(p ? { dir: compassDir(bot.pos, p.pos) } : {}),
+            }
+          })()
+        : null
+      return {
+        '齐窗进度': wp,
+        condense: {
       ok: condenseInfo.prereq_ok,
       need_yin: CONDENSE_MIN_YIN,
       need_yang: CONDENSE_MIN_YANG,
@@ -1041,8 +1118,9 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       have_yin: condenseInfo.local_yin,
       have_yang: condenseInfo.local_yang,
       missing: condenseInfo.missing,
-      nearest_opposite: condenseInfo.nearest_opposite,
+      nearest_opposite: opp,
       mix_ok: condenseInfo.mix_ok,
+      window_progress: wp,
       est_gain: condenseInfo.mix_ok
         ? Math.round(
             Math.min(condenseInfo.draw, Math.max(0, state.waste_heat)) *
@@ -1061,7 +1139,9 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       fail_streak: condenseInfo.fail_streak,
       cooldown_ticks_left: condenseInfo.cooldown_ticks_left,
       ...(condenseInfo.prereq_reason ? { prereq_reason: condenseInfo.prereq_reason } : {}),
-    },
+        },
+      }
+    })(),
     events_recent,
     last_errors: [...bot.last_errors],
   }
@@ -1195,8 +1275,21 @@ function applyOne(
             bot,
             idx,
             'REFUSED_CONDENSE_PREP',
-            `mix missing=${missing} — ${op} must target opposite (${opp ? `${opp.kind} ${opp.id}@${opp.dist}` : missing}) into r=${CONDENSE_WINDOW_RADIUS}`,
-            { missing, nearest_opposite: opp, local_yin: preGate!.local_yin, local_yang: preGate!.local_yang },
+            formatCondensePrepRefuse(
+              bot,
+              state,
+              preGate!,
+              op,
+              `请对对面粒子 pull/nudge（或 move 靠近），不要拉同极`,
+            ),
+            {
+              missing,
+              nearest_opposite: opp,
+              local_yin: preGate!.local_yin,
+              local_yang: preGate!.local_yang,
+              refused_op: op,
+              allowed: PREP_ALLOWED,
+            },
           )
           return
         }
@@ -1211,14 +1304,28 @@ function applyOne(
           // Find particle pos for opposite
           const pOpp = findParticle(state, opp.id)
           if (pOpp && !moveReducesDist(bot.pos, dir, pOpp.pos, state.width, state.height)) {
+            const needDir = compassDir(bot.pos, pOpp.pos)
             reject(
               state,
               receipt,
               bot,
               idx,
               'REFUSED_CONDENSE_PREP',
-              `mix missing=${missing} — move must approach ${opp.kind} ${opp.id} (d=${opp.dist})`,
-              { missing, nearest_opposite: opp, dir: action.dir },
+              formatCondensePrepRefuse(
+                bot,
+                state,
+                preGate!,
+                'move',
+                `请朝 ${needDir} 走近 ${opp.kind} ${opp.id}（不要往反方向）`,
+              ),
+              {
+                missing,
+                nearest_opposite: opp,
+                dir: action.dir,
+                suggested_dir: needDir,
+                refused_op: 'move',
+                allowed: PREP_ALLOWED,
+              },
             )
             return
           }
@@ -1232,8 +1339,15 @@ function applyOne(
           bot,
           idx,
           'REFUSED_CONDENSE_PREP',
-          `mix missing=${missing} local_yin=${preGate!.local_yin} local_yang=${preGate!.local_yang} — only pull/nudge/move toward opposite (or revive/digest/bite clump); refused ${op}`,
-          { missing, nearest_opposite: opp, refused_op: op },
+          formatCondensePrepRefuse(bot, state, preGate!, op),
+          {
+            missing,
+            nearest_opposite: opp,
+            refused_op: op,
+            local_yin: preGate!.local_yin,
+            local_yang: preGate!.local_yang,
+            allowed: PREP_ALLOWED,
+          },
         )
         return
       }

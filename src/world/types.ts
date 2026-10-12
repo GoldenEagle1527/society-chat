@@ -206,6 +206,14 @@ export interface ObserveSnapshot {
   fruit_gone: boolean
   /** Biteable small organics from condense/megamorph. */
   clumps: Array<{ id: string; pos: Vec2; energy_locked: number }>
+  /** 齐窗进度 — same as condense.window_progress.text + structured counts. */
+  '齐窗进度': {
+    label: '齐窗进度'
+    yin: { have: number; need: number }
+    yang: { have: number; need: number }
+    mix_ok: boolean
+    text: string
+  }
   /** Designer condense snapshot (ok / needs / estimate / mix teaching). */
   condense: {
     ok: boolean
@@ -219,8 +227,26 @@ export interface ObserveSnapshot {
     /** Which polarity is missing in window; null when mix ok. */
     missing: 'yin' | 'yang' | 'both' | null
     /** Nearest free particle of the missing kind (prep target). */
-    nearest_opposite: { id: string; kind: 'yin' | 'yang'; dist: number } | null
+    nearest_opposite: {
+      id: string
+      kind: 'yin' | 'yang'
+      dist: number
+      /** Compass hint from bot: n/s/e/w/ne/… */
+      dir?: string
+    } | null
     mix_ok: boolean
+    /**
+     * 齐窗进度 — yin/yang in window vs need (designer UX).
+     * Same payload mirrored under observe top-level key 「齐窗进度」.
+     */
+    window_progress: {
+      label: '齐窗进度'
+      yin: { have: number; need: number }
+      yang: { have: number; need: number }
+      mix_ok: boolean
+      /** One-line Chinese summary for controllers. */
+      text: string
+    }
     est_gain: number
     cost: number
     efficiency: number
