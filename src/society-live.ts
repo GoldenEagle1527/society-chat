@@ -495,11 +495,15 @@ async function main(): Promise<void> {
       tickRunning = true
       try {
         const result = await ctx.societyScheduler.runTick()
-        // Passive world clock: metabolism / corpse_leak even when nobody acted
-        try {
-          ctx.societyWorld.step()
-        } catch {
-          /* world not seeded yet */
+        // Passive world clock: several physics steps per live tick so metabolism
+        // advances even when LLM runTick is slow (wall-clock ≫ TICK_MS).
+        const worldSteps = envInt('SOCIETY_WORLD_STEPS_PER_TICK', 12)
+        for (let wi = 0; wi < worldSteps; wi++) {
+          try {
+            ctx.societyWorld.step()
+          } catch {
+            break /* world not seeded yet */
+          }
         }
         ticksDone = result.tick
         const parallelBits =
