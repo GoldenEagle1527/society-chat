@@ -14,6 +14,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { AgentId, RoomId } from '../../../src/types.ts'
+import { recordAct, recordObserve } from '../../../src/call-ledger.ts'
 import {
   loadDotEnv,
   parseSpawnLlmInput,
@@ -1054,6 +1055,7 @@ export class SocietyToolsService extends Service {
     this.ctx.societyIdentity.require(agentId)
     try {
       const snap = this.ctx.societyWorld.observe(agentId)
+      try { recordObserve(agentId, true) } catch { /* ledger optional */ }
       // Probe note into memory (world observation)
       try {
         this.ctx.societyMemory.recordProbeNote?.(agentId, {
@@ -1063,6 +1065,7 @@ export class SocietyToolsService extends Service {
       } catch { /* optional */ }
       return JSON.stringify({ ok: true, acted: 'world_observe', snapshot: snap })
     } catch (err) {
+      try { recordObserve(agentId, false) } catch { /* ledger optional */ }
       return JSON.stringify({
         ok: false,
         acted: 'world_observe',
@@ -1094,8 +1097,12 @@ export class SocietyToolsService extends Service {
           body: `accepted=${receipt.accepted.length} spent=${receipt.energy_spent} rejected=${receipt.rejected.map((r: any) => r.code).join(',')}`,
         })
       } catch { /* optional */ }
+      try {
+        recordAct(agentId, true, receipt.accepted?.length || 0, receipt.rejected?.length || 0)
+      } catch { /* ledger optional */ }
       return JSON.stringify({ ok: true, acted: 'world_act', receipt })
     } catch (err) {
+      try { recordAct(agentId, false, 0, 0) } catch { /* ledger optional */ }
       return JSON.stringify({
         ok: false,
         acted: 'world_act',

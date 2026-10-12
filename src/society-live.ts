@@ -27,6 +27,15 @@ import { readObserveSettings } from './observe-settings.ts'
 import { ensureHumanDm } from './dm-threads.ts'
 import { HUMAN_SPEAKER_ID } from './types.ts'
 import type { RoomMessage } from './types.ts'
+import {
+  closeCallLedgerWindow,
+  flushCallLedger,
+  resetCallLedger,
+  callLedgerMarkdown,
+  CALL_LEDGER_FILE,
+} from './call-ledger.ts'
+import fs from 'node:fs'
+import path from 'node:path'
 
 function envInt(name: string, fallback: number): number {
   const raw = process.env[name]?.trim()
@@ -131,6 +140,11 @@ async function main(): Promise<void> {
   console.log(
     `✓ world: tick=${world.tick} baseline=${world.conservation_baseline} bots=${world.bots.length} ok=${ctx.societyWorld.conservationOk()}`,
   )
+  resetCallLedger({
+    worldTickStart: world.tick,
+    note: 'Window starts at society-live boot after seed/ensure.',
+  })
+  console.log(`[live] call-ledger reset → ${CALL_LEDGER_FILE}`)
   console.log(`✓ room: ${room.name} (${room.id.slice(0, 8)}…) members=${room.members.join(',') || '(empty)'}`)
 
   // New births during live: join plaza + allowlist so they show up and can act
@@ -506,6 +520,9 @@ async function main(): Promise<void> {
           }
         }
         ticksDone = result.tick
+        if (result.tick % 5 === 0) {
+          try { flushCallLedger() } catch { /* */ }
+        }
         const parallelBits =
           result.parallel && result.parallel.length > 1
             ? ` parallel=[${result.parallel
@@ -533,6 +550,16 @@ async function main(): Promise<void> {
     await new Promise((r) => setTimeout(r, tickMs))
   }
 
+  try {
+    const w = ctx.societyWorld.getState()
+    closeCallLedgerWindow(w?.tick)
+    const md = callLedgerMarkdown()
+    const mdPath = path.join(path.dirname(CALL_LEDGER_FILE), 'call-ledger.md')
+    fs.writeFileSync(mdPath, md, 'utf8')
+    console.log(`[live] call-ledger closed tick=${w?.tick} → ${CALL_LEDGER_FILE}`)
+  } catch (err) {
+    console.warn('[live] call-ledger close failed', err instanceof Error ? err.message : err)
+  }
   await srv.close()
   await app.dispose()
   console.log('=== SOCIETY-LIVE DONE ===')

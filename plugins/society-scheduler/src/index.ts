@@ -35,6 +35,13 @@ import type { ActMode, AgentActResult, ReplyStimulus } from '../../society-llm/s
 import { formatBeijingNow } from '../../../src/beijing-time.ts'
 import { agentTickBudgetMs, sleep as sleepMs } from '../../../src/llm-http.ts'
 import {
+  recordLlm,
+  recordSchedulerTick,
+  recordSkip,
+  recordWake,
+  setLedgerWorldTick,
+} from '../../../src/call-ledger.ts'
+import {
   clearRest,
   getRestUntil,
   isAgentResting,
@@ -636,16 +643,19 @@ export class SocietySchedulerService extends Service {
     }
 
     if (exchangesCapped(this.exchangeCount, this.maxExchanges)) {
+      try { recordSchedulerTick('capped') } catch { /* */ }
       return { ...base, action: 'capped' }
     }
 
     const slots = this.freeParallelSlots()
     if (slots <= 0) {
+      try { recordSchedulerTick('skip') } catch { /* */ }
       return { ...base, action: 'skip' }
     }
 
     const agentIds = this.pickAgents(slots)
     if (agentIds.length === 0) {
+      try { recordSchedulerTick('none') } catch { /* */ }
       return { ...base, action: 'none' }
     }
 
@@ -678,6 +688,11 @@ export class SocietySchedulerService extends Service {
     }
 
     const primary = subResults.find((r) => r.action !== 'skip' && r.action !== 'none') ?? subResults[0]!
+    try {
+      recordSchedulerTick(primary.action)
+      const w = this.ctx.societyWorld?.getState?.()
+      if (w && typeof w.tick === 'number') setLedgerWorldTick(w.tick)
+    } catch { /* ledger optional */ }
     return {
       ...base,
       exchanges: this.exchangeCount,
@@ -722,6 +737,7 @@ export class SocietySchedulerService extends Service {
           )
         },
       )
+      try { recordSkip(agentId, 'timeout') } catch { /* */ }
       return { action: 'skip', agentId, provider }
     }
     return winner.r
@@ -731,6 +747,7 @@ export class SocietySchedulerService extends Service {
   private async runOneAgentTickBody(agentId: AgentId): Promise<TickActionResult> {
     const provider = this.providerOf(agentId)
     if (exchangesCapped(this.exchangeCount, this.maxExchanges)) {
+      try { recordSkip(agentId, 'capped') } catch { /* */ }
       return { action: 'capped', agentId, provider }
     }
 
@@ -743,7 +760,9 @@ export class SocietySchedulerService extends Service {
       const msg = this.pickBestUnread(agentId, unread, { resting })
       if (!msg) {
         // All room unread deferred by per-tick room cap → fall through to idle if possible
+        try { recordSkip(agentId, 'room_defer') } catch { /* */ }
       } else {
+        try { recordWake(agentId) } catch { /* */ }
         const outcome = await this.processUnread(agentId, msg)
         return { action: outcome, agentId, provider }
       }
@@ -751,6 +770,7 @@ export class SocietySchedulerService extends Service {
 
     // While resting: no idle self-loop
     if (resting) {
+      try { recordSkip(agentId, 'resting') } catch { /* */ }
       return { action: 'skip', agentId, provider }
     }
 
@@ -759,9 +779,11 @@ export class SocietySchedulerService extends Service {
     const lastAct = this.lastActAt.get(agentId) ?? 0
     const stale = lastAct === 0 ? Number.POSITIVE_INFINITY : Date.now() - lastAct
     if (stale < this.idleStaleMs) {
+      try { recordSkip(agentId, 'idle_stale') } catch { /* */ }
       return { action: 'skip', agentId, provider }
     }
 
+    try { recordWake(agentId) } catch { /* */ }
     const idle = await this.runIdleThought(agentId)
     return { action: idle.action, agentId, body: idle.body, provider }
   }
@@ -983,6 +1005,7 @@ export class SocietySchedulerService extends Service {
             job.mode,
             { ...job.opts, llmMode: 'async' },
           )
+          try { recordLlm(job.agentId, true) } catch { /* */ }
           this.lastActAt.set(job.agentId, Date.now())
 
           if (
@@ -1066,6 +1089,7 @@ export class SocietySchedulerService extends Service {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
           const safe = msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+          try { recordLlm(job.agentId, false) } catch { /* */ }
           schedWarn(
             this.ctx,
             `async-retry fail agent=${job.agentId} kind=${job.kind}: ${safe.slice(0, 200)}`,
@@ -1166,9 +1190,11 @@ export class SocietySchedulerService extends Service {
           mode,
           turnOpts,
         )
+        try { recordLlm(agentId, true) } catch { /* */ }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         const safe = msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+        try { recordLlm(agentId, false) } catch { /* */ }
         schedWarn(this.ctx, `LLM sync-fail ${agentId} (no post): ${safe}`)
         this.lastActAt.set(agentId, Date.now())
         handoffAsync = this.enqueueAsyncRetry({
@@ -1298,9 +1324,11 @@ export class SocietySchedulerService extends Service {
       let result: AgentActResult
       try {
         result = await this.ctx.societyLlm.actClosedTurn(agentId, { text: stimulus }, 'idle')
+        try { recordLlm(agentId, true) } catch { /* */ }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         const safe = msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+        try { recordLlm(agentId, false) } catch { /* */ }
         schedWarn(this.ctx, `idle LLM sync-fail ${agentId}: ${safe}`)
         this.lastActAt.set(agentId, Date.now())
         handoffAsync = this.enqueueAsyncRetry({
@@ -1431,9 +1459,11 @@ export class SocietySchedulerService extends Service {
           mode,
           turnOpts,
         )
+        try { recordLlm(agentId, true) } catch { /* */ }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         const safe = msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+        try { recordLlm(agentId, false) } catch { /* */ }
         schedWarn(this.ctx, `LLM sync-fail ${agentId} (no post): ${safe}`)
         this.lastActAt.set(agentId, Date.now())
         handoffAsync = this.enqueueAsyncRetry({
