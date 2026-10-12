@@ -261,21 +261,16 @@ export class SocietyLlmService extends Service {
   resolveWorldTurnConfig(agentId: AgentId): LlmEndpointConfig {
     const prefer = this.resolveConfig(agentId)
     if (prefer.provider !== 'siliconflow') return prefer
+    // Prefer GLM for remapped SiliconFlow — Agnes free tier 429s when both
+    // native Agnes + remapped SF hit it in parallel every turn.
     try {
-      if (agentId.includes('lit')) {
-        try {
-          return requireGlmConfig()
-        } catch {
-          return requireAgnesConfig()
-        }
-      }
+      return requireGlmConfig()
+    } catch {
       try {
         return requireAgnesConfig()
       } catch {
-        return requireGlmConfig()
+        return prefer
       }
-    } catch {
-      return prefer
     }
   }
 
