@@ -98,6 +98,12 @@ export const CONDENSE_MIN_YIN = 1
 export const CONDENSE_MIN_YANG = 1
 /** Softened for M0 visibility (was 3). */
 export const CONDENSE_MIN_PARTICLES = 2
+/** After this many consecutive condense fails, enter cooldown. */
+export const CONDENSE_FAIL_COOLDOWN_AFTER = 2
+/** Cooldown length in world ticks (blocks empty condense smashes). */
+export const CONDENSE_COOLDOWN_TICKS = 5
+/** Extra energy cost per fail-streak step when mix is otherwise ok (cap 3). */
+export const CONDENSE_STREAK_COST_STEP = 1
 /** Corpse/clump bite: low yield + high waste (emergency, not riches). */
 export const CORPSE_BITE_YIELD_MUL = 0.35
 export const CORPSE_BITE_WASTE_FRAC = 0.55
@@ -109,6 +115,8 @@ const TELEMETRY_REJECT_CODES: ReadonlySet<ActRejectCode> = new Set([
   'REFUSED_SATIATED',
   'REFUSED_REVIVE_WAIT',
   'REFUSED_REVIVE_BITE',
+  'REFUSED_CONDENSE_MIX',
+  'REFUSED_CONDENSE_COOLDOWN',
 ])
 
 const DIRS: Record<string, Vec2> = {
@@ -215,6 +223,15 @@ function recordError(bot: BotBody, code: ActRejectCode, msg: string): void {
 
 function ensureBiteFields(bot: BotBody): void {
   if (typeof bot.biteStreak !== 'number' || Number.isNaN(bot.biteStreak)) bot.biteStreak = 0
+}
+
+function ensureCondenseFields(bot: BotBody): void {
+  if (typeof bot.condenseFailStreak !== 'number' || Number.isNaN(bot.condenseFailStreak)) {
+    bot.condenseFailStreak = 0
+  }
+  if (typeof bot.condenseCooldownUntil !== 'number' || Number.isNaN(bot.condenseCooldownUntil)) {
+    bot.condenseCooldownUntil = 0
+  }
 }
 
 /** Effective bite cost given prior consecutive bites on the same target. */
@@ -389,11 +406,9 @@ function localFreeParticles(state: WorldState, at: Vec2, radius: number): Partic
   return freeParticles(state).filter((p) => dist(p.pos, at) <= radius + 1e-9)
 }
 
-/** M0 condense prerequisites (hooks for designer observe fields). */
-export function evaluateCondensePrereqs(
-  state: WorldState,
-  bot: BotBody,
-): {
+export type CondenseMissing = 'yin' | 'yang' | 'both' | null
+
+export type CondensePrereqInfo = {
   cost: number
   efficiency: number
   min_waste: number
@@ -403,10 +418,44 @@ export function evaluateCondensePrereqs(
   local_yang: number
   local_particles: number
   can_afford: boolean
+  mix_ok: boolean
+  missing: CondenseMissing
+  nearest_opposite: { id: string; kind: 'yin' | 'yang'; dist: number } | null
+  fail_streak: number
+  cooldown_ticks_left: number
   prereq_ok: boolean
   prereq_reason?: string
-} {
-  const cost = ACTION_COST.condense
+  /** True when refusal should be REFUSED_CONDENSE_MIX (not other prereq). */
+  refuse_mix: boolean
+  refuse_cooldown: boolean
+}
+
+/** Nearest free particle of a given kind (any distance). */
+export function nearestFreeParticleOfKind(
+  state: WorldState,
+  at: Vec2,
+  kind: 'yin' | 'yang',
+): { id: string; kind: 'yin' | 'yang'; dist: number } | null {
+  let best: { id: string; kind: 'yin' | 'yang'; dist: number } | null = null
+  for (const p of freeParticles(state)) {
+    if (p.kind !== kind) continue
+    const d = dist(p.pos, at)
+    if (!best || d < best.dist) best = { id: p.id, kind: p.kind, dist: Math.round(d * 1000) / 1000 }
+  }
+  return best
+}
+
+/** M0 condense prerequisites + mix teaching hooks for observe. */
+export function evaluateCondensePrereqs(
+  state: WorldState,
+  bot: BotBody,
+): CondensePrereqInfo {
+  ensureCondenseFields(bot)
+  const streak = bot.condenseFailStreak ?? 0
+  const cooldownLeft = Math.max(0, (bot.condenseCooldownUntil ?? 0) - state.tick)
+  const streakCost =
+    Math.round(Math.min(3, Math.max(0, streak)) * CONDENSE_STREAK_COST_STEP * 1000) / 1000
+  const cost = Math.round((ACTION_COST.condense + streakCost) * 1000) / 1000
   const locals = localFreeParticles(state, bot.pos, CONDENSE_WINDOW_RADIUS)
   let yin = 0
   let yang = 0
@@ -414,8 +463,27 @@ export function evaluateCondensePrereqs(
     if (p.kind === 'yin') yin++
     else yang++
   }
+  const needYin = yin < CONDENSE_MIN_YIN
+  const needYang = yang < CONDENSE_MIN_YANG
+  let missing: CondenseMissing = null
+  if (needYin && needYang) missing = 'both'
+  else if (needYin) missing = 'yin'
+  else if (needYang) missing = 'yang'
+  const mix_ok = missing === null
+  let nearest_opposite: CondensePrereqInfo['nearest_opposite'] = null
+  if (missing === 'yin' || missing === 'yang') {
+    nearest_opposite = nearestFreeParticleOfKind(state, bot.pos, missing)
+  } else if (missing === 'both') {
+    const a = nearestFreeParticleOfKind(state, bot.pos, 'yin')
+    const b = nearestFreeParticleOfKind(state, bot.pos, 'yang')
+    if (a && b) nearest_opposite = a.dist <= b.dist ? a : b
+    else nearest_opposite = a || b
+  }
   const can_afford = bot.energy_pool + 1e-9 >= cost
-  const base = {
+  const base: Omit<CondensePrereqInfo, 'prereq_ok' | 'prereq_reason' | 'refuse_mix' | 'refuse_cooldown'> & {
+    refuse_mix: boolean
+    refuse_cooldown: boolean
+  } = {
     cost,
     efficiency: CONDENSE_EFFICIENCY,
     min_waste: CONDENSE_MIN_WASTE,
@@ -425,6 +493,21 @@ export function evaluateCondensePrereqs(
     local_yang: yang,
     local_particles: locals.length,
     can_afford,
+    mix_ok,
+    missing,
+    nearest_opposite,
+    fail_streak: streak,
+    cooldown_ticks_left: cooldownLeft,
+    refuse_mix: false,
+    refuse_cooldown: false,
+  }
+  if (cooldownLeft > 0) {
+    return {
+      ...base,
+      prereq_ok: false,
+      refuse_cooldown: true,
+      prereq_reason: `condense cooldown ${cooldownLeft}t left after ${streak} fails — pull/nudge opposite into r=${CONDENSE_WINDOW_RADIUS}`,
+    }
   }
   if (!can_afford) {
     return { ...base, prereq_ok: false, prereq_reason: `pool ${bot.energy_pool} < condense ${cost}` }
@@ -436,11 +519,15 @@ export function evaluateCondensePrereqs(
       prereq_reason: `waste_heat ${state.waste_heat} < min ${CONDENSE_MIN_WASTE}`,
     }
   }
-  if (yin < CONDENSE_MIN_YIN || yang < CONDENSE_MIN_YANG) {
+  if (!mix_ok) {
+    const opp = nearest_opposite
+      ? ` nearest_${nearest_opposite.kind}=${nearest_opposite.id}@${nearest_opposite.dist}`
+      : ''
     return {
       ...base,
       prereq_ok: false,
-      prereq_reason: `need yin≥${CONDENSE_MIN_YIN} & yang≥${CONDENSE_MIN_YANG} in r=${CONDENSE_WINDOW_RADIUS} (have yin=${yin} yang=${yang})`,
+      refuse_mix: true,
+      prereq_reason: `need yin≥${CONDENSE_MIN_YIN} & yang≥${CONDENSE_MIN_YANG} in r=${CONDENSE_WINDOW_RADIUS} (have yin=${yin} yang=${yang}; missing=${missing})${opp}`,
     }
   }
   if (locals.length < CONDENSE_MIN_PARTICLES) {
@@ -451,6 +538,20 @@ export function evaluateCondensePrereqs(
     }
   }
   return { ...base, prereq_ok: true }
+}
+
+function noteCondenseFail(state: WorldState, bot: BotBody): void {
+  ensureCondenseFields(bot)
+  bot.condenseFailStreak = (bot.condenseFailStreak ?? 0) + 1
+  if (bot.condenseFailStreak >= CONDENSE_FAIL_COOLDOWN_AFTER) {
+    bot.condenseCooldownUntil = state.tick + CONDENSE_COOLDOWN_TICKS
+  }
+}
+
+function noteCondenseSuccess(bot: BotBody): void {
+  ensureCondenseFields(bot)
+  bot.condenseFailStreak = 0
+  bot.condenseCooldownUntil = 0
 }
 
 function fruitPresent(state: WorldState): boolean {
@@ -480,6 +581,11 @@ function rememberPull(bot: BotBody, particleId: string, from: Vec2, to: Vec2): v
   bot.lastPullParticleId = particleId
   bot.lastPullFrom = { ...from }
   bot.lastPullTo = { ...to }
+  // Prep progress: decay condense fail streak so cooldown eases after arranging
+  ensureCondenseFields(bot)
+  if ((bot.condenseFailStreak ?? 0) > 0) {
+    bot.condenseFailStreak = Math.max(0, (bot.condenseFailStreak ?? 0) - 1)
+  }
 }
 
 function listSaviors(state: WorldState, corpsePos: Vec2): ObserveSavior[] {
@@ -791,21 +897,39 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     urgency = Math.max(urgency, 28)
   }
   if (fruit_gone) {
-    // Only after fruit is gone: boost condense / clump bite
+    // Post-fruit: teach mix prep — pin pull/nudge when window unbalanced
     urgency = Math.max(urgency, 40)
+    if (condenseInfo.refuse_cooldown || (!condenseInfo.mix_ok && condenseInfo.fail_streak > 0)) {
+      urgency = Math.max(urgency, 48)
+    }
     if (condenseInfo.prereq_ok) {
       if (!suggested_ops.includes('condense')) suggested_ops.unshift('condense')
+    } else if (!condenseInfo.mix_ok || condenseInfo.refuse_cooldown) {
+      // Hard-pin prep ops; do not suggest condense until mix ok
+      const pinned: WorldOp[] = ['pull', 'nudge']
+      if (condenseInfo.nearest_opposite) {
+        alerts.push(
+          `CONDENSE_MIX missing=${condenseInfo.missing} local_yin=${condenseInfo.local_yin} local_yang=${condenseInfo.local_yang} — pull/nudge ${condenseInfo.nearest_opposite.kind} ${condenseInfo.nearest_opposite.id} (d=${condenseInfo.nearest_opposite.dist}) into r=${CONDENSE_WINDOW_RADIUS}`,
+        )
+      } else {
+        alerts.push(
+          `CONDENSE_MIX missing=${condenseInfo.missing} local_yin=${condenseInfo.local_yin} local_yang=${condenseInfo.local_yang} — bring opposite polarity into r=${CONDENSE_WINDOW_RADIUS}`,
+        )
+      }
+      if (condenseInfo.cooldown_ticks_left > 0) {
+        alerts.push(
+          `CONDENSE_COOLDOWN ${condenseInfo.cooldown_ticks_left}t — stop empty smash; arrange mix first`,
+        )
+      }
+      const reviveFirst = suggested_ops[0] === 'revive'
+      const head = reviveFirst ? (['revive'] as WorldOp[]) : []
+      const rest = suggested_ops.filter((o) => o !== 'revive' && o !== 'condense' && o !== 'pull' && o !== 'nudge')
+      suggested_ops.length = 0
+      suggested_ops.push(...head, ...pinned, ...rest)
     } else {
-      for (const op of ['pull', 'nudge', 'adsorb', 'condense'] as WorldOp[]) {
+      for (const op of ['pull', 'nudge', 'adsorb'] as WorldOp[]) {
         if (!suggested_ops.includes(op)) suggested_ops.push(op)
       }
-    }
-    if (clumpsList.length && bot.energy_pool < CLUMP_FORAGE_POOL_THRESHOLD) {
-      urgency = Math.max(urgency, 45)
-      if (!suggested_ops.includes('bite')) suggested_ops.unshift('bite')
-      if (!suggested_ops.includes('digest')) suggested_ops.splice(1, 0, 'digest')
-    } else if (clumpsList.length && !suggested_ops.includes('bite')) {
-      suggested_ops.push('bite')
     }
   } else if (fruitNearlyGone) {
     // Tail fruit still present: finish fruit (bite/digest) before condensing
@@ -856,14 +980,20 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       ok: condenseInfo.prereq_ok,
       need_yin: CONDENSE_MIN_YIN,
       need_yang: CONDENSE_MIN_YANG,
+      local_yin: condenseInfo.local_yin,
+      local_yang: condenseInfo.local_yang,
       have_yin: condenseInfo.local_yin,
       have_yang: condenseInfo.local_yang,
-      est_gain:
-        Math.round(
-          Math.min(condenseInfo.draw, Math.max(0, state.waste_heat)) *
-            condenseInfo.efficiency *
-            1000,
-        ) / 1000,
+      missing: condenseInfo.missing,
+      nearest_opposite: condenseInfo.nearest_opposite,
+      mix_ok: condenseInfo.mix_ok,
+      est_gain: condenseInfo.mix_ok
+        ? Math.round(
+            Math.min(condenseInfo.draw, Math.max(0, state.waste_heat)) *
+              condenseInfo.efficiency *
+              1000,
+          ) / 1000
+        : 0,
       cost: condenseInfo.cost,
       efficiency: condenseInfo.efficiency,
       min_waste: condenseInfo.min_waste,
@@ -872,6 +1002,8 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       local_particles: condenseInfo.local_particles,
       can_afford: condenseInfo.can_afford,
       prereq_ok: condenseInfo.prereq_ok,
+      fail_streak: condenseInfo.fail_streak,
+      cooldown_ticks_left: condenseInfo.cooldown_ticks_left,
       ...(condenseInfo.prereq_reason ? { prereq_reason: condenseInfo.prereq_reason } : {}),
     },
     events_recent,
@@ -919,6 +1051,7 @@ function applyOne(
     return
   }
   ensureBiteFields(bot)
+  ensureCondenseFields(bot)
   const op = action.op
   if (!op || !(op in ACTION_COST)) {
     reject(state, receipt, bot, idx, 'ILLEGAL_OP', `unknown op: ${String(op)}`)
@@ -926,6 +1059,11 @@ function applyOne(
   }
   // Precompute bite cost from streak (before budget/energy gates)
   let cost = ACTION_COST[op]
+  if (op === 'condense') {
+    // Escalating cost from fail streak (teach: stop empty smash)
+    const preCost = evaluateCondensePrereqs(state, bot)
+    cost = preCost.cost
+  }
   if (op === 'bite' && action.target_id) {
     const prior =
       bot.biteStreakTargetId === action.target_id ? bot.biteStreak : 0
@@ -1371,18 +1509,61 @@ function applyOne(
     case 'condense': {
       const pre = evaluateCondensePrereqs(state, bot)
       if (!pre.prereq_ok) {
+        noteCondenseFail(state, bot)
         pushEvent(state, 'condense_fail', {
           actor: bot.actorId,
           reason: pre.prereq_reason,
+          refuse_mix: pre.refuse_mix,
+          refuse_cooldown: pre.refuse_cooldown,
+          missing: pre.missing,
           waste_heat: state.waste_heat,
           local_yin: pre.local_yin,
           local_yang: pre.local_yang,
           local_particles: pre.local_particles,
+          nearest_opposite: pre.nearest_opposite,
+          fail_streak: bot.condenseFailStreak,
+          cooldown_until: bot.condenseCooldownUntil,
         })
-        reject(state, receipt, bot, idx, 'ILLEGAL_OP', pre.prereq_reason || 'condense prereq failed')
+        if (pre.refuse_cooldown) {
+          reject(
+            state,
+            receipt,
+            bot,
+            idx,
+            'REFUSED_CONDENSE_COOLDOWN',
+            pre.prereq_reason || 'condense cooldown',
+            {
+              cooldown_ticks_left: pre.cooldown_ticks_left,
+              fail_streak: bot.condenseFailStreak,
+              missing: pre.missing,
+              nearest_opposite: pre.nearest_opposite,
+            },
+          )
+        } else if (pre.refuse_mix) {
+          reject(
+            state,
+            receipt,
+            bot,
+            idx,
+            'REFUSED_CONDENSE_MIX',
+            pre.prereq_reason || 'condense mix incomplete',
+            {
+              missing: pre.missing,
+              local_yin: pre.local_yin,
+              local_yang: pre.local_yang,
+              nearest_opposite: pre.nearest_opposite,
+              fail_streak: bot.condenseFailStreak,
+            },
+          )
+        } else {
+          reject(state, receipt, bot, idx, 'ILLEGAL_OP', pre.prereq_reason || 'condense prereq failed')
+        }
         return
       }
+      // Use escalated cost from prereq (streak)
+      cost = pre.cost
       if (!spend(bot, cost)) {
+        noteCondenseFail(state, bot)
         pushEvent(state, 'condense_fail', { actor: bot.actorId, reason: 'NO_ENERGY' })
         reject(state, receipt, bot, idx, 'NO_ENERGY', 'cannot condense')
         return
@@ -1391,7 +1572,6 @@ function applyOne(
       const draw = Math.min(CONDENSE_DRAW, state.waste_heat)
       const locked = Math.round(draw * CONDENSE_EFFICIENCY * 1000) / 1000
       const stayWaste = Math.round((draw - locked) * 1000) / 1000
-      // Remove `draw` from waste, put `locked` into clump, leave `stayWaste` back in waste
       // Net: waste loses `locked` only (draw - stayWaste = locked)
       state.waste_heat = Math.round((state.waste_heat - locked) * 1000) / 1000
       // Action cost → waste_heat (conservation)
@@ -1408,6 +1588,7 @@ function applyOne(
       receipt.energy_spent += cost
       receipt.accepted.push(idx)
       resetBiteStreak(bot)
+      noteCondenseSuccess(bot)
       pushEvent(state, 'condense', {
         actor: bot.actorId,
         clump: clump.id,
@@ -1418,6 +1599,7 @@ function applyOne(
         waste_heat_left: state.waste_heat,
         local_yin: pre.local_yin,
         local_yang: pre.local_yang,
+        cost,
       })
       return
     }

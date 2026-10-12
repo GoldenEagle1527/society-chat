@@ -16,6 +16,10 @@ export type ActRejectCode =
   | 'REFUSED_REVIVE_WAIT'
   /** Non-starvation bite refused: same duty gate. */
   | 'REFUSED_REVIVE_BITE'
+  /** Condense refused: window missing yin and/or yang — pull/nudge opposite first. */
+  | 'REFUSED_CONDENSE_MIX'
+  /** Condense refused: consecutive empty fails → cool down (teach prep). */
+  | 'REFUSED_CONDENSE_COOLDOWN'
 
 export interface Vec2 {
   x: number
@@ -67,6 +71,10 @@ export interface BotBody {
   lastPullParticleId?: string
   lastPullFrom?: Vec2
   lastPullTo?: Vec2
+  /** Consecutive failed condense attempts (mix/prereq); reset on success. */
+  condenseFailStreak?: number
+  /** World tick until which condense is refused (cooldown after empty smashes). */
+  condenseCooldownUntil?: number
   last_errors: Array<{ code: ActRejectCode; msg: string; at: string }>
 }
 
@@ -194,13 +202,21 @@ export interface ObserveSnapshot {
   fruit_gone: boolean
   /** Biteable small organics from condense/megamorph. */
   clumps: Array<{ id: string; pos: Vec2; energy_locked: number }>
-  /** Designer condense snapshot (ok / needs / estimate). */
+  /** Designer condense snapshot (ok / needs / estimate / mix teaching). */
   condense: {
     ok: boolean
     need_yin: number
     need_yang: number
+    /** Free particles of each kind inside window (r=3.5). */
+    local_yin: number
+    local_yang: number
     have_yin: number
     have_yang: number
+    /** Which polarity is missing in window; null when mix ok. */
+    missing: 'yin' | 'yang' | 'both' | null
+    /** Nearest free particle of the missing kind (prep target). */
+    nearest_opposite: { id: string; kind: 'yin' | 'yang'; dist: number } | null
+    mix_ok: boolean
     est_gain: number
     cost: number
     efficiency: number
@@ -211,6 +227,8 @@ export interface ObserveSnapshot {
     can_afford: boolean
     prereq_ok: boolean
     prereq_reason?: string
+    fail_streak: number
+    cooldown_ticks_left: number
   }
   events_recent: WorldEvent[]
   last_errors: BotBody['last_errors']

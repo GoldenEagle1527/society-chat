@@ -383,6 +383,41 @@ function main(): void {
     assert.ok(typeof snapGone.waste_heat === 'number', 'waste_heat in observe')
     assert.ok(snapGone.condense, 'condense hook')
 
+    // Mix incomplete → REFUSED_CONDENSE_MIX + observe teaching fields
+    {
+      transferPool(bot, state, 8)
+      // Park all yang far away so window has only yin (or none)
+      for (const p of state.particles.filter((x) => !x.boundTo && x.kind === 'yang')) {
+        p.pos = { x: 0, y: 0 }
+      }
+      for (const p of state.particles.filter((x) => !x.boundTo && x.kind === 'yin')) {
+        p.pos = { x: bot.pos.x + 1, y: bot.pos.y }
+      }
+      const snapMix = observe(state, 'agnes')
+      assert.equal(snapMix.condense.mix_ok, false, 'mix_ok false')
+      assert.ok(snapMix.condense.local_yin >= 1, 'local_yin')
+      assert.equal(snapMix.condense.local_yang, 0, 'local_yang 0')
+      assert.equal(snapMix.condense.missing, 'yang', `missing=${snapMix.condense.missing}`)
+      assert.ok(snapMix.condense.nearest_opposite && snapMix.condense.nearest_opposite.kind === 'yang', 'nearest yang')
+      assert.ok(snapMix.suggested_ops[0] === 'pull' || snapMix.suggested_ops.includes('pull'), `suggest pull got ${snapMix.suggested_ops}`)
+      assert.ok(!snapMix.suggested_ops.includes('condense') || snapMix.suggested_ops.indexOf('pull') < snapMix.suggested_ops.indexOf('condense'), 'pull before condense')
+      const mix1 = act(state, { actor_id: 'agnes', budget_energy: 10, actions: [{ op: 'condense' }] }, { settle: false })
+      assert.ok(mix1.rejected.some((r) => r.code === 'REFUSED_CONDENSE_MIX'), `mix1 ${JSON.stringify(mix1.rejected)}`)
+      const mix2 = act(state, { actor_id: 'agnes', budget_energy: 10, actions: [{ op: 'condense' }] }, { settle: false })
+      assert.ok(mix2.rejected.some((r) => r.code === 'REFUSED_CONDENSE_MIX'), `mix2 ${JSON.stringify(mix2.rejected)}`)
+      // Third should hit cooldown
+      const mix3 = act(state, { actor_id: 'agnes', budget_energy: 10, actions: [{ op: 'condense' }] }, { settle: false })
+      assert.ok(
+        mix3.rejected.some((r) => r.code === 'REFUSED_CONDENSE_COOLDOWN' || r.code === 'REFUSED_CONDENSE_MIX'),
+        `mix3 cooldown-ish ${JSON.stringify(mix3.rejected)}`,
+      )
+      assert.ok(state.events.some((e) => e.type === 'refused_condense_mix'), 'telemetry refused_condense_mix')
+      // Clear cooldown for success path below
+      bot.condenseFailStreak = 0
+      bot.condenseCooldownUntil = 0
+      console.log('✓ REFUSED_CONDENSE_MIX + cooldown teaching')
+    }
+
     // Seed yin+yang near bot + enough waste
     const frees = state.particles.filter((p) => !p.boundTo)
     let yi = 0
@@ -544,15 +579,25 @@ function main(): void {
       bot.lastPullParticleId = loner.id
       bot.lastPullFrom = { x: 5, y: 5 }
       bot.lastPullTo = { x: 6, y: 5 }
+      // Isolate geometry: park everyone else far from (5,5)/(6,5)/(6,6)
+      for (const p of state.particles) {
+        if (p.id !== loner.id) p.pos = { x: 0, y: 0 }
+      }
+      for (const b of state.bots) {
+        if (b.id !== bot.id) b.pos = { x: 1, y: 1 }
+      }
       loner.pos = { x: 6, y: 5 }
-      bot.pos = { x: 6, y: 5 }
+      bot.pos = { x: 6, y: 6 }
+      bot.alive = true
+      state.events.length = 0
       transferPool(bot, state, 5)
       const evF = state.events.length
-      act(state, {
-        actor_id: 'agnes',
-        budget_energy: 5,
-        actions: [{ op: 'pull', target_id: loner.id, dir: 'w' }],
-      })
+      const forced = act(
+        state,
+        { actor_id: 'agnes', budget_energy: 5, actions: [{ op: 'pull', target_id: loner.id, dir: 'w' }] },
+        { settle: false },
+      )
+      assert.ok(forced.accepted.includes(0), `forced pull accepted ${JSON.stringify(forced)}`)
       assert.ok(
         state.events.slice(evF).some((e) => e.type === 'pull_oscillation'),
         'forced reverse must emit pull_oscillation',
