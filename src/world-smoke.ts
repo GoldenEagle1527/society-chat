@@ -506,7 +506,16 @@ function main(): void {
       `research pin pull got ${snapR.suggested_ops}`,
     )
     assert.ok(snapR.suggested_ops.includes('adsorb'), 'adsorb')
-    assert.ok(snapR.suggested_ops.includes('catalyze'), 'catalyze')
+    // catalyze only when some view particle has bond<1 (cores start ~0.9 → usually present)
+    const viewHasUnmaxed = state.particles.some(
+      (p) =>
+        Math.hypot(p.pos.x - bot.pos.x, p.pos.y - bot.pos.y) <= 6 && (p.bond ?? 0) < 1 - 1e-9,
+    )
+    if (viewHasUnmaxed) {
+      assert.ok(snapR.suggested_ops.includes('catalyze'), `catalyze when bond<1 got ${snapR.suggested_ops}`)
+    } else {
+      assert.ok(!snapR.suggested_ops.includes('catalyze'), `no catalyze when all maxed got ${snapR.suggested_ops}`)
+    }
     assert.ok(
       snapR.alerts.some((a) => a.includes('RESEARCH_READY')),
       'RESEARCH_READY alert',
@@ -526,6 +535,71 @@ function main(): void {
       )
     }
     console.log(`✓ RESEARCH_READY at pool=${bot.energy_pool} suggest=${snapR.suggested_ops.slice(0, 4)}`)
+  }
+
+  // --- REFUSED_CATALYZE_MAXED + research divert (no catalyze when all bonds maxed) ---
+  {
+    state.organics = state.organics.filter((o) => o.kind !== 'corpse')
+    if (bot.stomach > 0) {
+      state.waste_heat = Math.round((state.waste_heat + bot.stomach) * 1000) / 1000
+      bot.stomach = 0
+    }
+    transferPool(bot, state, RESEARCH_POOL_THRESHOLD)
+    // Pick a nearby particle and max its bond
+    let target = state.particles.find(
+      (p) => Math.hypot(p.pos.x - bot.pos.x, p.pos.y - bot.pos.y) <= 2.6,
+    )
+    if (!target) {
+      target = state.particles[0]!
+      bot.pos = { ...target.pos }
+    }
+    target.bond = 1
+    const poolBefore = bot.energy_pool
+    const evBefore = state.events.length
+    const maxed = act(
+      state,
+      { actor_id: 'agnes', budget_energy: 5, actions: [{ op: 'catalyze', target_id: target.id }] },
+      { settle: false },
+    )
+    assert.ok(
+      maxed.rejected.some((r) => r.code === 'REFUSED_CATALYZE_MAXED'),
+      `expected REFUSED_CATALYZE_MAXED got ${JSON.stringify(maxed.rejected)}`,
+    )
+    assert.ok(!maxed.accepted.includes(0), 'catalyze maxed not accepted')
+    assert.ok(Math.abs(bot.energy_pool - poolBefore) < 1e-9, 'no energy spent on maxed catalyze')
+    assert.ok(
+      state.events.slice(evBefore).some((e) => e.type === 'refused_catalyze_maxed'),
+      'refused_catalyze_maxed event',
+    )
+    console.log(`✓ REFUSED_CATALYZE_MAXED bond=1 particle=${target.id}`)
+
+    // Max ALL particles in view → research suggest must omit catalyze, keep pull/adsorb
+    for (const p of state.particles) {
+      if (Math.hypot(p.pos.x - bot.pos.x, p.pos.y - bot.pos.y) <= 6) p.bond = 1
+    }
+    transferPool(bot, state, RESEARCH_POOL_THRESHOLD)
+    const snapDiv = observe(state, 'agnes')
+    assert.ok(
+      snapDiv.suggested_ops.includes('pull') || snapDiv.suggested_ops.includes('adsorb'),
+      `divert pull/adsorb got ${snapDiv.suggested_ops}`,
+    )
+    assert.ok(
+      !snapDiv.suggested_ops.includes('catalyze'),
+      `no catalyze when all maxed got ${snapDiv.suggested_ops}`,
+    )
+    console.log(`✓ research divert (all maxed) suggest=${snapDiv.suggested_ops.slice(0, 4)}`)
+
+    // Restore one unmaxed → catalyze returns to suggest
+    const restore = state.particles.find(
+      (p) => Math.hypot(p.pos.x - bot.pos.x, p.pos.y - bot.pos.y) <= 6,
+    )
+    if (restore) restore.bond = 0.3
+    const snapCat = observe(state, 'agnes')
+    assert.ok(
+      snapCat.suggested_ops.includes('catalyze'),
+      `catalyze when bond<1 got ${snapCat.suggested_ops}`,
+    )
+    console.log(`✓ research catalyze when bond<1 suggest=${snapCat.suggested_ops.slice(0, 4)}`)
   }
 
   // --- REFUSED_CONDENSE_CLUTTER when clump in view ---

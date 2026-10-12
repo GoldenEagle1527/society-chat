@@ -28,6 +28,8 @@ export type ActRejectCode =
   | 'REFUSED_CONDENSE_STARVING'
   /** Condense refused: biteable clump(s) in view — eat inventory before making more. */
   | 'REFUSED_CONDENSE_CLUTTER'
+  /** Catalyze refused: particle bond already ≥1 — no further gain. */
+  | 'REFUSED_CATALYZE_MAXED'
 
 export interface Vec2 {
   x: number

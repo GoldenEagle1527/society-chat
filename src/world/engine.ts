@@ -129,6 +129,7 @@ const TELEMETRY_REJECT_CODES: ReadonlySet<ActRejectCode> = new Set([
   'REFUSED_CLUMP_WAIT',
   'REFUSED_CONDENSE_STARVING',
   'REFUSED_CONDENSE_CLUTTER',
+  'REFUSED_CATALYZE_MAXED',
 ])
 
 const DIRS: Record<string, Vec2> = {
@@ -607,6 +608,25 @@ function fruitPresent(state: WorldState): boolean {
 
 
 
+/** Research micro-ops: catalyze only if view has bond<1; else divert pull/adsorb. */
+export function researchMicroOps(state: WorldState, bot: BotBody): WorldOp[] {
+  const inView = state.particles.filter((p) => dist(p.pos, bot.pos) <= VIEW_RADIUS)
+  const hasUnmaxed = inView.some((p) => (p.bond ?? 0) < 1 - 1e-9)
+  if (hasUnmaxed) {
+    return ['pull', 'adsorb', 'catalyze']
+  }
+  // All bonds maxed (or empty view): divert to pull/adsorb by mix / proximity
+  const unboundNear = inView.filter((p) => !p.boundTo)
+  const missing = evaluateCondensePrereqs(state, bot).missing
+  if (missing === 'yin' || missing === 'yang' || missing === 'both') {
+    // Mix prep: pull missing polarity first, then adsorb
+    return ['pull', 'adsorb']
+  }
+  // Balanced / no mix pressure: prefer adsorb on unbound near, else pull
+  return unboundNear.length ? ['adsorb', 'pull'] : ['pull', 'adsorb']
+}
+
+
 
 /** Post-fruit mix incomplete → prep gate (pull/nudge/move toward opposite only). */
 export function mixPrepGateActive(state: WorldState, bot: BotBody): boolean {
@@ -1046,7 +1066,7 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       bot.stomach + 1e-9 >= RESEARCH_STOMACH_THRESHOLD) &&
     !suggested_ops.includes('revive')
   ) {
-    for (const op of ['pull', 'adsorb', 'catalyze'] as WorldOp[]) {
+    for (const op of researchMicroOps(state, bot)) {
       if (!suggested_ops.includes(op)) suggested_ops.push(op)
     }
     urgency = Math.max(urgency, 20)
@@ -1179,7 +1199,7 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     urgency = Math.max(urgency, 25)
   }
 
-  // Research threshold sink (no corpse duty): pin pull/adsorb/catalyze; digest side-ok
+  // Research threshold sink (no corpse duty): pin micro-ops; catalyze only if bond<1 in view
   // SATIETY_THRESHOLD remains fruit-bite only.
   if (
     !duty &&
@@ -1187,10 +1207,11 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       bot.stomach + 1e-9 >= RESEARCH_STOMACH_THRESHOLD)
   ) {
     urgency = Math.max(urgency, 26)
+    const research = researchMicroOps(state, bot)
+    const researchLabel = research.join('/')
     alerts.unshift(
-      `RESEARCH_READY pool=${bot.energy_pool}≥${RESEARCH_POOL_THRESHOLD} or stomach=${bot.stomach}≥${RESEARCH_STOMACH_THRESHOLD} — pull/adsorb/catalyze (satiety ${SATIETY_THRESHOLD}=fruit-bite only)`,
+      `RESEARCH_READY pool=${bot.energy_pool}≥${RESEARCH_POOL_THRESHOLD} or stomach=${bot.stomach}≥${RESEARCH_STOMACH_THRESHOLD} — ${researchLabel} (satiety ${SATIETY_THRESHOLD}=fruit-bite only; catalyze iff bond<1 in view)`,
     )
-    const research: WorldOp[] = ['pull', 'adsorb', 'catalyze']
     const head: WorldOp[] = []
     // Starving forage still wins over research
     if (
@@ -1727,6 +1748,19 @@ function applyOne(
       }
       if (dist(bot.pos, target.pos) > INTERACT_RADIUS + 1) {
         reject(state, receipt, bot, idx, 'NOT_ADJACENT', 'too far')
+        return
+      }
+      const bondNow = target.bond ?? 0
+      if (bondNow >= 1 - 1e-9) {
+        reject(
+          state,
+          receipt,
+          bot,
+          idx,
+          'REFUSED_CATALYZE_MAXED',
+          `particle ${target.id} bond=${bondNow}≥1 — catalyze maxed; pull/adsorb instead`,
+          { particle: target.id, bond: bondNow },
+        )
         return
       }
       if (!spend(bot, cost)) {
