@@ -82,6 +82,8 @@ export const REVIVE_SAFETY_MARGIN = 0
 /** Fraction of corpse locked energy granted to savior / revived (rest → waste). */
 export const REVIVE_SHARE_SAVIOR = 0.35
 export const REVIVE_SHARE_REVIVED = 0.45
+/** Starve death: if pool+stomach < this, pull waste_heat to top up corpse.locked (conservation). */
+export const CORPSE_LOCK_FLOOR = 12
 /** Post-fruit condense: waste_heat → clump locked at this efficiency (15–25%). */
 /** M0-friendly upper band (15–25%); tune down later. */
 export const CONDENSE_EFFICIENCY = 0.25
@@ -389,14 +391,20 @@ function corpseNear(state: WorldState, bot: BotBody, radius: number): boolean {
   return state.organics.some((o) => o.kind === 'corpse' && dist(bot.pos, o.pos) <= radius)
 }
 
-/** Nearest corpse in view if bot can afford revive+margin (engine revive pressure). */
+/** True when savior can cover revive: pool≥cost OR corpse.locked≥cost (hungry revive). */
+export function canCoverRevive(bot: BotBody, corpseLocked: number, cost = ACTION_COST.revive): boolean {
+  const need = cost + REVIVE_SAFETY_MARGIN
+  return bot.energy_pool + 1e-9 >= need || corpseLocked + 1e-9 >= need
+}
+
+/** Nearest corpse in view if pool≥cost OR locked≥cost (engine revive pressure). */
 function reviveDutyCorpse(state: WorldState, bot: BotBody): Organic | null {
   const need = ACTION_COST.revive + REVIVE_SAFETY_MARGIN
-  if (bot.energy_pool + 1e-9 < need) return null
   let best: Organic | null = null
   let bestD = Infinity
   for (const o of state.organics) {
     if (o.kind !== 'corpse' || !o.corpseOf) continue
+    if (!canCoverRevive(bot, o.energy_locked, ACTION_COST.revive)) continue
     const d = dist(bot.pos, o.pos)
     if (d <= VIEW_RADIUS + o.radius && d < bestD) {
       bestD = d
@@ -713,14 +721,14 @@ function rememberPull(bot: BotBody, particleId: string, from: Vec2, to: Vec2): v
   }
 }
 
-function listSaviors(state: WorldState, corpsePos: Vec2): ObserveSavior[] {
+function listSaviors(state: WorldState, corpsePos: Vec2, corpseLocked: number): ObserveSavior[] {
   const cost = ACTION_COST.revive
   const out: ObserveSavior[] = []
   for (const b of state.bots) {
     if (!b.alive) continue
     const d = Math.round(dist(b.pos, corpsePos) * 10) / 10
     const in_range = d <= REVIVE_RANGE + 1e-9
-    const can_afford = b.energy_pool + 1e-9 >= cost
+    const can_afford = canCoverRevive(b, corpseLocked, cost)
     out.push({
       actor_id: b.actorId,
       energy_pool: b.energy_pool,
@@ -868,8 +876,8 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     .map((o) => {
       const d = Math.round(dist(bot.pos, o.pos) * 10) / 10
       const in_range = d <= REVIVE_RANGE + 1e-9
-      const self_can_afford = bot.energy_pool + 1e-9 >= reviveCost
-      const saviors = listSaviors(state, o.pos)
+      const self_can_afford = canCoverRevive(bot, o.energy_locked, reviveCost)
+      const saviors = listSaviors(state, o.pos, o.energy_locked)
       const diedAt = typeof o.diedAtTick === 'number' ? o.diedAtTick : state.tick
       const ticks_unrevived = Math.max(0, state.tick - diedAt)
       const neglect_hardened = ticks_unrevived >= CORPSE_NEGLECT_HARDEN_TICKS
@@ -878,7 +886,7 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       const inaction_cost =
         o.energy_locked > 0
           ? `locked ${o.energy_locked} stuck until revive; leaks ${CORPSE_LOCK_LEAK}/tick→waste (~${ticksLeftRough}t to empty); companion stays dead`
-          : `locked=0 (husk); revive still costs ${reviveCost} but unlocks little; companion stays dead until revive`
+          : `locked=0 (husk); need waste top-up on next death or forage; revive costs ${reviveCost}`
       return {
         organic_id: o.id,
         corpse_of: o.corpseOf!,
@@ -926,7 +934,7 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     const saviorHint =
       whoNow.length > 0
         ? `can_revive_now=[${whoNow.join(',')}]`
-        : `need_pool≥${c.revive_cost} or move_in_range; afford=[${whoAfford.join(',') || 'none'}]`
+        : `need pool≥${c.revive_cost} OR locked≥${c.revive_cost} (hungry_revive); afford=[${whoAfford.join(',') || 'none'}]`
     const base =
       `CORPSE ${c.corpse_of} id=${c.organic_id} @(${c.pos.x},${c.pos.y}) locked=${c.energy_locked} revive_cost=${c.revive_cost} unrevived=${c.ticks_unrevived}t dist=${c.dist} in_range=${c.in_range} self_afford=${c.self_can_afford} self_now=${c.self_can_revive_now} | ${saviorHint} | WAIT_COST: ${c.inaction_cost}`
     alerts.push(base)
@@ -1311,14 +1319,22 @@ function applyOne(
     )
     return
   }
-  // Hungry bite(clump): cost may be paid from clump energy (see bite case).
+  // Hungry bite(clump) / hungry revive: cost may be paid from organic locked energy.
   const hungryClumpBite =
     op === 'bite' &&
     Boolean(action.target_id) &&
     state.organics.some(
       (o) => o.id === action.target_id && o.kind === 'clump' && o.energy_locked > 0.01,
     )
-  if (bot.energy_pool + 1e-9 < cost && op !== 'digest' && !hungryClumpBite) {
+  const hungryReviveOk =
+    op === 'revive' &&
+    Boolean(action.target_id) &&
+    state.organics.some((o) => {
+      if (o.id !== action.target_id || o.kind !== 'corpse') return false
+      const shortfall = Math.max(0, Math.round((cost - bot.energy_pool) * 1000) / 1000)
+      return o.energy_locked + 1e-9 >= shortfall
+    })
+  if (bot.energy_pool + 1e-9 < cost && op !== 'digest' && !hungryClumpBite && !hungryReviveOk) {
     reject(state, receipt, bot, idx, 'NO_ENERGY', `pool ${bot.energy_pool} < cost ${cost}`)
     return
   }
@@ -1470,7 +1486,7 @@ function applyOne(
           bot,
           idx,
           'REFUSED_REVIVE_WAIT',
-          `corpse ${duty.id} (${duty.corpseOf}) in view; pool ${bot.energy_pool}≥revive ${ACTION_COST.revive}+${REVIVE_SAFETY_MARGIN} — must move/revive not wait`,
+          `corpse ${duty.id} (${duty.corpseOf}) in view; can_cover revive (pool ${bot.energy_pool} or locked ${duty.energy_locked} ≥${ACTION_COST.revive}+${REVIVE_SAFETY_MARGIN}) — must move/revive not wait`,
           {
             corpse: duty.id,
             corpse_of: duty.corpseOf,
@@ -1681,7 +1697,7 @@ function applyOne(
             bot,
             idx,
             'REFUSED_REVIVE_BITE',
-            `corpse ${duty.id} (${duty.corpseOf}) in view; pool ${bot.energy_pool}≥revive ${ACTION_COST.revive}+${REVIVE_SAFETY_MARGIN} — revive before biting ${org.kind} ${org.id}`,
+            `corpse ${duty.id} (${duty.corpseOf}) in view; can_cover revive (pool ${bot.energy_pool} or locked ${duty.energy_locked} ≥${ACTION_COST.revive}+${REVIVE_SAFETY_MARGIN}) — revive before biting ${org.kind} ${org.id}`,
             {
               corpse: duty.id,
               corpse_of: duty.corpseOf,
@@ -1837,11 +1853,41 @@ function applyOne(
         reject(state, receipt, bot, idx, 'ILLEGAL_OP', 'corpse bot missing or already alive')
         return
       }
-      if (!spend(bot, cost)) {
+      // Hungry revive: if pool < cost, pay shortfall from corpse locked (symmetric to hungry clump bite).
+      const lockedBeforePay = org.energy_locked
+      let paidFromCorpse = 0
+      let paidFromPool = 0
+      const hungryRevive = bot.energy_pool + 1e-9 < cost
+      if (hungryRevive) {
+        paidFromPool = Math.round(bot.energy_pool * 1000) / 1000
+        paidFromCorpse = Math.round((cost - paidFromPool) * 1000) / 1000
+        if (org.energy_locked + 1e-9 < paidFromCorpse) {
+          reject(
+            state,
+            receipt,
+            bot,
+            idx,
+            'NO_ENERGY',
+            `hungry revive needs locked≥shortfall ${paidFromCorpse}, have ${org.energy_locked}`,
+            {
+              corpse: org.id,
+              pool: bot.energy_pool,
+              locked: org.energy_locked,
+              cost,
+              shortfall: paidFromCorpse,
+            },
+          )
+          return
+        }
+        bot.energy_pool = 0
+        org.energy_locked = Math.round((org.energy_locked - paidFromCorpse) * 1000) / 1000
+      } else if (!spend(bot, cost)) {
         reject(state, receipt, bot, idx, 'NO_ENERGY', 'need energy to revive')
         return
+      } else {
+        paidFromPool = cost
       }
-      // Split locked energy: savior + revived share; remainder → waste (conservation)
+      // Split remaining locked energy: savior + revived share; remainder → waste (conservation)
       const lockedWas = org.energy_locked
       let toSavior = Math.round(lockedWas * REVIVE_SHARE_SAVIOR * 1000) / 1000
       let toRevived = Math.round(lockedWas * REVIVE_SHARE_REVIVED * 1000) / 1000
@@ -1860,6 +1906,7 @@ function applyOne(
       state.organics = state.organics.filter((o) => o.id !== org.id)
       budgetLeft.n -= cost
       receipt.energy_spent += cost
+      // Action cost → waste (from pool and/or corpse shortfall)
       state.waste_heat = Math.round((state.waste_heat + cost + toWasteLock) * 1000) / 1000
       receipt.accepted.push(idx)
       resetBiteStreak(bot)
@@ -1868,10 +1915,18 @@ function applyOne(
         revived: dead.actorId,
         corpse: org.id,
         cost,
-        locked_was: lockedWas,
+        locked_was: lockedBeforePay,
+        locked_after_cost: lockedWas,
         to_savior: toSavior,
         to_revived: toRevived,
         waste_from_lock: toWasteLock,
+        ...(hungryRevive
+          ? {
+              hungry_revive: true,
+              paid_from_pool: paidFromPool,
+              paid_from_corpse: paidFromCorpse,
+            }
+          : {}),
       })
       // Compat alias for older readers
       pushEvent(state, 'revive', {
@@ -1880,6 +1935,7 @@ function applyOne(
         corpse: org.id,
         to_savior: toSavior,
         to_revived: toRevived,
+        ...(hungryRevive ? { hungry_revive: true, paid_from_corpse: paidFromCorpse } : {}),
       })
       return
     }
@@ -2230,9 +2286,20 @@ export function stepPhysics(state: WorldState): WorldEvent[] {
 function killBot(state: WorldState, bot: BotBody, reason: string): void {
   if (!bot.alive) return
   bot.alive = false
-  const locked = Math.round((bot.energy_pool + bot.stomach) * 1000) / 1000
+  let locked = Math.round((bot.energy_pool + bot.stomach) * 1000) / 1000
   bot.energy_pool = 0
   bot.stomach = 0
+  let toppedFromWaste = 0
+  // Starve death floor: pull waste_heat so corpse.locked reaches CORPSE_LOCK_FLOOR (conservation).
+  if (reason === 'starve' && locked + 1e-9 < CORPSE_LOCK_FLOOR) {
+    const need = Math.round((CORPSE_LOCK_FLOOR - locked) * 1000) / 1000
+    const take = Math.min(need, Math.max(0, state.waste_heat))
+    if (take > 0) {
+      state.waste_heat = Math.round((state.waste_heat - take) * 1000) / 1000
+      locked = Math.round((locked + take) * 1000) / 1000
+      toppedFromWaste = take
+    }
+  }
   const corpse: Organic = {
     id: newId('corpse'),
     kind: 'corpse',
@@ -2243,7 +2310,15 @@ function killBot(state: WorldState, bot: BotBody, reason: string): void {
     radius: 1,
   }
   state.organics.push(corpse)
-  pushEvent(state, 'death', { actor: bot.actorId, reason, corpse: corpse.id })
+  pushEvent(state, 'death', {
+    actor: bot.actorId,
+    reason,
+    corpse: corpse.id,
+    locked,
+    ...(toppedFromWaste > 0
+      ? { topped_from_waste: toppedFromWaste, lock_floor: CORPSE_LOCK_FLOOR }
+      : {}),
+  })
 }
 
 export function act(
@@ -2328,9 +2403,9 @@ export function formatEventLine(ev: WorldEvent): string {
     case 'digest':
       return `[世界 t=${ev.t}] ${p.actor} 消化：能池+${p.toPool}，废热+${p.toHeat}`
     case 'death':
-      return `[世界 t=${ev.t}] ${p.actor} 死亡（${p.reason}），留下尸体 ${p.corpse}`
+      return `[世界 t=${ev.t}] ${p.actor} 死亡（${p.reason}），留下尸体 ${p.corpse}${p.locked != null ? ` 锁能=${p.locked}` : ''}${p.topped_from_waste ? `（废热补${p.topped_from_waste}）` : ''}`
     case 'revived':
-      return `[世界 t=${ev.t}] ${p.actor} 复活了 ${p.revived}（锁能${p.locked_was}→救者+${p.to_savior}/死者+${p.to_revived}）`
+      return `[世界 t=${ev.t}] ${p.actor} 复活了 ${p.revived}（锁能${p.locked_was}→救者+${p.to_savior}/死者+${p.to_revived}${p.hungry_revive ? `；饿救短差${p.paid_from_corpse}` : ''}）`
     case 'revive':
       return `[世界 t=${ev.t}] ${p.actor} 复活了 ${p.revived}`
     case 'megamorph':

@@ -12,6 +12,7 @@ import {
   CONDENSE_EFFICIENCY,
   CONDENSE_MIN_WASTE,
   CONDENSE_STARVING_POOL,
+  CORPSE_LOCK_FLOOR,
   conservationOk,
   CORPSE_BITE_YIELD_MUL,
   createSeedWorld,
@@ -191,9 +192,19 @@ function main(): void {
   victim.stomach = 0
   for (let i = 0; i < 12; i++) stepPhysics(state)
   assert.equal(victim.alive, false)
-  assert.ok(state.organics.some((o) => o.kind === 'corpse' && o.corpseOf === 'glm'))
+  const starveCorpse = state.organics.find((o) => o.kind === 'corpse' && o.corpseOf === 'glm')
+  assert.ok(starveCorpse, 'glm corpse')
+  const deathEv = [...state.events].reverse().find((e) => e.type === 'death' && e.payload?.actor === 'glm')
+  assert.ok(deathEv, 'death event')
+  assert.ok(
+    Math.abs((deathEv!.payload.locked as number) - CORPSE_LOCK_FLOOR) < 0.05,
+    `death locked floor got ${deathEv!.payload.locked} expect ${CORPSE_LOCK_FLOOR}`,
+  )
+  assert.ok(deathEv!.payload.topped_from_waste, 'death topped_from_waste')
   assert.ok(conservationOk(state, 0.35), `after starve Σ=${totalEnergy(state)} base=${state.conservation_baseline}`)
-  console.log(`✓ starve→corpse conservation Σ=${totalEnergy(state)}`)
+  console.log(
+    `✓ starve→corpse death.locked=${deathEv!.payload.locked} now=${starveCorpse!.energy_locked} conservation Σ=${totalEnergy(state)}`,
+  )
 
   // --- corpses / revive_cost in observe ---
   const snap2 = observe(state, 'agnes')
@@ -240,26 +251,49 @@ function main(): void {
     `✓ micro_reward adsorb pool ${poolBefore}→${bot.energy_pool} heat ${heatBefore}→${state.waste_heat} amt=${rewards[0]?.payload.amount}`,
   )
 
-  // wait near corpse → wait_neglect, no wait_steady
+  // wait near corpse with locked≥8 / low pool → REFUSED_REVIVE_WAIT (revive knife duty)
   const corpse = state.organics.find((o) => o.kind === 'corpse')!
   bot.pos = { ...corpse.pos }
-  transferPool(bot, state, 5)
+  transferPool(bot, state, 5) // pool < revive cost but locked floor covers duty
   const evW = state.events.length
   const waitedNear = act(state, {
     actor_id: 'agnes',
     budget_energy: 2,
     actions: [{ op: 'wait' }],
-  })
-  assert.ok(waitedNear.accepted.includes(0), 'wait near corpse accepted')
+  }, { settle: false })
   assert.ok(
-    state.events.slice(evW).some((e) => e.type === 'wait_neglect'),
-    'wait_neglect event',
+    waitedNear.rejected.some((r) => r.code === 'REFUSED_REVIVE_WAIT'),
+    `expected REFUSED_REVIVE_WAIT via locked duty got ${JSON.stringify(waitedNear.rejected)}`,
   )
   assert.ok(
     !state.events.slice(evW).some((e) => e.type === 'micro_reward' && e.payload.reason === 'wait_steady'),
     'no wait_steady near corpse',
   )
-  console.log('✓ wait_neglect near corpse (no wait_steady)')
+  console.log('✓ REFUSED_REVIVE_WAIT near corpse when locked covers (no wait_steady)')
+
+  // husk corpse (locked≈0) + low pool: wait accepted with wait_neglect (no duty)
+  {
+    const lockedWas = corpse.energy_locked
+    state.waste_heat = Math.round((state.waste_heat + lockedWas) * 1000) / 1000
+    corpse.energy_locked = 0
+    transferPool(bot, state, 5)
+    const evHusk = state.events.length
+    const waitHusk = act(
+      state,
+      { actor_id: 'agnes', budget_energy: 2, actions: [{ op: 'wait' }] },
+      { settle: false },
+    )
+    assert.ok(waitHusk.accepted.includes(0), `husk wait accepted ${JSON.stringify(waitHusk)}`)
+    assert.ok(
+      state.events.slice(evHusk).some((e) => e.type === 'wait_neglect'),
+      'wait_neglect on husk',
+    )
+    // restore some lock for later revive-duty tests
+    const back = Math.min(lockedWas, state.waste_heat)
+    state.waste_heat = Math.round((state.waste_heat - back) * 1000) / 1000
+    corpse.energy_locked = back
+    console.log('✓ wait_neglect on husk corpse (no duty)')
+  }
 
   // wait away from crisis also unpaid (wait_steady cancelled)
   bot.pos = { x: 2, y: 2 }
@@ -276,11 +310,14 @@ function main(): void {
   {
     const victim = state.bots.find((b) => b.actorId === 'glm')!
     victim.alive = true
-    victim.energy_pool = 0.2
     victim.starveTicks = 5
     victim.pos = { x: bot.pos.x + 1, y: bot.pos.y }
-    // ensure no corpse in view
+    // ensure no corpse in view — reclaim locked to waste, give victim a sliver from waste
+    for (const o of state.organics.filter((x) => x.kind === 'corpse')) {
+      state.waste_heat = Math.round((state.waste_heat + o.energy_locked) * 1000) / 1000
+    }
     state.organics = state.organics.filter((o) => o.kind !== 'corpse')
+    transferPool(victim, state, 0.2)
     const evD = state.events.length
     act(state, { actor_id: 'agnes', budget_energy: 2, actions: [{ op: 'wait' }] })
     assert.ok(
@@ -293,8 +330,12 @@ function main(): void {
   // --- revive duty: wait/bite refused when corpse in view + pool covers revive+margin ---
   {
     const victim = state.bots.find((b) => b.actorId === 'glm')!
+    // Reclaim any prior corpse locked into waste before removing (conservation)
+    for (const o of state.organics.filter((x) => x.kind === 'corpse')) {
+      state.waste_heat = Math.round((state.waste_heat + o.energy_locked) * 1000) / 1000
+    }
     state.organics = state.organics.filter((o) => o.kind !== 'corpse')
-    // Fund corpse locked from waste_heat (conservation); clear victim pools
+    // Fund corpse locked from fruit (conservation); clear victim pools
     const locked = 20
     const fruit = state.organics.find((o) => o.kind === 'fruit')!
     assert.ok(fruit.energy_locked + 1e-9 >= locked, 'need fruit energy to fund test corpse')
@@ -366,6 +407,86 @@ function main(): void {
     )
   }
 
+  // --- revive knife: duty via locked≥8 + hungry_revive pays shortfall from corpse ---
+  {
+    const victim = state.bots.find((b) => b.actorId === 'glm')!
+    // Re-kill victim with empty pools so killBot tops lock from waste
+    if (victim.alive) {
+      state.waste_heat = Math.round((state.waste_heat + victim.energy_pool + victim.stomach) * 1000) / 1000
+      victim.energy_pool = 0
+      victim.stomach = 0
+      victim.alive = false
+    }
+    for (const o of state.organics.filter((x) => x.kind === 'corpse')) {
+      state.waste_heat = Math.round((state.waste_heat + o.energy_locked) * 1000) / 1000
+    }
+    state.organics = state.organics.filter((o) => o.kind !== 'corpse')
+    // Ensure waste can fund floor
+    if (state.waste_heat < CORPSE_LOCK_FLOOR) {
+      const fruit = state.organics.find((o) => o.kind === 'fruit')
+      if (fruit && fruit.energy_locked > CORPSE_LOCK_FLOOR) {
+        const t = CORPSE_LOCK_FLOOR
+        fruit.energy_locked = Math.round((fruit.energy_locked - t) * 1000) / 1000
+        state.waste_heat = Math.round((state.waste_heat + t) * 1000) / 1000
+      }
+    }
+    // Synthesize topped corpse (same as killBot floor)
+    const locked = CORPSE_LOCK_FLOOR
+    assert.ok(state.waste_heat + 1e-9 >= locked, 'waste for corpse floor')
+    state.waste_heat = Math.round((state.waste_heat - locked) * 1000) / 1000
+    const corpse = {
+      id: 'corpse_hungry_revive',
+      kind: 'corpse' as const,
+      pos: { x: bot.pos.x + 1, y: bot.pos.y },
+      energy_locked: locked,
+      corpseOf: 'glm',
+      diedAtTick: state.tick,
+      radius: 1,
+    }
+    state.organics.push(corpse)
+    victim.alive = false
+    victim.energy_pool = 0
+    victim.stomach = 0
+    // Low pool (<8) but locked≥8 → duty + can_afford
+    transferPool(bot, state, 2)
+    const snapH = observe(state, 'agnes')
+    const cObs = snapH.corpses.find((c) => c.organic_id === corpse.id)!
+    assert.ok(cObs.self_can_afford, `self_can_afford via locked got pool=${bot.energy_pool} locked=${cObs.energy_locked}`)
+    assert.ok(cObs.saviors.some((s) => s.actor_id === 'agnes' && s.can_afford), 'savior can_afford via locked')
+    const waitH = act(state, { actor_id: 'agnes', budget_energy: 2, actions: [{ op: 'wait' }] }, { settle: false })
+    assert.ok(
+      waitH.rejected.some((r) => r.code === 'REFUSED_REVIVE_WAIT'),
+      `duty wait with low pool ${JSON.stringify(waitH.rejected)}`,
+    )
+    bot.pos = { ...corpse.pos }
+    transferPool(bot, state, 2)
+    const poolBefore = bot.energy_pool
+    const lockedBefore = corpse.energy_locked
+    const heatBefore = state.waste_heat
+    const revH = act(
+      state,
+      { actor_id: 'agnes', budget_energy: 20, actions: [{ op: 'revive', target_id: corpse.id }] },
+      { settle: false },
+    )
+    assert.ok(revH.accepted.includes(0), `hungry revive ${JSON.stringify(revH)}`)
+    assert.ok(victim.alive, 'victim revived hungry')
+    const revEv = [...state.events].reverse().find((e) => e.type === 'revived' && e.payload?.hungry_revive)
+    assert.ok(revEv, 'hungry_revive event flag')
+    assert.ok(Math.abs((revEv!.payload.paid_from_pool as number) - poolBefore) < 0.05, 'paid_from_pool')
+    assert.ok(Math.abs((revEv!.payload.paid_from_corpse as number) - (ACTION_COST.revive - poolBefore)) < 0.05, 'paid_from_corpse')
+    // Remaining after shortfall: lockedBefore - shortfall, then split
+    const shortfall = ACTION_COST.revive - poolBefore
+    const remain = Math.round((lockedBefore - shortfall) * 1000) / 1000
+    const expectSavior = Math.round(remain * 0.35 * 1000) / 1000
+    const expectRevived = Math.round(remain * 0.45 * 1000) / 1000
+    assert.ok(Math.abs(bot.energy_pool - expectSavior) < 0.05, `savior share got ${bot.energy_pool} expect ${expectSavior}`)
+    assert.ok(Math.abs(victim.energy_pool - expectRevived) < 0.05, `revived share got ${victim.energy_pool} expect ${expectRevived}`)
+    assert.ok(conservationOk(state, 0.6), `after hungry revive Σ=${totalEnergy(state)}`)
+    assert.ok(state.waste_heat + 1e-9 >= heatBefore + ACTION_COST.revive - 0.1, 'cost→waste')
+    console.log(
+      `✓ hungry_revive pool=${poolBefore} shortfall=${shortfall} remain=${remain} savior=${bot.energy_pool} revived=${victim.energy_pool}`,
+    )
+  }
 
   // --- post-fruit: condense + low-yield corpse bite ---
   {
