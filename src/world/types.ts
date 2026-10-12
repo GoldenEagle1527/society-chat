@@ -57,6 +57,10 @@ export interface BotBody {
   biteStreak: number
   /** Organic id of the current bite streak; cleared on other ops / other targets. */
   biteStreakTargetId?: string
+  /** Last successful pull/nudge relocate (anti-oscillation). */
+  lastPullParticleId?: string
+  lastPullFrom?: Vec2
+  lastPullTo?: Vec2
   last_errors: Array<{ code: ActRejectCode; msg: string; at: string }>
 }
 

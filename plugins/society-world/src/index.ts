@@ -156,7 +156,7 @@ export class SocietyWorldService extends Service {
         `行动成本：revive=${snap.revive_cost}（最贵）、adsorb=${snap.action_costs.adsorb}、bite=${snap.action_costs.bite}、pull=${snap.action_costs.pull}、wait=${snap.action_costs.wait}。`,
         `紧迫度 urgency=${snap.urgency}；建议操作 suggested_ops=[${(snap.suggested_ops || []).join(',')}]。有尸体时优先 revive，禁止在尸体旁干等。`,
         '引擎立法：能池≥餍足阈值时咬果 → REFUSED_SATIATED；同目标连啃成本升、收益降。刚好够优于囤满。',
-        'micro_reward 只奖构型进展（pull_cluster/pull_pair/pull_morph_prep、adsorb_balance、catalyze_bond）；随机 pull_moved 不给奖。守恒：废热→能池。',
+        'micro_reward 只奖构型进展（pull_cluster/pull_pair/pull_morph_prep、adsorb_balance、catalyze_bond）；随机 pull_moved / 来回拉 / wait 不给奖。守恒：废热→能池。代谢每 tick 扣能。',
         '能池够用时：挪粒子成团/催化键/复活同伴；咬果仅濒饿。聊天是外壳。',
       ]
       if (snap.corpses?.length) {

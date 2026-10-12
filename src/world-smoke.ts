@@ -231,6 +231,17 @@ function main(): void {
   )
   console.log('✓ wait_neglect near corpse (no wait_steady)')
 
+  // wait away from crisis also unpaid (wait_steady cancelled)
+  bot.pos = { x: 2, y: 2 }
+  transferPool(bot, state, 4)
+  const evW2 = state.events.length
+  act(state, { actor_id: 'agnes', budget_energy: 2, actions: [{ op: 'wait' }] })
+  assert.ok(
+    !state.events.slice(evW2).some((e) => e.type === 'micro_reward' && e.payload.reason === 'wait_steady'),
+    'wait_steady cancelled globally',
+  )
+  console.log('✓ wait unpaid everywhere (no wait_steady)')
+
   // spam pull far from others unpaid (isolate particle)
   const loner = state.particles.find((p) => !p.boundTo && p.id !== freeP!.id) || state.particles.find((p) => !p.boundTo)
   if (loner) {
@@ -256,6 +267,68 @@ function main(): void {
       'spam pull_moved must be unpaid',
     )
     console.log(`✓ spam pull unpaid micros=${microP.map((e) => e.payload.reason).join(',') || 'none'} heatΔ=${(state.waste_heat - heatP).toFixed(2)}`)
+
+    // oscillation: pull e then w on same particle — second unpaid
+    loner.pos = { ...bot.pos }
+    // ensure adjacent same cell
+    transferPool(bot, state, 5)
+    const evO = state.events.length
+    act(state, {
+      actor_id: 'agnes',
+      budget_energy: 10,
+      actions: [
+        { op: 'pull', target_id: loner.id, dir: 'e' },
+      ],
+    })
+    // put particle back adjacent for reverse
+    loner.pos = { x: bot.pos.x + 1, y: bot.pos.y }
+    bot.pos = { x: loner.pos.x - 1, y: loner.pos.y }
+    // manually set last pull memory as e-move if act moved it
+    const afterFirst = state.events.slice(evO)
+    act(state, {
+      actor_id: 'agnes',
+      budget_energy: 10,
+      actions: [{ op: 'pull', target_id: loner.id, dir: 'w' }],
+    })
+    const osc = state.events.slice(evO).filter((e) => e.type === 'pull_oscillation')
+    const microAfter = state.events.slice(evO).filter((e) => e.type === 'micro_reward')
+    // If oscillation detected, no reward on reverse; event may or may not fire depending on geometry
+    if (osc.length) {
+      assert.ok(
+        !microAfter.some(
+          (e) =>
+            e.payload.reason === 'pull_closer' &&
+            Number(e.t) >= (osc[0]!.t as number),
+        ),
+        'oscillation must not pay pull_closer',
+      )
+      console.log(`✓ pull_oscillation unpaid count=${osc.length}`)
+    } else {
+      // Force oscillation path via rememberPull semantics: two reverse moves with memory
+      bot.lastPullParticleId = loner.id
+      bot.lastPullFrom = { x: 5, y: 5 }
+      bot.lastPullTo = { x: 6, y: 5 }
+      loner.pos = { x: 6, y: 5 }
+      bot.pos = { x: 6, y: 5 }
+      transferPool(bot, state, 5)
+      const evF = state.events.length
+      act(state, {
+        actor_id: 'agnes',
+        budget_energy: 5,
+        actions: [{ op: 'pull', target_id: loner.id, dir: 'w' }],
+      })
+      assert.ok(
+        state.events.slice(evF).some((e) => e.type === 'pull_oscillation'),
+        'forced reverse must emit pull_oscillation',
+      )
+      assert.ok(
+        !state.events
+          .slice(evF)
+          .some((e) => e.type === 'micro_reward' && e.payload.reason === 'pull_closer'),
+        'forced osc unpaid',
+      )
+      console.log('✓ pull_oscillation forced unpaid')
+    }
   }
 
   console.log('=== WORLD-SMOKE OK ===')

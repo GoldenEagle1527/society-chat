@@ -20,11 +20,12 @@ services:
       # 0 = unlimited ticks while live UI is up
       SOCIETY_MAX_TICKS: "0"
       SOCIETY_MAX_EXCHANGES: "${SOCIETY_MAX_EXCHANGES:-0}"
-      SOCIETY_TICK_MS: "${SOCIETY_TICK_MS:-2000}"
+      # Faster cadence (was 2000): more agent acts + world ticks per wall-minute
+      SOCIETY_TICK_MS: "800"
       SOCIETY_MAX_PARALLEL_REPLIES: "${SOCIETY_MAX_PARALLEL_REPLIES:-5}"
-      SOCIETY_IDLE_STALE_MS: "${SOCIETY_IDLE_STALE_MS:-2500}"
-      SOCIETY_AGENT_COOLDOWN_MS: "${SOCIETY_AGENT_COOLDOWN_MS:-400}"
-      SOCIETY_COOLDOWN_MS: "${SOCIETY_COOLDOWN_MS:-600}"
+      SOCIETY_IDLE_STALE_MS: "1000"
+      SOCIETY_AGENT_COOLDOWN_MS: "200"
+      SOCIETY_COOLDOWN_MS: "250"
     volumes:
       # Persist agents / rooms / memory / soul / workspaces on the host
       - ./data:/app/data

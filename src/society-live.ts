@@ -77,7 +77,7 @@ async function main(): Promise<void> {
 
   const maxTicks = envInt('SOCIETY_MAX_TICKS', 10_000)
   const maxExchanges = envInt('SOCIETY_MAX_EXCHANGES', 0) // 0 = unlimited
-  const tickMs = envInt('SOCIETY_TICK_MS', 1_500)
+  const tickMs = envInt('SOCIETY_TICK_MS', 800)
   const cooldownMs = envInt('SOCIETY_COOLDOWN_MS', 600)
   const agentCooldownMs = envInt('SOCIETY_AGENT_COOLDOWN_MS', 400)
   const idleStaleMs = envInt('SOCIETY_IDLE_STALE_MS', 2_500)
@@ -495,6 +495,12 @@ async function main(): Promise<void> {
       tickRunning = true
       try {
         const result = await ctx.societyScheduler.runTick()
+        // Passive world clock: metabolism / corpse_leak even when nobody acted
+        try {
+          ctx.societyWorld.step()
+        } catch {
+          /* world not seeded yet */
+        }
         ticksDone = result.tick
         const parallelBits =
           result.parallel && result.parallel.length > 1

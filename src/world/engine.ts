@@ -24,8 +24,11 @@ export const WORLD_WIDTH = 48
 export const WORLD_HEIGHT = 48
 export const VIEW_RADIUS = 6
 export const INTERACT_RADIUS = 1.6
-export const START_POOL = 12
+/** Opening pool — low enough that bite/digest matters within minutes. */
+export const START_POOL = 5
 export const BITE_CHUNK = 8
+/** Passive metabolism per physics tick: pool → waste_heat (conservation). */
+export const METABOLISM_UPKEEP = 0.4
 export const ACTION_COST: Record<WorldOp, number> = {
   nudge: 1,
   pull: 1.2,
@@ -54,7 +57,8 @@ export const MICRO_REWARD_PULL_CLOSER = 0.08
 export const MICRO_REWARD_ADSORB = 0.25
 export const MICRO_REWARD_ADSORB_BALANCE = 0.55
 export const MICRO_REWARD_CATALYZE = 0.4
-export const MICRO_REWARD_WAIT_STEADY = 0.12
+/** wait_steady REMOVED — lying flat must not pay (was 0.12). */
+export const MICRO_REWARD_WAIT_STEADY = 0
 /** Revive adjacency (same as act revive gate). */
 export const REVIVE_RANGE = INTERACT_RADIUS + 1
 /** Unrevived corpse: locked energy slowly bleeds to waste_heat (conservation). */
@@ -316,6 +320,28 @@ export function scorePullConfig(
 
 function corpseNear(state: WorldState, bot: BotBody, radius: number): boolean {
   return state.organics.some((o) => o.kind === 'corpse' && dist(bot.pos, o.pos) <= radius)
+}
+
+/** True if this relocate reverses the bot's previous pull/nudge on the same particle. */
+export function isPullOscillation(
+  bot: BotBody,
+  particleId: string,
+  from: Vec2,
+  to: Vec2,
+): boolean {
+  if (bot.lastPullParticleId !== particleId || !bot.lastPullFrom || !bot.lastPullTo) return false
+  return (
+    bot.lastPullTo.x === from.x &&
+    bot.lastPullTo.y === from.y &&
+    bot.lastPullFrom.x === to.x &&
+    bot.lastPullFrom.y === to.y
+  )
+}
+
+function rememberPull(bot: BotBody, particleId: string, from: Vec2, to: Vec2): void {
+  bot.lastPullParticleId = particleId
+  bot.lastPullFrom = { ...from }
+  bot.lastPullTo = { ...to }
 }
 
 function dyingNear(state: WorldState, bot: BotBody, radius: number): boolean {
@@ -684,14 +710,12 @@ function applyOne(
         actor: bot.actorId,
         neglect: nearCrisis || undefined,
       })
-      // No wait_steady while corpses/dying nearby — revive > idle
+      // wait never pays micro_reward (wait_steady cancelled — no lying-flat income)
       if (nearCrisis) {
         pushEvent(state, 'wait_neglect', {
           actor: bot.actorId,
           msg: 'wait near corpse/dying — no micro_reward; prefer revive',
         })
-      } else if (bot.energy_pool < SATIETY_THRESHOLD) {
-        grantMicroReward(state, bot, MICRO_REWARD_WAIT_STEADY, 'wait_steady')
       }
       return
     }
@@ -740,24 +764,35 @@ function applyOne(
       receipt.accepted.push(idx)
       resetBiteStreak(bot)
       pushEvent(state, op, { actor: bot.actorId, particle: target.id, to: next, from })
-      // Config progress only — spam pull_moved unpaid; closer-to-self is tiny consolation
+      // Config progress only; oscillating A↔B on same particle unpaid
       if (moved) {
-        const scored = scorePullConfig(state, target, from, next)
-        if (scored) {
-          grantMicroReward(state, bot, scored.amount, scored.reason, {
+        const oscillating = isPullOscillation(bot, target.id, from, next)
+        if (oscillating) {
+          pushEvent(state, 'pull_oscillation', {
+            actor: bot.actorId,
             particle: target.id,
-            op,
+            from,
+            to: next,
+            msg: 'back-forth pull — no micro_reward',
           })
         } else {
-          const closer = dist(bot.pos, next) + 1e-9 < dist(bot.pos, from)
-          if (closer && op === 'pull') {
-            grantMicroReward(state, bot, MICRO_REWARD_PULL_CLOSER, 'pull_closer', {
+          const scored = scorePullConfig(state, target, from, next)
+          if (scored) {
+            grantMicroReward(state, bot, scored.amount, scored.reason, {
               particle: target.id,
               op,
             })
+          } else {
+            const closer = dist(bot.pos, next) + 1e-9 < dist(bot.pos, from)
+            if (closer && op === 'pull') {
+              grantMicroReward(state, bot, MICRO_REWARD_PULL_CLOSER, 'pull_closer', {
+                particle: target.id,
+                op,
+              })
+            }
           }
-          // else: unpaid spam relocate (nudge_moved / pull_moved)
         }
+        rememberPull(bot, target.id, from, next)
       }
       return
     }
@@ -1116,8 +1151,8 @@ export function stepPhysics(state: WorldState): WorldEvent[] {
   // Metabolism / starve
   for (const bot of state.bots) {
     if (!bot.alive) continue
-    // Passive upkeep
-    const upkeep = 0.15
+    // Passive upkeep (pool → waste_heat)
+    const upkeep = METABOLISM_UPKEEP
     if (bot.energy_pool >= upkeep) {
       bot.energy_pool = Math.round((bot.energy_pool - upkeep) * 1000) / 1000
       state.waste_heat = Math.round((state.waste_heat + upkeep) * 1000) / 1000
@@ -1260,6 +1295,8 @@ export function formatEventLine(ev: WorldEvent): string {
       return `[世界 t=${ev.t}] ${p.actor} 微操回收 +${p.amount}（${p.reason}，废热余 ${p.waste_heat_left}）`
     case 'wait_neglect':
       return `[世界 t=${ev.t}] ${p.actor} 在尸体/濒死旁干等（无微操奖励）— 应 revive`
+    case 'pull_oscillation':
+      return `[世界 t=${ev.t}] ${p.actor} 来回拉同一粒子（无 micro_reward）`
     case 'corpse_leak':
       return `[世界 t=${ev.t}] 尸体 ${p.of || p.corpse} 锁能渗漏 −${p.leak}（余 ${p.locked_left}）→废热`
     default:
