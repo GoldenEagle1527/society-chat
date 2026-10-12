@@ -188,17 +188,25 @@ export interface ObserveSnapshot {
   satiety_threshold: number
   /** Global waste_heat ledger (post-fruit foraging feedstock). */
   waste_heat: number
-  /** True when no fruit remains with energy_locked>0. */
+  /** Fruit status (teaching window). */
+  fruit: { energy_locked: number; gone: boolean }
+  /** @deprecated use fruit.gone */
   fruit_gone: boolean
-  /** Designer hooks for condense prerequisites (M0 basic). */
+  /** Biteable small organics from condense/megamorph. */
+  clumps: Array<{ id: string; pos: Vec2; energy_locked: number }>
+  /** Designer condense snapshot (ok / needs / estimate). */
   condense: {
+    ok: boolean
+    need_yin: number
+    need_yang: number
+    have_yin: number
+    have_yang: number
+    est_gain: number
     cost: number
     efficiency: number
     min_waste: number
     draw: number
     window_radius: number
-    local_yin: number
-    local_yang: number
     local_particles: number
     can_afford: boolean
     prereq_ok: boolean

@@ -85,6 +85,12 @@ export const REVIVE_SHARE_REVIVED = 0.45
 /** Post-fruit condense: waste_heat → clump locked at this efficiency (15–25%). */
 /** M0-friendly upper band (15–25%); tune down later. */
 export const CONDENSE_EFFICIENCY = 0.25
+/** Below this fruit locked energy, satiety no longer blocks fruit bite (thirst). */
+export const FRUIT_TAIL_THRESHOLD = 40
+/** Suggest bite(clump) when pool below this and clumps exist. */
+export const CLUMP_FORAGE_POOL_THRESHOLD = 8
+/** Boost condense/bite when fruit locked at or below this (nearly gone). */
+export const FRUIT_NEARLY_GONE = 80
 export const CONDENSE_MIN_WASTE = 3
 export const CONDENSE_DRAW = 6
 export const CONDENSE_WINDOW_RADIUS = 3.5
@@ -705,9 +711,16 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       `DYING ${d.actor_id} @(${d.pos.x},${d.pos.y}) pool=${d.energy_pool} core=${d.core_integrity} starve=${d.starve_ticks} — feed/help before corpse`,
     )
   }
-  if (bot.energy_pool >= SATIETY_THRESHOLD) {
+  const fruitLockedEarly = state.organics
+    .filter((o) => o.kind === 'fruit')
+    .reduce((s, o) => s + o.energy_locked, 0)
+  if (bot.energy_pool >= SATIETY_THRESHOLD && fruitLockedEarly > FRUIT_TAIL_THRESHOLD) {
     alerts.push(
       `SATIATED pool=${bot.energy_pool}≥${SATIETY_THRESHOLD} — fruit bite REFUSED_SATIATED; prefer revive/probe/config`,
+    )
+  } else if (bot.energy_pool >= SATIETY_THRESHOLD && fruitLockedEarly > 0) {
+    alerts.push(
+      `FRUIT_TAIL locked=${fruitLockedEarly}≤${FRUIT_TAIL_THRESHOLD} — thirst bite of remaining fruit allowed despite satiety`,
     )
   }
   const fruit_gone = !fruitPresent(state)
@@ -763,16 +776,34 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     suggested_ops.unshift('bite', 'digest')
   }
   const condenseInfo = evaluateCondensePrereqs(state, bot)
-  if (fruit_gone) {
-    urgency = Math.max(urgency, 35)
+  const fruitLocked = state.organics
+    .filter((o) => o.kind === 'fruit')
+    .reduce((s, o) => s + o.energy_locked, 0)
+  const clumpsList = state.organics
+    .filter((o) => o.kind === 'clump' && o.energy_locked > 0.01)
+    .map((o) => ({ id: o.id, pos: { ...o.pos }, energy_locked: o.energy_locked }))
+  const fruitNearlyGone = fruit_gone || fruitLocked <= FRUIT_NEARLY_GONE
+  if (fruitNearlyGone) {
+    urgency = Math.max(urgency, fruit_gone ? 40 : 30)
     if (condenseInfo.prereq_ok) {
       if (!suggested_ops.includes('condense')) suggested_ops.unshift('condense')
     } else {
-      // Arrange particles then condense
       for (const op of ['pull', 'nudge', 'adsorb', 'condense'] as WorldOp[]) {
         if (!suggested_ops.includes(op)) suggested_ops.push(op)
       }
     }
+    // Prefer biting existing clumps when hungry (do not hard-refuse wait)
+    if (clumpsList.length && bot.energy_pool < CLUMP_FORAGE_POOL_THRESHOLD) {
+      urgency = Math.max(urgency, 45)
+      if (!suggested_ops.includes('bite')) suggested_ops.unshift('bite')
+      if (!suggested_ops.includes('digest')) suggested_ops.splice(1, 0, 'digest')
+    } else if (clumpsList.length && !suggested_ops.includes('bite')) {
+      suggested_ops.push('bite')
+    }
+  } else if (clumpsList.length && bot.energy_pool < CLUMP_FORAGE_POOL_THRESHOLD) {
+    // Mid-game: clumps available, pool low — elevate bite without refusing wait
+    if (!suggested_ops.includes('bite')) suggested_ops.unshift('bite')
+    urgency = Math.max(urgency, 25)
   }
   urgency = clamp(urgency, 0, 100)
 
@@ -802,8 +833,31 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     revive_cost: reviveCost,
     satiety_threshold: SATIETY_THRESHOLD,
     waste_heat: state.waste_heat,
+    fruit: { energy_locked: Math.round(fruitLocked * 1000) / 1000, gone: fruit_gone },
     fruit_gone,
-    condense: condenseInfo,
+    clumps: clumpsList,
+    condense: {
+      ok: condenseInfo.prereq_ok,
+      need_yin: CONDENSE_MIN_YIN,
+      need_yang: CONDENSE_MIN_YANG,
+      have_yin: condenseInfo.local_yin,
+      have_yang: condenseInfo.local_yang,
+      est_gain:
+        Math.round(
+          Math.min(condenseInfo.draw, Math.max(0, state.waste_heat)) *
+            condenseInfo.efficiency *
+            1000,
+        ) / 1000,
+      cost: condenseInfo.cost,
+      efficiency: condenseInfo.efficiency,
+      min_waste: condenseInfo.min_waste,
+      draw: condenseInfo.draw,
+      window_radius: condenseInfo.window_radius,
+      local_particles: condenseInfo.local_particles,
+      can_afford: condenseInfo.can_afford,
+      prereq_ok: condenseInfo.prereq_ok,
+      ...(condenseInfo.prereq_reason ? { prereq_reason: condenseInfo.prereq_reason } : {}),
+    },
     events_recent,
     last_errors: [...bot.last_errors],
   }
@@ -1107,8 +1161,12 @@ function applyOne(
           return
         }
       }
-      // Engine-side satiety: fruit bite hard-refused when pool already comfortable
-      if (org.kind === 'fruit' && bot.energy_pool >= SATIETY_THRESHOLD) {
+      // Satiety: refuse fruit hoarding unless fruit is in tail (thirst bite allowed)
+      if (
+        org.kind === 'fruit' &&
+        bot.energy_pool >= SATIETY_THRESHOLD &&
+        org.energy_locked > FRUIT_TAIL_THRESHOLD
+      ) {
         reject(
           state,
           receipt,

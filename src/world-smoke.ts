@@ -88,6 +88,28 @@ function main(): void {
   )
   console.log(`✓ REFUSED_SATIATED pool=${bot.energy_pool} threshold=${SATIETY_THRESHOLD} + event`)
 
+  // Tail fruit: satiety relaxed when fruit nearly empty
+  {
+    const lockedBefore = fruit.energy_locked
+    const park = Math.round((lockedBefore - 20) * 1000) / 1000
+    fruit.energy_locked = 20 // below FRUIT_TAIL_THRESHOLD (40)
+    state.waste_heat = Math.round((state.waste_heat + park) * 1000) / 1000
+    transferPool(bot, state, SATIETY_THRESHOLD + 2)
+    const thirst = act(
+      state,
+      { actor_id: 'agnes', budget_energy: 5, actions: [{ op: 'bite', target_id: fruit.id }] },
+      { settle: false },
+    )
+    assert.ok(thirst.accepted.includes(0), `thirst bite accepted ${JSON.stringify(thirst.rejected)}`)
+    // Restore fruit from waste for later tests (conservation-safe)
+    const need = Math.max(0, lockedBefore - fruit.energy_locked)
+    const take = Math.min(need, state.waste_heat)
+    state.waste_heat = Math.round((state.waste_heat - take) * 1000) / 1000
+    fruit.energy_locked = Math.round((fruit.energy_locked + take) * 1000) / 1000
+    assert.ok(conservationOk(state, 0.35), `after thirst restore Σ=${totalEnergy(state)}`)
+    console.log(`✓ FRUIT_TAIL thirst bite despite satiety (locked was 20)`)
+  }
+
   // --- Diminishing returns ---
   // Move stomach back to waste so only bite yields are measured; keep conservation
   if (bot.stomach > 0) {
@@ -353,6 +375,10 @@ function main(): void {
     state.organics = state.organics.filter((o) => o.kind !== 'fruit' || o.energy_locked > 0.01)
     const snapGone = observe(state, 'agnes')
     assert.equal(snapGone.fruit_gone, true, 'fruit_gone')
+    assert.ok(snapGone.fruit && snapGone.fruit.gone === true, 'fruit.gone')
+    assert.ok(Array.isArray(snapGone.clumps), 'clumps array')
+    assert.ok(snapGone.condense && typeof snapGone.condense.ok === 'boolean', 'condense.ok')
+    assert.ok(typeof snapGone.condense.est_gain === 'number', 'condense.est_gain')
     assert.ok(snapGone.alerts.some((a) => a.includes('FRUIT_GONE')), 'FRUIT_GONE alert')
     assert.ok(typeof snapGone.waste_heat === 'number', 'waste_heat in observe')
     assert.ok(snapGone.condense, 'condense hook')
