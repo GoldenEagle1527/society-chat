@@ -643,19 +643,31 @@ export class SocietySchedulerService extends Service {
     }
 
     if (exchangesCapped(this.exchangeCount, this.maxExchanges)) {
-      try { recordSchedulerTick('capped') } catch { /* */ }
+      try {
+        recordSchedulerTick('capped')
+        const w = this.ctx.societyWorld?.getState?.()
+        if (w && typeof w.tick === 'number') setLedgerWorldTick(w.tick)
+      } catch { /* */ }
       return { ...base, action: 'capped' }
     }
 
     const slots = this.freeParallelSlots()
     if (slots <= 0) {
-      try { recordSchedulerTick('skip') } catch { /* */ }
+      try {
+        recordSchedulerTick('skip')
+        const w = this.ctx.societyWorld?.getState?.()
+        if (w && typeof w.tick === 'number') setLedgerWorldTick(w.tick)
+      } catch { /* */ }
       return { ...base, action: 'skip' }
     }
 
     const agentIds = this.pickAgents(slots)
     if (agentIds.length === 0) {
-      try { recordSchedulerTick('none') } catch { /* */ }
+      try {
+        recordSchedulerTick('none')
+        const w = this.ctx.societyWorld?.getState?.()
+        if (w && typeof w.tick === 'number') setLedgerWorldTick(w.tick)
+      } catch { /* */ }
       return { ...base, action: 'none' }
     }
 

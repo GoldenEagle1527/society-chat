@@ -24,11 +24,15 @@ export const WORLD_WIDTH = 48
 export const WORLD_HEIGHT = 48
 export const VIEW_RADIUS = 6
 export const INTERACT_RADIUS = 1.6
-/** Opening pool — low enough that bite/digest matters within minutes. */
-export const START_POOL = 5
+/** Opening pool — hungry but not dead in first live tick. */
+export const START_POOL = 6
 export const BITE_CHUNK = 8
-/** Passive metabolism per physics tick: pool → waste_heat (conservation). */
-export const METABOLISM_UPKEEP = 0.4
+/**
+ * Passive metabolism per physics tick: pool → waste_heat (conservation).
+ * Tuned for SOCIETY_WORLD_STEPS_PER_TICK≈12: 0.03×12 ≈ 0.36 per live tick
+ * (was 0.4 which wiped the cast in one live tick).
+ */
+export const METABOLISM_UPKEEP = 0.03
 export const ACTION_COST: Record<WorldOp, number> = {
   nudge: 1,
   pull: 1.2,
