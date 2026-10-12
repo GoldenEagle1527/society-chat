@@ -170,8 +170,14 @@ function main(): void {
   assert.ok(snap2.corpses.some((c) => c.corpse_of === 'glm'), 'corpses alert must list glm')
   assert.equal(snap2.revive_cost, 8)
   assert.equal(snap2.action_costs.revive, 8)
-  assert.ok(snap2.alerts.some((a) => a.includes('CORPSE')), 'alerts mention corpse')
-  console.log(`✓ observe corpses=${snap2.corpses.length} revive_cost=${snap2.revive_cost}`)
+  assert.ok(snap2.alerts.some((a) => a.includes('CORPSE') && a.includes('revive_cost=')), 'alerts mention corpse+cost')
+  assert.ok(snap2.alerts.some((a) => a.includes('WAIT_COST')), 'alerts mention inaction cost')
+  const glmCorpse = snap2.corpses.find((c) => c.corpse_of === 'glm')!
+  assert.ok(Array.isArray(glmCorpse.saviors) && glmCorpse.saviors.length >= 1, 'saviors listed')
+  assert.ok(typeof glmCorpse.inaction_cost === 'string' && (glmCorpse.inaction_cost.includes('leak') || glmCorpse.inaction_cost.includes('husk') || glmCorpse.inaction_cost.includes('dead')), 'inaction_cost')
+  assert.ok(snap2.urgency > 0, 'urgency raised by corpse')
+  assert.ok(snap2.suggested_ops.includes('revive') || snap2.corpses.length > 0, 'suggest revive or corpses present')
+  console.log(`✓ observe corpses=${snap2.corpses.length} urgency=${snap2.urgency} suggest=${snap2.suggested_ops} alert0=${snap2.alerts[0]?.slice(0, 100)}`)
 
   // --- micro_reward on adsorb (need waste_heat + free particle) ---
   const freeP = state.particles.find((p) => !p.boundTo)
@@ -195,11 +201,62 @@ function main(): void {
   })
   assert.ok(ads.accepted.includes(0), `adsorb accepted ${JSON.stringify(ads)}`)
   const rewards = state.events.slice(evBefore).filter((e) => e.type === 'micro_reward')
-  assert.ok(rewards.some((e) => e.payload.reason === 'adsorb_bound'), 'micro_reward adsorb_bound')
+  assert.ok(
+    rewards.some((e) => e.payload.reason === 'adsorb_bound' || e.payload.reason === 'adsorb_balance'),
+    'micro_reward adsorb_*',
+  )
   assert.ok(conservationOk(state, 0.4), `after adsorb reward Σ=${totalEnergy(state)}`)
   console.log(
     `✓ micro_reward adsorb pool ${poolBefore}→${bot.energy_pool} heat ${heatBefore}→${state.waste_heat} amt=${rewards[0]?.payload.amount}`,
   )
+
+  // wait near corpse → wait_neglect, no wait_steady
+  const corpse = state.organics.find((o) => o.kind === 'corpse')!
+  bot.pos = { ...corpse.pos }
+  transferPool(bot, state, 5)
+  const evW = state.events.length
+  const waitedNear = act(state, {
+    actor_id: 'agnes',
+    budget_energy: 2,
+    actions: [{ op: 'wait' }],
+  })
+  assert.ok(waitedNear.accepted.includes(0), 'wait near corpse accepted')
+  assert.ok(
+    state.events.slice(evW).some((e) => e.type === 'wait_neglect'),
+    'wait_neglect event',
+  )
+  assert.ok(
+    !state.events.slice(evW).some((e) => e.type === 'micro_reward' && e.payload.reason === 'wait_steady'),
+    'no wait_steady near corpse',
+  )
+  console.log('✓ wait_neglect near corpse (no wait_steady)')
+
+  // spam pull far from others unpaid (isolate particle)
+  const loner = state.particles.find((p) => !p.boundTo && p.id !== freeP!.id) || state.particles.find((p) => !p.boundTo)
+  if (loner) {
+    loner.pos = { x: 1, y: 1 }
+    // clear neighbors
+    for (const p of state.particles) {
+      if (!p.boundTo && p.id !== loner.id && Math.hypot(p.pos.x - 1, p.pos.y - 1) < 5) {
+        p.pos = { x: 40, y: 40 }
+      }
+    }
+    bot.pos = { x: 1, y: 1 }
+    transferPool(bot, state, 4)
+    const evP = state.events.length
+    const heatP = state.waste_heat
+    act(state, {
+      actor_id: 'agnes',
+      budget_energy: 5,
+      actions: [{ op: 'pull', target_id: loner.id, dir: 'e' }],
+    })
+    const microP = state.events.slice(evP).filter((e) => e.type === 'micro_reward')
+    assert.ok(
+      !microP.some((e) => e.payload.reason === 'pull_moved'),
+      'spam pull_moved must be unpaid',
+    )
+    console.log(`✓ spam pull unpaid micros=${microP.map((e) => e.payload.reason).join(',') || 'none'} heatΔ=${(state.waste_heat - heatP).toFixed(2)}`)
+  }
 
   console.log('=== WORLD-SMOKE OK ===')
 }

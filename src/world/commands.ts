@@ -149,7 +149,9 @@ export function formatSnapshotLine(snap: ObserveSnapshot): string {
     `视野粒子=${snap.view.particles.length}`,
     `有机=${snap.organics.length}`,
     `revive_cost=${snap.revive_cost}`,
+    `urgency=${snap.urgency ?? 0}`,
   ]
+  if (snap.suggested_ops?.length) parts.push(`suggest=${snap.suggested_ops.join(',')}`)
   if (fruit) parts.push(`硕果剩余=${fruit.energy_locked}`)
   if (snap.corpses?.length) {
     parts.push(

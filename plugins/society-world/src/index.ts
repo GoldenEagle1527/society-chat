@@ -154,17 +154,21 @@ export class SocietyWorldService extends Service {
         '生存只看 energy_pool / core_integrity（不是心情）。能池空会饿死；死亡由引擎裁定。',
         '工具：world_observe 读邻域；world_act 提交微操（nudge/pull/adsorb/catalyze/bite/digest/wait/revive）。',
         `行动成本：revive=${snap.revive_cost}（最贵）、adsorb=${snap.action_costs.adsorb}、bite=${snap.action_costs.bite}、pull=${snap.action_costs.pull}、wait=${snap.action_costs.wait}。`,
-        '引擎立法：能池≥餍足阈值时咬果 → REFUSED_SATIATED（事件 refused_satiated）；同目标连啃成本升、收益降。刚好够优于囤满。',
-        '有效 pull/adsorb/稳态 wait 会从废热回收小额 micro_reward（守恒，不凭空造能）。',
-        '能池够用时默认试探假说/挪粒子/复活同伴；咬果仅濒饿。聊天是外壳；探测笔记可记假设/错误码。',
+        `紧迫度 urgency=${snap.urgency}；建议操作 suggested_ops=[${(snap.suggested_ops || []).join(',')}]。有尸体时优先 revive，禁止在尸体旁干等。`,
+        '引擎立法：能池≥餍足阈值时咬果 → REFUSED_SATIATED；同目标连啃成本升、收益降。刚好够优于囤满。',
+        'micro_reward 只奖构型进展（pull_cluster/pull_pair/pull_morph_prep、adsorb_balance、catalyze_bond）；随机 pull_moved 不给奖。守恒：废热→能池。',
+        '能池够用时：挪粒子成团/催化键/复活同伴；咬果仅濒饿。聊天是外壳。',
       ]
       if (snap.corpses?.length) {
-        lines.push('【尸体警报 — 可 revive】')
+        lines.push('【尸体警报 — 立刻评估 revive】')
         for (const c of snap.corpses) {
+          const now = c.saviors?.filter((s) => s.can_revive_now).map((s) => s.actor_id) || []
           lines.push(
-            `- ${c.corpse_of} 尸体 ${c.organic_id} @(${c.pos.x},${c.pos.y}) 锁能=${c.energy_locked} 复活成本=${c.revive_cost} 距离=${c.dist}`,
+            `- ${c.corpse_of} ${c.organic_id} @(${c.pos.x},${c.pos.y}) 锁能=${c.energy_locked} 成本=${c.revive_cost} dist=${c.dist} in_range=${c.in_range} 我能付=${c.self_can_afford} 我现在能救=${c.self_can_revive_now} 可立即救=[${now.join(',') || '无'}]`,
           )
+          lines.push(`  干等代价：${c.inaction_cost}`)
         }
+        lines.push('有尸体时 wait 无 micro_reward（wait_neglect）；锁能每 tick 渗漏到废热。')
       }
       if (snap.dying?.length) {
         lines.push('【濒死同伴】')

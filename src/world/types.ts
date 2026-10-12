@@ -110,6 +110,17 @@ export interface ObserveOrganic {
   energy_locked: number
 }
 
+/** Who could revive a corpse (pool / range). */
+export interface ObserveSavior {
+  actor_id: string
+  energy_pool: number
+  dist: number
+  in_range: boolean
+  can_afford: boolean
+  /** in_range && can_afford */
+  can_revive_now: boolean
+}
+
 /** Corpse / dying alert for observe (map-wide, not view-gated). */
 export interface ObserveCorpseAlert {
   organic_id: string
@@ -119,6 +130,15 @@ export interface ObserveCorpseAlert {
   revive_cost: number
   /** Distance from observer; omit if observer has no body. */
   dist?: number
+  in_range: boolean
+  /** Observer pool >= revive_cost */
+  self_can_afford: boolean
+  /** Observer can revive this tick (in range + afford). */
+  self_can_revive_now: boolean
+  /** Alive bots who might save (sorted: can_revive_now first). */
+  saviors: ObserveSavior[]
+  /** What waiting costs (locked stuck + leak). */
+  inaction_cost: string
 }
 
 export interface ObserveDyingAlert {
@@ -144,6 +164,10 @@ export interface ObserveSnapshot {
   dying: ObserveDyingAlert[]
   /** Short human-readable alerts (corpse / dying / satiety). */
   alerts: string[]
+  /** Ops the engine thinks are urgent (revive > wait near corpse). */
+  suggested_ops: WorldOp[]
+  /** 0–100 urgency; corpses/dying raise it. */
+  urgency: number
   /** Full op cost table (includes revive). */
   action_costs: Record<WorldOp, number>
   revive_cost: number

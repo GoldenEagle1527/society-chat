@@ -9,6 +9,7 @@ import type {
   ActRejectCode,
   ActRequest,
   BotBody,
+  ObserveSavior,
   ObserveSnapshot,
   Organic,
   Particle,
@@ -46,10 +47,18 @@ export const BITE_STREAK_YIELD_STEP = 0.2
 /**
  * Micro-op rewards: recycle a sliver of waste_heat → energy_pool.
  * Never mint — if waste_heat is empty, reward is 0 (conservation holds).
+ * Prefer structural progress (cluster / pair / morph-prep / bond) over spam moved.
  */
 export const MICRO_REWARD_PULL = 0.35
-export const MICRO_REWARD_ADSORB = 0.5
+export const MICRO_REWARD_PULL_CLOSER = 0.08
+export const MICRO_REWARD_ADSORB = 0.25
+export const MICRO_REWARD_ADSORB_BALANCE = 0.55
+export const MICRO_REWARD_CATALYZE = 0.4
 export const MICRO_REWARD_WAIT_STEADY = 0.12
+/** Revive adjacency (same as act revive gate). */
+export const REVIVE_RANGE = INTERACT_RADIUS + 1
+/** Unrevived corpse: locked energy slowly bleeds to waste_heat (conservation). */
+export const CORPSE_LOCK_LEAK = 0.08
 /** Reject codes that emit a world event (design telemetry; avoid flood). */
 const TELEMETRY_REJECT_CODES: ReadonlySet<ActRejectCode> = new Set(['REFUSED_SATIATED'])
 
@@ -224,6 +233,126 @@ export function maybeGrantProbeReward(
   grantMicroReward(state, bot, map[kind], kind)
 }
 
+function freeParticles(state: WorldState): Particle[] {
+  return state.particles.filter((p) => !p.boundTo)
+}
+
+/** Same-kind neighbors within r (excluding self). */
+function sameKindNear(state: WorldState, p: Particle, at: Vec2, r: number): number {
+  let n = 0
+  for (const q of freeParticles(state)) {
+    if (q.id === p.id || q.kind !== p.kind) continue
+    if (dist(at, q.pos) <= r) n++
+  }
+  return n
+}
+
+/** Distance to nearest opposite-kind free particle (Infinity if none). */
+function nearestOppDist(state: WorldState, p: Particle, at: Vec2): number {
+  let best = Infinity
+  for (const q of freeParticles(state)) {
+    if (q.id === p.id || q.kind === p.kind) continue
+    const d = dist(at, q.pos)
+    if (d < best) best = d
+  }
+  return best
+}
+
+/** 3×3 megamorph cell key. */
+function morphCellKey(pos: Vec2): string {
+  return `${Math.floor(pos.x / 3) * 3},${Math.floor(pos.y / 3) * 3}`
+}
+
+/** How close a cell is to megamorph (0–1-ish); particle at `at` counted as kind. */
+function morphCellScore(state: WorldState, at: Vec2, kind: ParticleKind, selfId: string): number {
+  const key = morphCellKey(at)
+  let yin = 0
+  let yang = 0
+  for (const q of freeParticles(state)) {
+    if (q.id === selfId) continue
+    if (morphCellKey(q.pos) !== key) continue
+    if (q.kind === 'yin') yin++
+    else yang++
+  }
+  if (kind === 'yin') yin++
+  else yang++
+  const total = yin + yang
+  if (total === 0) return 0
+  const ratio = Math.min(yin, yang) / Math.max(yin, yang)
+  // Reward density toward 5 + balance (megamorph needs ≥5 & ratio≥0.4)
+  return Math.min(total, 5) / 5 + (ratio >= 0.4 ? 0.35 : ratio * 0.5)
+}
+
+/**
+ * Score a particle relocation for config progress.
+ * Returns reward amount + reason, or null if unpaid spam move.
+ */
+export function scorePullConfig(
+  state: WorldState,
+  particle: Particle,
+  from: Vec2,
+  to: Vec2,
+): { amount: number; reason: string } | null {
+  if (from.x === to.x && from.y === to.y) return null
+  const clusterBefore = sameKindNear(state, particle, from, 2.5)
+  const clusterAfter = sameKindNear(state, particle, to, 2.5)
+  const oppBefore = nearestOppDist(state, particle, from)
+  const oppAfter = nearestOppDist(state, particle, to)
+  const morphBefore = morphCellScore(state, from, particle.kind, particle.id)
+  const morphAfter = morphCellScore(state, to, particle.kind, particle.id)
+
+  if (morphAfter > morphBefore + 0.05) {
+    return { amount: MICRO_REWARD_PULL, reason: 'pull_morph_prep' }
+  }
+  if (clusterAfter > clusterBefore) {
+    return { amount: MICRO_REWARD_PULL * 0.9, reason: 'pull_cluster' }
+  }
+  if (oppAfter + 1e-9 < oppBefore && oppAfter <= 2.2) {
+    return { amount: MICRO_REWARD_PULL * 0.85, reason: 'pull_pair' }
+  }
+  // Spam relocation / only "closer to self" — unpaid or tiny
+  return null
+}
+
+function corpseNear(state: WorldState, bot: BotBody, radius: number): boolean {
+  return state.organics.some((o) => o.kind === 'corpse' && dist(bot.pos, o.pos) <= radius)
+}
+
+function dyingNear(state: WorldState, bot: BotBody, radius: number): boolean {
+  return state.bots.some(
+    (b) =>
+      b.alive &&
+      b.actorId !== bot.actorId &&
+      (b.starveTicks >= 3 || b.core_integrity < 0.35 || b.energy_pool < 1) &&
+      dist(bot.pos, b.pos) <= radius,
+  )
+}
+
+function listSaviors(state: WorldState, corpsePos: Vec2): ObserveSavior[] {
+  const cost = ACTION_COST.revive
+  const out: ObserveSavior[] = []
+  for (const b of state.bots) {
+    if (!b.alive) continue
+    const d = Math.round(dist(b.pos, corpsePos) * 10) / 10
+    const in_range = d <= REVIVE_RANGE + 1e-9
+    const can_afford = b.energy_pool + 1e-9 >= cost
+    out.push({
+      actor_id: b.actorId,
+      energy_pool: b.energy_pool,
+      dist: d,
+      in_range,
+      can_afford,
+      can_revive_now: in_range && can_afford,
+    })
+  }
+  out.sort((a, b) => {
+    if (a.can_revive_now !== b.can_revive_now) return a.can_revive_now ? -1 : 1
+    if (a.can_afford !== b.can_afford) return a.can_afford ? -1 : 1
+    return a.dist - b.dist
+  })
+  return out
+}
+
 /** Seed a fresh world with a big fruit and cast bots near it. */
 export function createSeedWorld(actorIds: string[]): WorldState {
   const width = WORLD_WIDTH
@@ -346,17 +475,36 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       pos: { ...o.pos },
       energy_locked: o.energy_locked,
     }))
-  // Map-wide corpse alerts (not view-gated) so revive is discoverable
+
+  const reviveCost = ACTION_COST.revive
   const corpses = state.organics
     .filter((o) => o.kind === 'corpse' && o.corpseOf)
-    .map((o) => ({
-      organic_id: o.id,
-      corpse_of: o.corpseOf!,
-      pos: { ...o.pos },
-      energy_locked: o.energy_locked,
-      revive_cost: ACTION_COST.revive,
-      dist: Math.round(dist(bot.pos, o.pos) * 10) / 10,
-    }))
+    .map((o) => {
+      const d = Math.round(dist(bot.pos, o.pos) * 10) / 10
+      const in_range = d <= REVIVE_RANGE + 1e-9
+      const self_can_afford = bot.energy_pool + 1e-9 >= reviveCost
+      const saviors = listSaviors(state, o.pos)
+      const ticksLeftRough =
+        o.energy_locked > 0 ? Math.ceil(o.energy_locked / CORPSE_LOCK_LEAK) : 0
+      const inaction_cost =
+        o.energy_locked > 0
+          ? `locked ${o.energy_locked} stuck until revive; leaks ${CORPSE_LOCK_LEAK}/tick→waste (~${ticksLeftRough}t to empty); companion stays dead`
+          : `locked=0 (husk); revive still costs ${reviveCost} but unlocks little; companion stays dead until revive`
+      return {
+        organic_id: o.id,
+        corpse_of: o.corpseOf!,
+        pos: { ...o.pos },
+        energy_locked: o.energy_locked,
+        revive_cost: reviveCost,
+        dist: d,
+        in_range,
+        self_can_afford,
+        self_can_revive_now: in_range && self_can_afford && bot.alive,
+        saviors,
+        inaction_cost,
+      }
+    })
+
   const dying = state.bots
     .filter(
       (b) =>
@@ -372,20 +520,60 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       starve_ticks: b.starveTicks,
       dist: Math.round(dist(bot.pos, b.pos) * 10) / 10,
     }))
+
   const alerts: string[] = []
   for (const c of corpses) {
+    const whoNow = c.saviors.filter((s) => s.can_revive_now).map((s) => s.actor_id)
+    const whoAfford = c.saviors
+      .filter((s) => s.can_afford)
+      .map((s) => `${s.actor_id}(pool=${s.energy_pool})`)
+    const saviorHint =
+      whoNow.length > 0
+        ? `can_revive_now=[${whoNow.join(',')}]`
+        : `need_pool≥${c.revive_cost} or move_in_range; afford=[${whoAfford.join(',') || 'none'}]`
     alerts.push(
-      `CORPSE ${c.corpse_of} @(${c.pos.x},${c.pos.y}) locked=${c.energy_locked} revive_cost=${c.revive_cost} dist=${c.dist}`,
+      `CORPSE ${c.corpse_of} id=${c.organic_id} @(${c.pos.x},${c.pos.y}) locked=${c.energy_locked} revive_cost=${c.revive_cost} dist=${c.dist} in_range=${c.in_range} self_afford=${c.self_can_afford} self_now=${c.self_can_revive_now} | ${saviorHint} | WAIT_COST: ${c.inaction_cost}`,
     )
   }
   for (const d of dying) {
     alerts.push(
-      `DYING ${d.actor_id} @(${d.pos.x},${d.pos.y}) pool=${d.energy_pool} core=${d.core_integrity} starve=${d.starve_ticks}`,
+      `DYING ${d.actor_id} @(${d.pos.x},${d.pos.y}) pool=${d.energy_pool} core=${d.core_integrity} starve=${d.starve_ticks} — feed/help before corpse`,
     )
   }
   if (bot.energy_pool >= SATIETY_THRESHOLD) {
-    alerts.push(`SATIATED pool=${bot.energy_pool}≥${SATIETY_THRESHOLD} — fruit bite will REFUSED_SATIATED; probe/revive instead`)
+    alerts.push(
+      `SATIATED pool=${bot.energy_pool}≥${SATIETY_THRESHOLD} — fruit bite REFUSED_SATIATED; prefer revive/probe/config`,
+    )
   }
+
+  // Urgency + suggested ops: revive beats wait when corpses/dying present
+  let urgency = 0
+  const suggested_ops: WorldOp[] = []
+  if (corpses.some((c) => c.self_can_revive_now)) {
+    urgency += 80
+    suggested_ops.push('revive')
+  } else if (corpses.some((c) => c.self_can_afford)) {
+    urgency += 55
+    suggested_ops.push('revive') // path then revive
+  } else if (corpses.length) {
+    urgency += 35
+  }
+  if (dying.length) {
+    urgency += 25
+    if (!suggested_ops.includes('revive')) {
+      // no revive yet — nudge toward help via wait denial; suggest adsorb/pull only if no corpse
+    }
+  }
+  if (bot.energy_pool >= SATIETY_THRESHOLD && !suggested_ops.includes('revive')) {
+    suggested_ops.push('pull', 'adsorb', 'catalyze')
+    urgency = Math.max(urgency, 20)
+  }
+  if (bot.energy_pool < 5) {
+    urgency += 40
+    suggested_ops.unshift('bite', 'digest')
+  }
+  urgency = clamp(urgency, 0, 100)
+
   const events_recent = state.events.filter((e) => e.t >= state.tick - 5).slice(-12)
   return {
     tick: state.tick,
@@ -406,13 +594,16 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     corpses,
     dying,
     alerts,
+    suggested_ops,
+    urgency,
     action_costs: { ...ACTION_COST },
-    revive_cost: ACTION_COST.revive,
+    revive_cost: reviveCost,
     satiety_threshold: SATIETY_THRESHOLD,
     events_recent,
     last_errors: [...bot.last_errors],
   }
 }
+
 
 function reject(
   state: WorldState,
@@ -488,9 +679,18 @@ function applyOne(
       state.waste_heat = Math.round((state.waste_heat + cost) * 1000) / 1000
       receipt.accepted.push(idx)
       resetBiteStreak(bot)
-      pushEvent(state, 'wait', { actor: bot.actorId })
-      // Steady wait: tiny recycle from waste_heat if not satiated (guards / observe)
-      if (bot.energy_pool < SATIETY_THRESHOLD) {
+      const nearCrisis = corpseNear(state, bot, VIEW_RADIUS) || dyingNear(state, bot, VIEW_RADIUS)
+      pushEvent(state, 'wait', {
+        actor: bot.actorId,
+        neglect: nearCrisis || undefined,
+      })
+      // No wait_steady while corpses/dying nearby — revive > idle
+      if (nearCrisis) {
+        pushEvent(state, 'wait_neglect', {
+          actor: bot.actorId,
+          msg: 'wait near corpse/dying — no micro_reward; prefer revive',
+        })
+      } else if (bot.energy_pool < SATIETY_THRESHOLD) {
         grantMicroReward(state, bot, MICRO_REWARD_WAIT_STEADY, 'wait_steady')
       }
       return
@@ -540,13 +740,24 @@ function applyOne(
       receipt.accepted.push(idx)
       resetBiteStreak(bot)
       pushEvent(state, op, { actor: bot.actorId, particle: target.id, to: next, from })
-      // Effective pull/nudge: particle actually relocated → recycle waste_heat → pool
+      // Config progress only — spam pull_moved unpaid; closer-to-self is tiny consolation
       if (moved) {
-        const closer =
-          dist(bot.pos, next) + 1e-9 < dist(bot.pos, from)
-        const reason = op === 'pull' ? (closer ? 'pull_closer' : 'pull_moved') : 'nudge_moved'
-        const amt = op === 'pull' ? MICRO_REWARD_PULL : MICRO_REWARD_PULL * 0.6
-        grantMicroReward(state, bot, amt, reason, { particle: target.id, op })
+        const scored = scorePullConfig(state, target, from, next)
+        if (scored) {
+          grantMicroReward(state, bot, scored.amount, scored.reason, {
+            particle: target.id,
+            op,
+          })
+        } else {
+          const closer = dist(bot.pos, next) + 1e-9 < dist(bot.pos, from)
+          if (closer && op === 'pull') {
+            grantMicroReward(state, bot, MICRO_REWARD_PULL_CLOSER, 'pull_closer', {
+              particle: target.id,
+              op,
+            })
+          }
+          // else: unpaid spam relocate (nudge_moved / pull_moved)
+        }
       }
       return
     }
@@ -568,17 +779,35 @@ function applyOne(
         reject(state, receipt, bot, idx, 'NO_ENERGY', 'pool empty')
         return
       }
+      // Balance: adsorbing opposite kind vs already-bound free-ish core kinds
+      let yin = 0
+      let yang = 0
+      for (const pid of bot.bound_particle_ids) {
+        const bp = findParticle(state, pid)
+        if (!bp) continue
+        if (bp.kind === 'yin') yin++
+        else yang++
+      }
+      const balances =
+        (target.kind === 'yin' && yang > yin) || (target.kind === 'yang' && yin > yang)
       target.boundTo = bot.actorId
       target.pos = { ...bot.pos }
+      target.bond = clamp((target.bond ?? 0.2) + 0.15, 0, 1)
       bot.bound_particle_ids.push(target.id)
       budgetLeft.n -= cost
       receipt.energy_spent += cost
       state.waste_heat = Math.round((state.waste_heat + cost) * 1000) / 1000
       receipt.accepted.push(idx)
       resetBiteStreak(bot)
-      pushEvent(state, 'adsorb', { actor: bot.actorId, particle: target.id })
-      // Binding succeeded → micro reward from waste_heat
-      grantMicroReward(state, bot, MICRO_REWARD_ADSORB, 'adsorb_bound', { particle: target.id })
+      pushEvent(state, 'adsorb', {
+        actor: bot.actorId,
+        particle: target.id,
+        bond: target.bond,
+        balances,
+      })
+      const amt = balances ? MICRO_REWARD_ADSORB_BALANCE : MICRO_REWARD_ADSORB
+      const reason = balances ? 'adsorb_balance' : 'adsorb_bound'
+      grantMicroReward(state, bot, amt, reason, { particle: target.id, bond: target.bond })
       return
     }
     case 'catalyze': {
@@ -595,13 +824,20 @@ function applyOne(
         reject(state, receipt, bot, idx, 'NO_ENERGY', 'pool empty')
         return
       }
-      target.bond = clamp((target.bond ?? 0.2) + 0.25, 0, 1)
+      const bondBefore = target.bond ?? 0.2
+      target.bond = clamp(bondBefore + 0.25, 0, 1)
       budgetLeft.n -= cost
       receipt.energy_spent += cost
       state.waste_heat = Math.round((state.waste_heat + cost) * 1000) / 1000
       receipt.accepted.push(idx)
       resetBiteStreak(bot)
       pushEvent(state, 'catalyze', { actor: bot.actorId, particle: target.id, bond: target.bond })
+      if (target.bond > bondBefore + 1e-9) {
+        grantMicroReward(state, bot, MICRO_REWARD_CATALYZE, 'catalyze_bond', {
+          particle: target.id,
+          bond: target.bond,
+        })
+      }
       return
     }
     case 'bite': {
@@ -861,6 +1097,22 @@ export function stepPhysics(state: WorldState): WorldEvent[] {
     // maybeGrantProbeReward(state, bot, 'megamorph') after attributing credit.
   }
 
+  // Corpse lock leak: unreived locked energy → waste_heat (pressure to revive)
+  for (const org of state.organics) {
+    if (org.kind !== 'corpse' || org.energy_locked <= 0) continue
+    const leak = Math.min(CORPSE_LOCK_LEAK, org.energy_locked)
+    org.energy_locked = Math.round((org.energy_locked - leak) * 1000) / 1000
+    state.waste_heat = Math.round((state.waste_heat + leak) * 1000) / 1000
+    if (state.tick % 5 === 0) {
+      pushEvent(state, 'corpse_leak', {
+        corpse: org.id,
+        of: org.corpseOf,
+        leak,
+        locked_left: org.energy_locked,
+      })
+    }
+  }
+
   // Metabolism / starve
   for (const bot of state.bots) {
     if (!bot.alive) continue
@@ -1006,6 +1258,10 @@ export function formatEventLine(ev: WorldEvent): string {
       return `[世界 t=${ev.t}] ${p.actor} 餍足拒咬（pool=${p.energy_pool}≥${p.threshold}）— 改试探/复活`
     case 'micro_reward':
       return `[世界 t=${ev.t}] ${p.actor} 微操回收 +${p.amount}（${p.reason}，废热余 ${p.waste_heat_left}）`
+    case 'wait_neglect':
+      return `[世界 t=${ev.t}] ${p.actor} 在尸体/濒死旁干等（无微操奖励）— 应 revive`
+    case 'corpse_leak':
+      return `[世界 t=${ev.t}] 尸体 ${p.of || p.corpse} 锁能渗漏 −${p.leak}（余 ${p.locked_left}）→废热`
     default:
       return `[世界 t=${ev.t}] ${ev.type} ${JSON.stringify(p).slice(0, 120)}`
   }
