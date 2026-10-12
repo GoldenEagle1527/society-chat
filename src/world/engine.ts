@@ -29,10 +29,13 @@ export const START_POOL = 6
 export const BITE_CHUNK = 8
 /**
  * Passive metabolism per physics tick: pool → waste_heat (conservation).
- * Tuned for SOCIETY_WORLD_STEPS_PER_TICK≈12: 0.03×12 ≈ 0.36 per live tick
- * (was 0.4 which wiped the cast in one live tick).
+ * Fruit phase softer (teaching); post-fruit slightly harsher (force forage).
+ * Legacy METABOLISM_UPKEEP = fruit-phase value.
  */
-export const METABOLISM_UPKEEP = 0.03
+export const METABOLISM_FRUIT = 0.015
+export const METABOLISM_POST_FRUIT = 0.025
+/** @deprecated use METABOLISM_FRUIT / METABOLISM_POST_FRUIT */
+export const METABOLISM_UPKEEP = METABOLISM_FRUIT
 export const ACTION_COST: Record<WorldOp, number> = {
   nudge: 1,
   pull: 1.2,
@@ -53,7 +56,8 @@ export const SATIETY_THRESHOLD = 10
 /** Extra bite cost per consecutive same-target bite after the first. */
 export const BITE_STREAK_COST_STEP = 1.5
 /** Yield loss per consecutive same-target bite (floors at 25% of BITE_CHUNK). */
-export const BITE_STREAK_YIELD_STEP = 0.2
+/** Harsher diminishing → fruit lasts longer (teaching window). */
+export const BITE_STREAK_YIELD_STEP = 0.28
 /**
  * Micro-op rewards: recycle a sliver of waste_heat → energy_pool.
  * Never mint — if waste_heat is empty, reward is 0 (conservation holds).
@@ -79,13 +83,15 @@ export const REVIVE_SAFETY_MARGIN = 0
 export const REVIVE_SHARE_SAVIOR = 0.35
 export const REVIVE_SHARE_REVIVED = 0.45
 /** Post-fruit condense: waste_heat → clump locked at this efficiency (15–25%). */
-export const CONDENSE_EFFICIENCY = 0.2
-export const CONDENSE_MIN_WASTE = 4
-export const CONDENSE_DRAW = 5
-export const CONDENSE_WINDOW_RADIUS = 2.5
+/** M0-friendly upper band (15–25%); tune down later. */
+export const CONDENSE_EFFICIENCY = 0.25
+export const CONDENSE_MIN_WASTE = 3
+export const CONDENSE_DRAW = 6
+export const CONDENSE_WINDOW_RADIUS = 3.5
 export const CONDENSE_MIN_YIN = 1
 export const CONDENSE_MIN_YANG = 1
-export const CONDENSE_MIN_PARTICLES = 3
+/** Softened for M0 visibility (was 3). */
+export const CONDENSE_MIN_PARTICLES = 2
 /** Corpse/clump bite: low yield + high waste (emergency, not riches). */
 export const CORPSE_BITE_YIELD_MUL = 0.35
 export const CORPSE_BITE_WASTE_FRAC = 0.55
@@ -520,7 +526,8 @@ export function createSeedWorld(actorIds: string[]): WorldState {
     }
   }
 
-  const fruitEnergy = 400
+  /** Larger teaching fruit (was 400). */
+  const fruitEnergy = 560
   const fruit: Organic = {
     id: newId('fruit'),
     kind: 'fruit',
@@ -1493,11 +1500,11 @@ export function stepPhysics(state: WorldState): WorldEvent[] {
     }
   }
 
-  // Metabolism / starve
+  // Metabolism / starve (softer while fruit exists)
+  const upkeep = fruitPresent(state) ? METABOLISM_FRUIT : METABOLISM_POST_FRUIT
   for (const bot of state.bots) {
     if (!bot.alive) continue
     // Passive upkeep (pool → waste_heat)
-    const upkeep = METABOLISM_UPKEEP
     if (bot.energy_pool >= upkeep) {
       bot.energy_pool = Math.round((bot.energy_pool - upkeep) * 1000) / 1000
       state.waste_heat = Math.round((state.waste_heat + upkeep) * 1000) / 1000

@@ -388,9 +388,9 @@ function main(): void {
     const clump = state.organics.find((o) => o.kind === 'clump')
     assert.ok(clump && clump.energy_locked > 0, 'clump created')
     assert.ok(
-      Math.abs(clump!.energy_locked - Math.min(5, heatBefore) * CONDENSE_EFFICIENCY) < 0.05 ||
-        clump!.energy_locked <= 5 * CONDENSE_EFFICIENCY + 0.05,
-      `locked=${clump!.energy_locked} eff`,
+      clump!.energy_locked > 0 &&
+        clump!.energy_locked <= 6 * CONDENSE_EFFICIENCY + 0.05,
+      `locked=${clump!.energy_locked} eff=${CONDENSE_EFFICIENCY}`,
     )
     assert.ok(conservationOk(state, 0.5), `after condense Σ=${totalEnergy(state)}`)
 
