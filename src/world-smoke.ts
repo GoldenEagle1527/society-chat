@@ -13,6 +13,8 @@ import {
   CONDENSE_MIN_WASTE,
   CONDENSE_STARVING_POOL,
   CORPSE_LOCK_FLOOR,
+  RESEARCH_POOL_THRESHOLD,
+  RESEARCH_STOMACH_THRESHOLD,
   conservationOk,
   CORPSE_BITE_YIELD_MUL,
   createSeedWorld,
@@ -488,6 +490,116 @@ function main(): void {
     )
   }
 
+  // --- research threshold sink: pool≥6 pins pull/adsorb/catalyze; SATIETY stays fruit-only ---
+  {
+    state.organics = state.organics.filter((o) => o.kind !== 'corpse')
+    // Clear stomach first so research comes from pool gate only
+    if (bot.stomach > 0) {
+      state.waste_heat = Math.round((state.waste_heat + bot.stomach) * 1000) / 1000
+      bot.stomach = 0
+    }
+    transferPool(bot, state, RESEARCH_POOL_THRESHOLD) // 6 — below SATIETY 10
+    assert.ok(Math.abs(bot.energy_pool - RESEARCH_POOL_THRESHOLD) < 0.05, `pool=${bot.energy_pool}`)
+    const snapR = observe(state, 'agnes')
+    assert.ok(
+      snapR.suggested_ops[0] === 'pull' || snapR.suggested_ops.includes('pull'),
+      `research pin pull got ${snapR.suggested_ops}`,
+    )
+    assert.ok(snapR.suggested_ops.includes('adsorb'), 'adsorb')
+    assert.ok(snapR.suggested_ops.includes('catalyze'), 'catalyze')
+    assert.ok(
+      snapR.alerts.some((a) => a.includes('RESEARCH_READY')),
+      'RESEARCH_READY alert',
+    )
+    // SATIETY still fruit-only: pool 6 < 10 → fruit bite allowed if fruit present
+    const fruit = state.organics.find((o) => o.kind === 'fruit' && o.energy_locked > 20)
+    if (fruit) {
+      bot.pos = { ...fruit.pos }
+      const biteF = act(
+        state,
+        { actor_id: 'agnes', budget_energy: 5, actions: [{ op: 'bite', target_id: fruit.id }] },
+        { settle: false },
+      )
+      assert.ok(
+        biteF.accepted.includes(0) || !biteF.rejected.some((r) => r.code === 'REFUSED_SATIATED'),
+        `fruit bite at pool6 not satiated ${JSON.stringify(biteF.rejected)}`,
+      )
+    }
+    console.log(`✓ RESEARCH_READY at pool=${bot.energy_pool} suggest=${snapR.suggested_ops.slice(0, 4)}`)
+  }
+
+  // --- REFUSED_CONDENSE_CLUTTER when clump in view ---
+  {
+    // Ensure post-fruit-ish: drain fruit locked to waste for clean condense prereq aside from clutter
+    for (const o of state.organics.filter((x) => x.kind === 'fruit')) {
+      state.waste_heat = Math.round((state.waste_heat + o.energy_locked) * 1000) / 1000
+      o.energy_locked = 0
+    }
+    state.organics = state.organics.filter((o) => o.kind !== 'fruit' || o.energy_locked > 0.01)
+    // Place a clump on bot
+    if (state.waste_heat < 8) {
+      // mint from baseline-safe: skip if can't
+    }
+    const need = 5
+    assert.ok(state.waste_heat >= need, 'waste for clutter clump')
+    state.waste_heat = Math.round((state.waste_heat - need) * 1000) / 1000
+    const cl = {
+      id: 'clump_clutter_test',
+      kind: 'clump' as const,
+      pos: { ...bot.pos },
+      energy_locked: need,
+      radius: 1,
+    }
+    state.organics.push(cl)
+    // Fund pool for condense cost but not starving
+    transferPool(bot, state, 8)
+    // Arrange mix window
+    let yi = 0
+    let ya = 0
+    for (const p of state.particles.filter((x) => !x.boundTo)) {
+      if (p.kind === 'yin' && yi < 2) {
+        p.pos = { x: bot.pos.x + yi, y: bot.pos.y }
+        yi++
+      } else if (p.kind === 'yang' && ya < 2) {
+        p.pos = { x: bot.pos.x, y: bot.pos.y + ya + 1 }
+        ya++
+      }
+    }
+    bot.condenseFailStreak = 0
+    bot.condenseCooldownUntil = 0
+    const preC = evaluateCondensePrereqs(state, bot)
+    assert.ok(preC.refuse_clutter, `refuse_clutter ${preC.prereq_reason}`)
+    assert.ok(!preC.prereq_ok, 'prereq not ok')
+    const snapC = observe(state, 'agnes')
+    assert.ok(!snapC.suggested_ops.includes('condense'), `no condense suggest ${snapC.suggested_ops}`)
+    const condC = act(
+      state,
+      { actor_id: 'agnes', budget_energy: 10, actions: [{ op: 'condense' }] },
+      { settle: false },
+    )
+    assert.ok(
+      condC.rejected.some((r) => r.code === 'REFUSED_CONDENSE_CLUTTER'),
+      `expected CLUTTER got ${JSON.stringify(condC.rejected)}`,
+    )
+    assert.ok(state.events.some((e) => e.type === 'refused_condense_clutter'), 'telemetry clutter')
+    console.log('✓ REFUSED_CONDENSE_CLUTTER with clump in view')
+    // cleanup clump into waste for later tests
+    state.waste_heat = Math.round((state.waste_heat + cl.energy_locked) * 1000) / 1000
+    state.organics = state.organics.filter((o) => o.id !== cl.id)
+    // Scatter free particles so later MIX teaching can force yang-missing window
+    let yinNear = 0
+    for (const p of state.particles.filter((x) => !x.boundTo)) {
+      if (p.kind === 'yin') {
+        p.pos = { x: bot.pos.x + (yinNear % 2), y: bot.pos.y }
+        yinNear++
+      } else {
+        p.pos = { x: 1, y: 1 } // far corner — missing yang locally
+      }
+    }
+    bot.condenseFailStreak = 0
+    bot.condenseCooldownUntil = 0
+  }
+
   // --- post-fruit: condense + low-yield corpse bite ---
   {
     // Drain fruit
@@ -509,13 +621,19 @@ function main(): void {
     // Mix incomplete → REFUSED_CONDENSE_MIX + observe teaching fields
     {
       transferPool(bot, state, 8)
-      // Park all yang far away so window has only yin (or none)
+      // Park bot mid-map; yang in far corner so window has only yin
+      bot.pos = { x: Math.floor(state.width / 2), y: Math.floor(state.height / 2) }
       for (const p of state.particles.filter((x) => !x.boundTo && x.kind === 'yang')) {
-        p.pos = { x: 0, y: 0 }
+        p.pos = { x: state.width - 1, y: state.height - 1 }
       }
       for (const p of state.particles.filter((x) => !x.boundTo && x.kind === 'yin')) {
         p.pos = { x: bot.pos.x + 1, y: bot.pos.y }
       }
+      // Clear leftover clumps so CLUTTER does not mask MIX teaching
+      for (const o of state.organics.filter((x) => x.kind === 'clump')) {
+        state.waste_heat = Math.round((state.waste_heat + o.energy_locked) * 1000) / 1000
+      }
+      state.organics = state.organics.filter((o) => o.kind !== 'clump')
       const snapMix = observe(state, 'agnes')
       assert.equal(snapMix.condense.mix_ok, false, 'mix_ok false')
       assert.ok(snapMix.condense.local_yin >= 1, 'local_yin')
@@ -557,7 +675,7 @@ function main(): void {
       const yinNear = state.particles.find((p) => !p.boundTo && p.kind === 'yin')!
       yinNear.pos = { x: bot.pos.x + 1, y: bot.pos.y }
       const yangFar = state.particles.find((p) => !p.boundTo && p.kind === 'yang')!
-      yangFar.pos = { x: 0, y: 0 }
+      yangFar.pos = { x: state.width - 1, y: state.height - 1 }
       const badPull = act(
         state,
         { actor_id: 'agnes', budget_energy: 5, actions: [{ op: 'pull', target_id: yinNear.id, dir: 'e' }] },

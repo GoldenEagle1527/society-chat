@@ -53,6 +53,10 @@ export const STARVE_TICKS_TO_DIE = 8
 export const CORE_DEATH = 0.05
 /** Hard-reject fruit `bite` when energy_pool >= this (「刚好够」> hoarding). */
 export const SATIETY_THRESHOLD = 10
+/** Research sink (not fruit satiety): pin pull/adsorb/catalyze when no corpse duty. */
+export const RESEARCH_POOL_THRESHOLD = 6
+/** Research sink via stomach buffer (digest side-ok). */
+export const RESEARCH_STOMACH_THRESHOLD = 4
 /** Extra bite cost per consecutive same-target bite after the first. */
 export const BITE_STREAK_COST_STEP = 1.5
 /** Yield loss per consecutive same-target bite (floors at 25% of BITE_CHUNK). */
@@ -124,6 +128,7 @@ const TELEMETRY_REJECT_CODES: ReadonlySet<ActRejectCode> = new Set([
   'REFUSED_CONDENSE_PREP',
   'REFUSED_CLUMP_WAIT',
   'REFUSED_CONDENSE_STARVING',
+  'REFUSED_CONDENSE_CLUTTER',
 ])
 
 const DIRS: Record<string, Vec2> = {
@@ -443,6 +448,8 @@ export type CondensePrereqInfo = {
   refuse_cooldown: boolean
   /** True when pool < CONDENSE_STARVING_POOL — refuse condense, forage bite. */
   refuse_starving: boolean
+  /** True when biteable clump(s) in view — eat before more condense. */
+  refuse_clutter: boolean
 }
 
 /** Nearest free particle of a given kind (any distance). */
@@ -495,10 +502,11 @@ export function evaluateCondensePrereqs(
     else nearest_opposite = a || b
   }
   const can_afford = bot.energy_pool + 1e-9 >= cost
-  const base: Omit<CondensePrereqInfo, 'prereq_ok' | 'prereq_reason' | 'refuse_mix' | 'refuse_cooldown' | 'refuse_starving'> & {
+  const base: Omit<CondensePrereqInfo, 'prereq_ok' | 'prereq_reason' | 'refuse_mix' | 'refuse_cooldown' | 'refuse_starving' | 'refuse_clutter'> & {
     refuse_mix: boolean
     refuse_cooldown: boolean
     refuse_starving: boolean
+    refuse_clutter: boolean
   } = {
     cost,
     efficiency: CONDENSE_EFFICIENCY,
@@ -517,6 +525,7 @@ export function evaluateCondensePrereqs(
     refuse_mix: false,
     refuse_cooldown: false,
     refuse_starving: false,
+    refuse_clutter: false,
   }
   if (bot.energy_pool + 1e-9 < CONDENSE_STARVING_POOL) {
     return {
@@ -525,6 +534,17 @@ export function evaluateCondensePrereqs(
       refuse_starving: true,
       can_afford: false,
       prereq_reason: `pool ${bot.energy_pool} < starving floor ${CONDENSE_STARVING_POOL} — bite(clump)/digest/revive/move; condense REFUSED_CONDENSE_STARVING`,
+    }
+  }
+  {
+    const clutter = clumpInView(state, bot)
+    if (clutter) {
+      return {
+        ...base,
+        prereq_ok: false,
+        refuse_clutter: true,
+        prereq_reason: `clump ${clutter.id} in view (locked=${clutter.energy_locked}) — bite inventory before condense (REFUSED_CONDENSE_CLUTTER)`,
+      }
     }
   }
   if (cooldownLeft > 0) {
@@ -1018,8 +1038,17 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       // no revive yet — nudge toward help via wait denial; suggest adsorb/pull only if no corpse
     }
   }
-  if (bot.energy_pool >= SATIETY_THRESHOLD && !suggested_ops.includes('revive')) {
-    suggested_ops.push('pull', 'adsorb', 'catalyze')
+  // Research sink: SATIETY stays fruit-bite only; research opens at pool≥6 or stomach≥4
+  // (final pin applied after forage/duty blocks when still no corpse duty)
+  if (
+    !duty &&
+    (bot.energy_pool + 1e-9 >= RESEARCH_POOL_THRESHOLD ||
+      bot.stomach + 1e-9 >= RESEARCH_STOMACH_THRESHOLD) &&
+    !suggested_ops.includes('revive')
+  ) {
+    for (const op of ['pull', 'adsorb', 'catalyze'] as WorldOp[]) {
+      if (!suggested_ops.includes(op)) suggested_ops.push(op)
+    }
     urgency = Math.max(urgency, 20)
   }
   if (bot.energy_pool < 5) {
@@ -1076,7 +1105,7 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       const stripped = suggested_ops.filter((o) => o !== 'condense')
       suggested_ops.length = 0
       suggested_ops.push(...stripped)
-    } else if (condenseInfo.prereq_ok) {
+    } else if (condenseInfo.prereq_ok && !condenseInfo.refuse_clutter) {
       // Never ahead of bite when foraging clumps / starving
       if (!suggested_ops.includes('condense')) {
         if (
@@ -1149,6 +1178,49 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     }
     urgency = Math.max(urgency, 25)
   }
+
+  // Research threshold sink (no corpse duty): pin pull/adsorb/catalyze; digest side-ok
+  // SATIETY_THRESHOLD remains fruit-bite only.
+  if (
+    !duty &&
+    (bot.energy_pool + 1e-9 >= RESEARCH_POOL_THRESHOLD ||
+      bot.stomach + 1e-9 >= RESEARCH_STOMACH_THRESHOLD)
+  ) {
+    urgency = Math.max(urgency, 26)
+    alerts.unshift(
+      `RESEARCH_READY pool=${bot.energy_pool}≥${RESEARCH_POOL_THRESHOLD} or stomach=${bot.stomach}≥${RESEARCH_STOMACH_THRESHOLD} — pull/adsorb/catalyze (satiety ${SATIETY_THRESHOLD}=fruit-bite only)`,
+    )
+    const research: WorldOp[] = ['pull', 'adsorb', 'catalyze']
+    const head: WorldOp[] = []
+    // Starving forage still wins over research
+    if (
+      bot.energy_pool + 1e-9 < CONDENSE_STARVING_POOL &&
+      suggested_ops.includes('bite')
+    ) {
+      head.push('bite')
+      if (suggested_ops.includes('digest')) head.push('digest')
+    }
+    const rest = suggested_ops.filter(
+      (o) => !head.includes(o) && !research.includes(o) && o !== 'condense' && o !== 'wait',
+    )
+    suggested_ops.length = 0
+    suggested_ops.push(...head, ...research)
+    if (bot.stomach >= 1 && !suggested_ops.includes('digest')) suggested_ops.push('digest')
+    for (const o of rest) {
+      if (!suggested_ops.includes(o)) suggested_ops.push(o)
+    }
+  }
+
+  // Clutter: never suggest condense when biteable clumps in view
+  if (condenseInfo.refuse_clutter) {
+    alerts.unshift(
+      `CONDENSE_CLUTTER — bite clump(s) in view before making more (REFUSED_CONDENSE_CLUTTER)`,
+    )
+    const stripped = suggested_ops.filter((o) => o !== 'condense')
+    suggested_ops.length = 0
+    suggested_ops.push(...stripped)
+  }
+
   urgency = clamp(urgency, 0, 100)
 
   const events_recent = state.events.filter((e) => e.t >= state.tick - 5).slice(-12)
@@ -1998,6 +2070,31 @@ function applyOne(
         )
         return
       }
+      if (pre.refuse_clutter) {
+        const clutter = clumpInView(state, bot)
+        pushEvent(state, 'condense_fail', {
+          actor: bot.actorId,
+          reason: pre.prereq_reason,
+          refuse_clutter: true,
+          clump: clutter?.id,
+          locked: clutter?.energy_locked,
+          waste_heat: state.waste_heat,
+        })
+        reject(
+          state,
+          receipt,
+          bot,
+          idx,
+          'REFUSED_CONDENSE_CLUTTER',
+          pre.prereq_reason || 'bite clump inventory before condense',
+          {
+            clump: clutter?.id,
+            energy_locked: clutter?.energy_locked,
+            allowed: 'bite(clump) / digest / pull / adsorb / catalyze',
+          },
+        )
+        return
+      }
       if (!pre.prereq_ok) {
         noteCondenseFail(state, bot)
         pushEvent(state, 'condense_fail', {
@@ -2006,6 +2103,7 @@ function applyOne(
           refuse_mix: pre.refuse_mix,
           refuse_cooldown: pre.refuse_cooldown,
           refuse_starving: pre.refuse_starving,
+          refuse_clutter: pre.refuse_clutter,
           missing: pre.missing,
           waste_heat: state.waste_heat,
           local_yin: pre.local_yin,
