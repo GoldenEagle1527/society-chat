@@ -173,7 +173,7 @@ export class SocietyWorldService extends Service {
         `紧迫度 urgency=${snap.urgency}；建议操作 suggested_ops=[${(snap.suggested_ops || []).join(',')}]。有尸体时优先 revive，禁止在尸体旁干等。`,
         '引擎立法：能池≥餍足阈值时咬果 → REFUSED_SATIATED；同目标连啃成本升、收益降。刚好够优于囤满。',
         'micro_reward 只奖构型进展（pull_cluster/pull_pair/pull_morph_prep、adsorb_balance、catalyze_bond）；随机 pull_moved / 来回拉 / wait 不给奖。守恒：废热→能池。代谢每 tick 扣能。',
-        '能池够用时：挪粒子成团/催化键/复活同伴；咬果仅濒饿。硕果尚在先 bite/digest。果尽看「齐窗进度」(阴x/需 阳y/需)；未齐时 PREP 会写明允许列表与对面方向/id，move 算筹备。齐窗后造团→咬团维生。pool<4 禁冷凝（REFUSED_CONDENSE_STARVING），饿时可从团能付咬团费（stomach=chunk−cost）。尸体旁硬提示 revive；饿死尸体锁能地板12（废热补）；pool<8 可饿救（短差从尸体锁能付）。研究窗：无尸体义务且 pool≥6 或 stomach≥4 时开放微操；果期仅尾部追加、不抢 bite/digest；果尽且齐窗未成（或缺团需 bite / clutter）时研究微操也只尾部追加，头钉留给 pull/nudge/move（或 bite(clump)）；仅果尽且齐窗已成且无 clutter 团压头时才允许研究微操顶头（视野有 bond<1 才建议 catalyze，否则 divert 到 pull/adsorb）；bond≥1 催化→REFUSED_CATALYZE_MAXED。餍足10仍只管咬果；视野有团则禁冷凝 CLUTTER。冷凝效/果参/饥饿闸/饿救不变。聊天是外壳。',
+        '能池够用时：挪粒子成团/催化键/复活同伴；咬果仅濒饿。硕果尚在先 bite/digest。果尽看「齐窗进度」(阴x/需 阳y/需)；未齐时两段导航：对面超 INTERACT 只 move（alert 钉 dir+target_id，拒 pull/nudge）；进距后只 pull（钉 target_id，拒 move/catalyze）。齐窗后造团→咬团维生。pool<4 禁冷凝（REFUSED_CONDENSE_STARVING），饿时可从团能付咬团费（stomach=chunk−cost）。尸体旁硬提示 revive；饿死尸体锁能地板12（废热补）；pool<8 可饿救（短差从尸体锁能付）。研究窗：无尸体义务且 pool≥6 或 stomach≥4 时开放微操；果期仅尾部追加、不抢 bite/digest；果尽且齐窗未成（或缺团需 bite / clutter）时研究微操也只尾部追加，头钉留给齐窗两段导航 move→pull（或 bite(clump)）；仅果尽且齐窗已成且无 clutter 团压头时才允许研究微操顶头（视野有 bond<1 才建议 catalyze，否则 divert 到 pull/adsorb）；bond≥1 催化→REFUSED_CATALYZE_MAXED。餍足10仍只管咬果；视野有团则禁冷凝 CLUTTER。冷凝效/果参/饥饿闸/饿救不变。聊天是外壳。',
       ]
       if (snap.corpses?.length) {
         lines.push('【尸体警报 — 立刻评估 revive】')

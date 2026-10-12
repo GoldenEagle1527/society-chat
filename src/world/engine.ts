@@ -681,7 +681,10 @@ export function compassDir(from: Vec2, to: Vec2): string {
   return 'sw'
 }
 
-const PREP_ALLOWED = 'move / pull / nudge（朝对面）· revive · digest · bite(clump)（饿时造团费从团付）'
+/** Stage-aware mix-prep allow list (UX). Far=move-only; near=pull-only. */
+const PREP_ALLOWED_FAR = 'move(dir+target_id 走近对面) · revive · digest · bite(clump)（饿时造团费从团付）— 太远拒 pull/nudge'
+const PREP_ALLOWED_NEAR = 'pull(target_id=对面) · revive · digest · bite(clump)（饿时造团费从团付）— 齐窗距内拒 move/catalyze/nudge'
+const PREP_ALLOWED = '远：只 move；近：只 pull · revive · digest · bite(clump)'
 
 /** Human-readable REFUSED_CONDENSE_PREP message (UX only). */
 function formatCondensePrepRefuse(
@@ -701,9 +704,15 @@ function formatCondensePrepRefuse(
     oppLine = `对面：${pre.nearest_opposite.kind} ${pre.nearest_opposite.id} 方向=${dir} 距离=${pre.nearest_opposite.dist}`
   }
   const why = detail ? `；${detail}` : ''
+  const allowed =
+    pre.nearest_opposite && pre.nearest_opposite.dist > INTERACT_RADIUS
+      ? PREP_ALLOWED_FAR
+      : pre.nearest_opposite
+        ? PREP_ALLOWED_NEAR
+        : PREP_ALLOWED
   return (
     `齐窗未成（缺 ${pre.missing}；${yin} ${yang} — ${mix}）。` +
-    `允许：${PREP_ALLOWED}。` +
+    `允许：${allowed}。` +
     `${oppLine}。` +
     `已拒：${refusedOp}${why}`
   )
@@ -728,7 +737,16 @@ function buildWindowProgress(
     const dir = p ? compassDir(bot.pos, p.pos) : '?'
     opp = `；对面 ${pre.nearest_opposite.kind} ${pre.nearest_opposite.id} 在${dir} d=${pre.nearest_opposite.dist}`
   }
-  const status = pre.mix_ok ? '已齐窗，可 condense' : `未齐窗（缺 ${pre.missing}）— 可 move/pull/nudge 朝对面`
+  let status: string
+  if (pre.mix_ok) {
+    status = '已齐窗，可 condense'
+  } else if (pre.nearest_opposite && pre.nearest_opposite.dist > INTERACT_RADIUS) {
+    status = `未齐窗（缺 ${pre.missing}）— 远 d=${pre.nearest_opposite.dist}>${INTERACT_RADIUS}：只 move 走近再 pull`
+  } else if (pre.nearest_opposite) {
+    status = `未齐窗（缺 ${pre.missing}）— 近 d=${pre.nearest_opposite.dist}≤${INTERACT_RADIUS}：只 pull 对面`
+  } else {
+    status = `未齐窗（缺 ${pre.missing}）— 寻对面：move`
+  }
   const text = `齐窗进度：阴${yin.have}/${yin.need} 阳${yang.have}/${yang.need} — ${status}${opp}`
   return { label: '齐窗进度', yin, yang, mix_ok: pre.mix_ok, text }
 }
@@ -1091,7 +1109,7 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     urgency = Math.max(urgency, 28)
   }
   if (fruit_gone) {
-    // Post-fruit: teach mix prep — pin pull/nudge/move when window unbalanced
+    // Post-fruit: teach mix prep — two-stage nav (far=move / near=pull) when unbalanced
     urgency = Math.max(urgency, 40)
     if (condenseInfo.refuse_cooldown || (!condenseInfo.mix_ok && condenseInfo.fail_streak > 0)) {
       urgency = Math.max(urgency, 48)
@@ -1139,11 +1157,30 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
         }
       }
     } else if (!condenseInfo.mix_ok || condenseInfo.refuse_cooldown) {
-      const pinned: WorldOp[] = ['pull', 'nudge', 'move']
+      // Two-stage nav: far → only move; near → only pull (never pin both)
+      const opp = condenseInfo.nearest_opposite
+      const oppFar = !opp || opp.dist > INTERACT_RADIUS
+      const pinned: WorldOp[] = oppFar ? ['move'] : ['pull']
       {
         const wp = buildWindowProgress(bot, state, condenseInfo)
         alerts.push(wp.text)
-        alerts.push(`允许动作：${PREP_ALLOWED}`)
+        if (opp) {
+          const pOpp = findParticle(state, opp.id)
+          const needDir = pOpp ? compassDir(bot.pos, pOpp.pos) : '?'
+          if (oppFar) {
+            alerts.push(
+              `PREP_NAV far d=${opp.dist}>${INTERACT_RADIUS} — suggested=move dir=${needDir} target_id=${opp.id}（走近再 pull）；拒 pull/nudge`,
+            )
+            alerts.push(`允许动作：${PREP_ALLOWED_FAR}；dir=${needDir} target_id=${opp.id}`)
+          } else {
+            alerts.push(
+              `PREP_NAV near d=${opp.dist}≤${INTERACT_RADIUS} — suggested=pull target_id=${opp.id}；拒 move/catalyze/nudge`,
+            )
+            alerts.push(`允许动作：${PREP_ALLOWED_NEAR}；target_id=${opp.id}`)
+          }
+        } else {
+          alerts.push(`允许动作：move（寻对面）· revive · digest · bite(clump)`)
+        }
       }
       if (condenseInfo.cooldown_ticks_left > 0) {
         alerts.push(
@@ -1153,7 +1190,7 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       const reviveFirst = suggested_ops[0] === 'revive'
       const head: WorldOp[] = []
       if (reviveFirst) head.push('revive')
-      // Hungry forage: bite stays ahead of mix-prep pull/nudge
+      // Hungry forage: bite stays ahead of mix-prep move/pull
       if (suggested_ops.includes('bite') && bot.energy_pool < CLUMP_FORAGE_POOL_THRESHOLD) {
         if (!head.includes('bite')) head.push('bite')
         if (suggested_ops.includes('digest') && !head.includes('digest')) head.push('digest')
@@ -1496,6 +1533,12 @@ function applyOne(
     if (mixPrep) {
       const opp = preGate!.nearest_opposite
       const missing = preGate!.missing
+      const oppDist = opp?.dist ?? Infinity
+      const oppFar = !opp || oppDist > INTERACT_RADIUS
+      const prepStage = oppFar ? 'far' : 'near'
+      const allowedList = oppFar ? PREP_ALLOWED_FAR : PREP_ALLOWED_NEAR
+      const pOpp = opp ? findParticle(state, opp.id) : undefined
+      const suggestedDir = pOpp ? compassDir(bot.pos, pOpp.pos) : undefined
       const allowedAlways = op === 'revive' || op === 'digest'
       const biteClumpOk =
         op === 'bite' &&
@@ -1503,20 +1546,22 @@ function applyOne(
         state.organics.some(
           (o) => o.id === action.target_id && o.kind === 'clump' && o.energy_locked > 0.01,
         )
+      const prepExtra = {
+        missing,
+        nearest_opposite: opp,
+        local_yin: preGate!.local_yin,
+        local_yang: preGate!.local_yang,
+        opp_dist: opp ? oppDist : null,
+        prep_stage: prepStage,
+        ...(suggestedDir ? { suggested_dir: suggestedDir } : {}),
+        ...(opp ? { target_id: opp.id } : {}),
+        allowed: allowedList,
+      }
       if (allowedAlways || biteClumpOk) {
         // pass through
-      } else if (op === 'pull' || op === 'nudge') {
-        const target = action.target_id ? findParticle(state, action.target_id) : undefined
-        const kindOk =
-          target &&
-          !target.boundTo &&
-          (missing === 'both'
-            ? true
-            : missing === 'yin' || missing === 'yang'
-              ? target.kind === missing
-              : false)
-        const idOk = opp ? target && target.id === opp.id : kindOk
-        if (!target || (!kindOk && !idOk)) {
+      } else if (oppFar) {
+        // FAR: only move toward opp; refuse pull/nudge (too far for interact)
+        if (op === 'pull' || op === 'nudge') {
           reject(
             state,
             receipt,
@@ -1528,31 +1573,23 @@ function applyOne(
               state,
               preGate!,
               op,
-              `请对对面粒子 pull/nudge（或 move 靠近），不要拉同极`,
+              `对面太远 d=${oppDist}>${INTERACT_RADIUS} — 先 move${suggestedDir ? ` dir=${suggestedDir}` : ''}${opp ? ` target_id=${opp.id}` : ''} 走近再 pull`,
             ),
-            {
-              missing,
-              nearest_opposite: opp,
-              local_yin: preGate!.local_yin,
-              local_yang: preGate!.local_yang,
-              refused_op: op,
-              allowed: PREP_ALLOWED,
-            },
+            { ...prepExtra, refused_op: op },
           )
           return
-        }
-      } else if (op === 'move') {
-        const dir = parseDir(action.dir)
-        if (!opp) {
-          // no opposite particle in world — allow move to search
-        } else if (!dir || (dir.x === 0 && dir.y === 0)) {
-          reject(state, receipt, bot, idx, 'ILLEGAL_OP', 'dir required for move')
-          return
-        } else {
-          // Find particle pos for opposite
-          const pOpp = findParticle(state, opp.id)
-          if (pOpp && !moveReducesDist(bot.pos, dir, pOpp.pos, state.width, state.height)) {
-            const needDir = compassDir(bot.pos, pOpp.pos)
+        } else if (op === 'move') {
+          const dir = parseDir(action.dir)
+          if (!opp) {
+            // no opposite particle in world — allow move to search
+          } else if (!dir || (dir.x === 0 && dir.y === 0)) {
+            reject(state, receipt, bot, idx, 'ILLEGAL_OP', 'dir required for move')
+            return
+          } else if (
+            pOpp &&
+            !moveReducesDist(bot.pos, dir, pOpp.pos, state.width, state.height)
+          ) {
+            const needDir = suggestedDir || compassDir(bot.pos, pOpp.pos)
             reject(
               state,
               receipt,
@@ -1567,37 +1604,102 @@ function applyOne(
                 `请朝 ${needDir} 走近 ${opp.kind} ${opp.id}（不要往反方向）`,
               ),
               {
-                missing,
-                nearest_opposite: opp,
+                ...prepExtra,
                 dir: action.dir,
                 suggested_dir: needDir,
                 refused_op: 'move',
-                allowed: PREP_ALLOWED,
               },
             )
             return
           }
+        } else if (op === 'condense') {
+          // fall through to condense case (REFUSED_CONDENSE_MIX / cooldown)
+        } else {
+          reject(
+            state,
+            receipt,
+            bot,
+            idx,
+            'REFUSED_CONDENSE_PREP',
+            formatCondensePrepRefuse(
+              bot,
+              state,
+              preGate!,
+              op,
+              `远距阶段只允许 move${suggestedDir ? ` dir=${suggestedDir}` : ''}${opp ? ` →${opp.id}` : ''}`,
+            ),
+            { ...prepExtra, refused_op: op },
+          )
+          return
         }
-      } else if (op === 'condense') {
-        // fall through to condense case (REFUSED_CONDENSE_MIX / cooldown)
       } else {
-        reject(
-          state,
-          receipt,
-          bot,
-          idx,
-          'REFUSED_CONDENSE_PREP',
-          formatCondensePrepRefuse(bot, state, preGate!, op),
-          {
-            missing,
-            nearest_opposite: opp,
-            refused_op: op,
-            local_yin: preGate!.local_yin,
-            local_yang: preGate!.local_yang,
-            allowed: PREP_ALLOWED,
-          },
-        )
-        return
+        // NEAR: only pull pinned opp; refuse move/catalyze/nudge
+        if (op === 'pull') {
+          const target = action.target_id ? findParticle(state, action.target_id) : undefined
+          const kindOk =
+            target &&
+            !target.boundTo &&
+            (missing === 'both'
+              ? true
+              : missing === 'yin' || missing === 'yang'
+                ? target.kind === missing
+                : false)
+          const idOk = opp ? target && target.id === opp.id : kindOk
+          if (!target || (!kindOk && !idOk)) {
+            reject(
+              state,
+              receipt,
+              bot,
+              idx,
+              'REFUSED_CONDENSE_PREP',
+              formatCondensePrepRefuse(
+                bot,
+                state,
+                preGate!,
+                'pull',
+                `请 pull 对面 ${opp ? `${opp.kind} ${opp.id}` : '粒子'}（target_id 钉死），不要拉同极`,
+              ),
+              { ...prepExtra, refused_op: 'pull' },
+            )
+            return
+          }
+        } else if (op === 'move' || op === 'nudge' || op === 'catalyze') {
+          reject(
+            state,
+            receipt,
+            bot,
+            idx,
+            'REFUSED_CONDENSE_PREP',
+            formatCondensePrepRefuse(
+              bot,
+              state,
+              preGate!,
+              op,
+              `已进距 d=${oppDist}≤${INTERACT_RADIUS} — 只 pull target_id=${opp!.id}（拒 ${op}）`,
+            ),
+            { ...prepExtra, refused_op: op },
+          )
+          return
+        } else if (op === 'condense') {
+          // fall through
+        } else {
+          reject(
+            state,
+            receipt,
+            bot,
+            idx,
+            'REFUSED_CONDENSE_PREP',
+            formatCondensePrepRefuse(
+              bot,
+              state,
+              preGate!,
+              op,
+              `近距阶段只允许 pull target_id=${opp!.id}`,
+            ),
+            { ...prepExtra, refused_op: op },
+          )
+          return
+        }
       }
     }
   }
