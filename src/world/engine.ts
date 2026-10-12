@@ -783,9 +783,11 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     .filter((o) => o.kind === 'clump' && o.energy_locked > 0.01)
     .map((o) => ({ id: o.id, pos: { ...o.pos }, energy_locked: o.energy_locked }))
   const fruitNearlyGone = fruit_gone || fruitLocked <= FRUIT_NEARLY_GONE
-  // Empty stomach first — huge stomach + condense spam stalls teaching window
+  // Empty stomach when full — but never ahead of revive duty
   if (bot.stomach >= 2 && !suggested_ops.includes('digest')) {
-    suggested_ops.unshift('digest')
+    const revivePinned = suggested_ops[0] === 'revive'
+    if (revivePinned) suggested_ops.splice(1, 0, 'digest')
+    else suggested_ops.unshift('digest')
     urgency = Math.max(urgency, 28)
   }
   if (fruit_gone) {
