@@ -24,6 +24,8 @@ export type ActRejectCode =
   | 'REFUSED_CONDENSE_PREP'
   /** Clump in view + low pool: wait refused — bite(clump) instead. */
   | 'REFUSED_CLUMP_WAIT'
+  /** Condense refused: pool below starving floor — bite(clump)/digest/revive/move still ok. */
+  | 'REFUSED_CONDENSE_STARVING'
 
 export interface Vec2 {
   x: number

@@ -11,6 +11,7 @@ import {
   CONDENSE_DRAW,
   CONDENSE_EFFICIENCY,
   CONDENSE_MIN_WASTE,
+  CONDENSE_STARVING_POOL,
   conservationOk,
   CORPSE_BITE_YIELD_MUL,
   createSeedWorld,
@@ -541,6 +542,64 @@ function main(): void {
       assert.ok(biteCl.accepted.includes(0), `clump bite ${JSON.stringify(biteCl)}`)
       assert.ok(state.events.some((e) => e.type === 'bite' && e.payload.kind === 'clump'), 'clump bite event')
       console.log('✓ REFUSED_CLUMP_WAIT + clumpBite')
+    }
+
+    // Hunger knife: pool < CONDENSE_STARVING_POOL → REFUSED_CONDENSE_STARVING; hungry bite pays from clump
+    {
+      // Re-find or re-seed a clump with enough locked energy
+      let cl = state.organics.find((o) => o.kind === 'clump' && o.energy_locked >= 5)
+      if (!cl) {
+        const need = 8
+        assert.ok(state.waste_heat >= need, 'waste for hunger clump')
+        state.waste_heat = Math.round((state.waste_heat - need) * 1000) / 1000
+        cl = {
+          id: 'clump_hunger_test',
+          kind: 'clump' as const,
+          pos: { ...bot.pos },
+          energy_locked: need,
+          radius: 1,
+        }
+        state.organics.push(cl)
+      }
+      bot.pos = { ...cl.pos }
+      bot.biteStreak = 0
+      delete bot.biteStreakTargetId
+      transferPool(bot, state, 1) // pool 1 < cost 2 and < starving floor 4
+      const snapStarv = observe(state, 'agnes')
+      assert.ok(snapStarv.suggested_ops[0] === 'bite' || snapStarv.suggested_ops.includes('bite'), `bite pinned got ${snapStarv.suggested_ops}`)
+      assert.ok(!snapStarv.condense?.ok, 'condense not ok when starving')
+      const starv = act(
+        state,
+        { actor_id: 'agnes', budget_energy: 10, actions: [{ op: 'condense' }] },
+        { settle: false },
+      )
+      assert.ok(
+        starv.rejected.some((r) => r.code === 'REFUSED_CONDENSE_STARVING'),
+        `expected STARVING got ${JSON.stringify(starv.rejected)}`,
+      )
+      assert.ok(state.events.some((e) => e.type === 'refused_condense_starving'), 'telemetry starving')
+      const lockedBefore = cl.energy_locked
+      const stomBefore = bot.stomach
+      const poolBefore = bot.energy_pool
+      const heatBefore = state.waste_heat
+      const biteH = act(
+        state,
+        { actor_id: 'agnes', budget_energy: 10, actions: [{ op: 'bite', target_id: cl.id }] },
+        { settle: false },
+      )
+      assert.ok(biteH.accepted.includes(0), `hungry clump bite ${JSON.stringify(biteH)}`)
+      assert.ok(Math.abs(bot.energy_pool - poolBefore) < 1e-6, `pool unchanged got ${bot.energy_pool} was ${poolBefore}`)
+      const biteEv = [...state.events].reverse().find((e) => e.type === 'bite' && e.payload?.hungry_clump_bite)
+      assert.ok(biteEv, 'hungry_clump_bite event flag')
+      const chunk = biteEv!.payload.chunk as number
+      const cost = biteEv!.payload.cost as number
+      const toStom = biteEv!.payload.to_stomach as number
+      assert.ok(Math.abs(toStom - (chunk - cost)) < 1e-6, `stomach=chunk-cost got ${toStom} chunk=${chunk} cost=${cost}`)
+      assert.ok(bot.stomach + 1e-9 >= stomBefore + toStom - 0.01, 'stomach gained')
+      assert.ok(cl.energy_locked + 1e-9 <= lockedBefore - chunk + 0.01, 'clump drained')
+      assert.ok(state.waste_heat + 1e-9 >= heatBefore + cost - 0.01, 'cost→waste from clump')
+      assert.ok(conservationOk(state, 0.6), `after hungry bite Σ=${totalEnergy(state)}`)
+      console.log(`✓ REFUSED_CONDENSE_STARVING + hungry clump bite stomach=${toStom} (chunk ${chunk} − cost ${cost})`)
     }
 
     // Corpse bite low yield

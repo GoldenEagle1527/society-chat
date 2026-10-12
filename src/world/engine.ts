@@ -89,6 +89,8 @@ export const CONDENSE_EFFICIENCY = 0.25
 export const FRUIT_TAIL_THRESHOLD = 300
 /** Suggest bite(clump) when pool below this and clumps exist. */
 export const CLUMP_FORAGE_POOL_THRESHOLD = 8
+/** Reject condense when pool below this (hunger knife — still allow bite(clump)/digest/revive/move). */
+export const CONDENSE_STARVING_POOL = 4
 /** Boost condense/bite when fruit locked at or below this (nearly gone). */
 export const FRUIT_NEARLY_GONE = 80
 export const CONDENSE_MIN_WASTE = 8
@@ -119,6 +121,7 @@ const TELEMETRY_REJECT_CODES: ReadonlySet<ActRejectCode> = new Set([
   'REFUSED_CONDENSE_COOLDOWN',
   'REFUSED_CONDENSE_PREP',
   'REFUSED_CLUMP_WAIT',
+  'REFUSED_CONDENSE_STARVING',
 ])
 
 const DIRS: Record<string, Vec2> = {
@@ -430,6 +433,8 @@ export type CondensePrereqInfo = {
   /** True when refusal should be REFUSED_CONDENSE_MIX (not other prereq). */
   refuse_mix: boolean
   refuse_cooldown: boolean
+  /** True when pool < CONDENSE_STARVING_POOL — refuse condense, forage bite. */
+  refuse_starving: boolean
 }
 
 /** Nearest free particle of a given kind (any distance). */
@@ -482,9 +487,10 @@ export function evaluateCondensePrereqs(
     else nearest_opposite = a || b
   }
   const can_afford = bot.energy_pool + 1e-9 >= cost
-  const base: Omit<CondensePrereqInfo, 'prereq_ok' | 'prereq_reason' | 'refuse_mix' | 'refuse_cooldown'> & {
+  const base: Omit<CondensePrereqInfo, 'prereq_ok' | 'prereq_reason' | 'refuse_mix' | 'refuse_cooldown' | 'refuse_starving'> & {
     refuse_mix: boolean
     refuse_cooldown: boolean
+    refuse_starving: boolean
   } = {
     cost,
     efficiency: CONDENSE_EFFICIENCY,
@@ -502,6 +508,16 @@ export function evaluateCondensePrereqs(
     cooldown_ticks_left: cooldownLeft,
     refuse_mix: false,
     refuse_cooldown: false,
+    refuse_starving: false,
+  }
+  if (bot.energy_pool + 1e-9 < CONDENSE_STARVING_POOL) {
+    return {
+      ...base,
+      prereq_ok: false,
+      refuse_starving: true,
+      can_afford: false,
+      prereq_reason: `pool ${bot.energy_pool} < starving floor ${CONDENSE_STARVING_POOL} — bite(clump)/digest/revive/move; condense REFUSED_CONDENSE_STARVING`,
+    }
   }
   if (cooldownLeft > 0) {
     return {
@@ -617,7 +633,7 @@ export function compassDir(from: Vec2, to: Vec2): string {
   return 'sw'
 }
 
-const PREP_ALLOWED = 'move / pull / nudge（朝对面）· revive · digest · bite(clump)'
+const PREP_ALLOWED = 'move / pull / nudge（朝对面）· revive · digest · bite(clump)（饿时造团费从团付）'
 
 /** Human-readable REFUSED_CONDENSE_PREP message (UX only). */
 function formatCondensePrepRefuse(
@@ -920,6 +936,11 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
         `REVIVE_NEGLECT ${c.corpse_of} unrevived=${c.ticks_unrevived}t≥${CORPSE_NEGLECT_HARDEN_TICKS} — MUST revive: who=[${named}] cost=${c.revive_cost} else locked→waste + companion stays dead`,
       )
     }
+    if (c.in_range) {
+      alerts.unshift(
+        `REVIVE_HARD ${c.corpse_of} adjacent dist=${c.dist} cost=${c.revive_cost} self_afford=${c.self_can_afford} self_now=${c.self_can_revive_now} — revive NOW (do not condense/wait/wander)`,
+      )
+    }
   }
   for (const d of dying) {
     alerts.push(
@@ -949,7 +970,14 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
   let urgency = 0
   const suggested_ops: WorldOp[] = []
   const duty = reviveDutyCorpse(state, bot)
-  if (corpses.some((c) => c.self_can_revive_now)) {
+  if (corpses.some((c) => c.in_range)) {
+    urgency = Math.min(100, urgency + 95)
+    // Hard pin revive when standing on/near corpse
+    suggested_ops.length = 0
+    if (corpses.some((c) => c.self_can_revive_now)) suggested_ops.push('revive')
+    else if (corpses.some((c) => c.self_can_afford)) suggested_ops.push('revive')
+    else suggested_ops.push('adsorb', 'bite', 'move') // earn then revive
+  } else if (corpses.some((c) => c.self_can_revive_now)) {
     urgency += 90
     suggested_ops.push('revive')
   } else if (corpses.some((c) => c.self_can_afford)) {
@@ -1011,17 +1039,48 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     if (condenseInfo.refuse_cooldown || (!condenseInfo.mix_ok && condenseInfo.fail_streak > 0)) {
       urgency = Math.max(urgency, 48)
     }
-    // Hungry + clump in view: elevate bite(clump) (wait will be hard-refused)
+    // Hungry + clump: pin bite(clump) at top (wait hard-refused; starving blocks condense)
     if (clumpsList.length && bot.energy_pool < CLUMP_FORAGE_POOL_THRESHOLD) {
-      urgency = Math.max(urgency, 50)
-      alerts.push(
-        `CLUMP_FORAGE pool=${bot.energy_pool}<${CLUMP_FORAGE_POOL_THRESHOLD} clumps=${clumpsList.length} — bite(clump); wait REFUSED_CLUMP_WAIT`,
+      urgency = Math.max(urgency, 55)
+      alerts.unshift(
+        `CLUMP_FORAGE pool=${bot.energy_pool}<${CLUMP_FORAGE_POOL_THRESHOLD} clumps=${clumpsList.length} — bite(clump) FIRST; wait REFUSED_CLUMP_WAIT; hungry bite pays cost from clump`,
       )
-      if (!suggested_ops.includes('bite')) suggested_ops.unshift('bite')
-      if (!suggested_ops.includes('digest')) suggested_ops.splice(1, 0, 'digest')
+      // Pin bite at absolute top unless revive duty already owns slot 0
+      const revivePinned = suggested_ops[0] === 'revive' || suggested_ops[0] === 'move'
+      const rest = suggested_ops.filter((o) => o !== 'bite' && o !== 'digest')
+      suggested_ops.length = 0
+      if (revivePinned && (rest[0] === 'revive' || rest[0] === 'move')) {
+        // keep revive/move head then bite
+        const head: WorldOp[] = []
+        if (rest[0] === 'move') head.push('move')
+        if (rest.includes('revive')) head.push('revive')
+        const tail = rest.filter((o) => !head.includes(o))
+        suggested_ops.push(...head, 'bite', 'digest', ...tail)
+      } else {
+        suggested_ops.push('bite', 'digest', ...rest)
+      }
     }
-    if (condenseInfo.prereq_ok) {
-      if (!suggested_ops.includes('condense')) suggested_ops.unshift('condense')
+    if (condenseInfo.refuse_starving) {
+      alerts.unshift(
+        `STARVING pool=${bot.energy_pool}<${CONDENSE_STARVING_POOL} — condense REFUSED_CONDENSE_STARVING; bite(clump)/digest/revive/move only`,
+      )
+      // strip condense from suggestions
+      const stripped = suggested_ops.filter((o) => o !== 'condense')
+      suggested_ops.length = 0
+      suggested_ops.push(...stripped)
+    } else if (condenseInfo.prereq_ok) {
+      // Never ahead of bite when foraging clumps / starving
+      if (!suggested_ops.includes('condense')) {
+        if (
+          clumpsList.length &&
+          bot.energy_pool < CLUMP_FORAGE_POOL_THRESHOLD &&
+          suggested_ops.includes('bite')
+        ) {
+          suggested_ops.push('condense')
+        } else {
+          suggested_ops.unshift('condense')
+        }
+      }
     } else if (!condenseInfo.mix_ok || condenseInfo.refuse_cooldown) {
       const pinned: WorldOp[] = ['pull', 'nudge', 'move']
       {
@@ -1035,14 +1094,21 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
         )
       }
       const reviveFirst = suggested_ops[0] === 'revive'
-      const biteFirst = suggested_ops[0] === 'bite' || suggested_ops[1] === 'bite'
       const head: WorldOp[] = []
       if (reviveFirst) head.push('revive')
+      // Hungry forage: bite stays ahead of mix-prep pull/nudge
       if (suggested_ops.includes('bite') && bot.energy_pool < CLUMP_FORAGE_POOL_THRESHOLD) {
         if (!head.includes('bite')) head.push('bite')
+        if (suggested_ops.includes('digest') && !head.includes('digest')) head.push('digest')
       }
       const rest = suggested_ops.filter(
-        (o) => !head.includes(o) && o !== 'condense' && o !== 'pull' && o !== 'nudge' && o !== 'move' && o !== 'wait',
+        (o) =>
+          !head.includes(o) &&
+          o !== 'condense' &&
+          o !== 'pull' &&
+          o !== 'nudge' &&
+          o !== 'move' &&
+          o !== 'wait',
       )
       suggested_ops.length = 0
       suggested_ops.push(...head, ...pinned, ...rest)
@@ -1061,8 +1127,18 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       suggested_ops.push('condense')
     }
   } else if (clumpsList.length && bot.energy_pool < CLUMP_FORAGE_POOL_THRESHOLD) {
-    // Mid-game: clumps available, pool low — elevate bite without refusing wait
-    if (!suggested_ops.includes('bite')) suggested_ops.unshift('bite')
+    // Mid-game: clumps available, pool low — elevate bite; starving pins bite top
+    if (bot.energy_pool + 1e-9 < CONDENSE_STARVING_POOL) {
+      urgency = Math.max(urgency, 50)
+      alerts.unshift(
+        `STARVING pool=${bot.energy_pool}<${CONDENSE_STARVING_POOL} clumps=${clumpsList.length} — bite(clump) FIRST (condense refused)`,
+      )
+      const rest = suggested_ops.filter((o) => o !== 'bite' && o !== 'condense')
+      suggested_ops.length = 0
+      suggested_ops.push('bite', ...rest)
+    } else if (!suggested_ops.includes('bite')) {
+      suggested_ops.unshift('bite')
+    }
     urgency = Math.max(urgency, 25)
   }
   urgency = clamp(urgency, 0, 100)
@@ -1209,12 +1285,42 @@ function applyOne(
     reject(state, receipt, bot, idx, 'BUDGET_EXCEEDED', `need ${cost}, budget left ${budgetLeft.n}`)
     return
   }
-  if (bot.energy_pool + 1e-9 < cost && op !== 'digest') {
-    // digest can run with low pool (costs little); still check
-    if (bot.energy_pool + 1e-9 < cost) {
-      reject(state, receipt, bot, idx, 'NO_ENERGY', `pool ${bot.energy_pool} < cost ${cost}`)
-      return
-    }
+  // Hunger knife: refuse condense before generic NO_ENERGY so code is STARVING not NO_ENERGY.
+  if (op === 'condense' && bot.energy_pool + 1e-9 < CONDENSE_STARVING_POOL) {
+    const preStarv = evaluateCondensePrereqs(state, bot)
+    pushEvent(state, 'condense_fail', {
+      actor: bot.actorId,
+      reason: preStarv.prereq_reason,
+      refuse_starving: true,
+      pool: bot.energy_pool,
+      starving_floor: CONDENSE_STARVING_POOL,
+      waste_heat: state.waste_heat,
+    })
+    reject(
+      state,
+      receipt,
+      bot,
+      idx,
+      'REFUSED_CONDENSE_STARVING',
+      preStarv.prereq_reason || `pool < ${CONDENSE_STARVING_POOL}`,
+      {
+        pool: bot.energy_pool,
+        starving_floor: CONDENSE_STARVING_POOL,
+        allowed: 'bite(clump) / digest / revive / move',
+      },
+    )
+    return
+  }
+  // Hungry bite(clump): cost may be paid from clump energy (see bite case).
+  const hungryClumpBite =
+    op === 'bite' &&
+    Boolean(action.target_id) &&
+    state.organics.some(
+      (o) => o.id === action.target_id && o.kind === 'clump' && o.energy_locked > 0.01,
+    )
+  if (bot.energy_pool + 1e-9 < cost && op !== 'digest' && !hungryClumpBite) {
+    reject(state, receipt, bot, idx, 'NO_ENERGY', `pool ${bot.energy_pool} < cost ${cost}`)
+    return
   }
 
 
@@ -1619,21 +1725,51 @@ function applyOne(
         yieldCap = Math.round(yieldCap * CLUMP_BITE_YIELD_MUL * 1000) / 1000
         wasteFrac = CLUMP_BITE_WASTE_FRAC
       }
-      if (!spend(bot, biteCost)) {
-        reject(state, receipt, bot, idx, 'NO_ENERGY', 'pool empty')
-        return
+      const hungryFromClump =
+        org.kind === 'clump' && bot.energy_pool + 1e-9 < biteCost
+      let chunk = 0
+      let toStomach = 0
+      let toWasteChunk = 0
+      let paidFromClump = 0
+      if (hungryFromClump) {
+        // Hunger knife: pay bite cost from clump; stomach = chunk − cost (no pool spend).
+        chunk = Math.min(yieldCap, org.energy_locked)
+        if (chunk + 1e-9 < biteCost) {
+          reject(
+            state,
+            receipt,
+            bot,
+            idx,
+            'NO_ENERGY',
+            `hungry clump bite needs locked≥cost ${biteCost}, have ${chunk}`,
+            { organic: org.id, locked: org.energy_locked, cost: biteCost },
+          )
+          return
+        }
+        paidFromClump = biteCost
+        toStomach = Math.round((chunk - biteCost) * 1000) / 1000
+        toWasteChunk = 0
+        org.energy_locked = Math.round((org.energy_locked - chunk) * 1000) / 1000
+        bot.stomach = Math.round((bot.stomach + toStomach) * 1000) / 1000
+        // Action cost → waste_heat (paid from clump, not pool)
+        state.waste_heat = Math.round((state.waste_heat + biteCost) * 1000) / 1000
+      } else {
+        if (!spend(bot, biteCost)) {
+          reject(state, receipt, bot, idx, 'NO_ENERGY', 'pool empty')
+          return
+        }
+        chunk = Math.min(yieldCap, org.energy_locked)
+        toStomach = Math.round(chunk * (1 - wasteFrac) * 1000) / 1000
+        toWasteChunk = Math.round((chunk - toStomach) * 1000) / 1000
+        org.energy_locked = Math.round((org.energy_locked - chunk) * 1000) / 1000
+        bot.stomach = Math.round((bot.stomach + toStomach) * 1000) / 1000
+        state.waste_heat = Math.round((state.waste_heat + biteCost + toWasteChunk) * 1000) / 1000
       }
-      const chunk = Math.min(yieldCap, org.energy_locked)
-      const toStomach = Math.round(chunk * (1 - wasteFrac) * 1000) / 1000
-      const toWasteChunk = Math.round((chunk - toStomach) * 1000) / 1000
-      org.energy_locked = Math.round((org.energy_locked - chunk) * 1000) / 1000
-      bot.stomach = Math.round((bot.stomach + toStomach) * 1000) / 1000
       if (coreDmg > 0) {
         bot.core_integrity = Math.max(CORE_DEATH, Math.round((bot.core_integrity - coreDmg) * 1000) / 1000)
       }
       budgetLeft.n -= biteCost
       receipt.energy_spent += biteCost
-      state.waste_heat = Math.round((state.waste_heat + biteCost + toWasteChunk) * 1000) / 1000
       receipt.accepted.push(idx)
       bumpBiteStreak(bot, org.id)
       pushEvent(state, 'bite', {
@@ -1646,6 +1782,7 @@ function applyOne(
         remaining: org.energy_locked,
         streak: bot.biteStreak,
         cost: biteCost,
+        ...(hungryFromClump ? { paid_from_clump: paidFromClump, hungry_clump_bite: true } : {}),
         ...(coreDmg ? { core_damage: coreDmg, core_integrity: bot.core_integrity } : {}),
       })
       if (org.energy_locked <= 0.01 && org.kind !== 'corpse') {
@@ -1781,6 +1918,30 @@ function applyOne(
     }
     case 'condense': {
       const pre = evaluateCondensePrereqs(state, bot)
+      if (pre.refuse_starving) {
+        pushEvent(state, 'condense_fail', {
+          actor: bot.actorId,
+          reason: pre.prereq_reason,
+          refuse_starving: true,
+          pool: bot.energy_pool,
+          starving_floor: CONDENSE_STARVING_POOL,
+          waste_heat: state.waste_heat,
+        })
+        reject(
+          state,
+          receipt,
+          bot,
+          idx,
+          'REFUSED_CONDENSE_STARVING',
+          pre.prereq_reason || `pool < ${CONDENSE_STARVING_POOL}`,
+          {
+            pool: bot.energy_pool,
+            starving_floor: CONDENSE_STARVING_POOL,
+            allowed: 'bite(clump) / digest / revive / move',
+          },
+        )
+        return
+      }
       if (!pre.prereq_ok) {
         noteCondenseFail(state, bot)
         pushEvent(state, 'condense_fail', {
@@ -1788,6 +1949,7 @@ function applyOne(
           reason: pre.prereq_reason,
           refuse_mix: pre.refuse_mix,
           refuse_cooldown: pre.refuse_cooldown,
+          refuse_starving: pre.refuse_starving,
           missing: pre.missing,
           waste_heat: state.waste_heat,
           local_yin: pre.local_yin,
