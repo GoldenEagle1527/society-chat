@@ -67,6 +67,8 @@ export const MICRO_REWARD_WAIT_STEADY = 0
 export const REVIVE_RANGE = INTERACT_RADIUS + 1
 /** Unrevived corpse: locked energy slowly bleeds to waste_heat (conservation). */
 export const CORPSE_LOCK_LEAK = 0.08
+/** After this many ticks without revive, harden corpse alerts. */
+export const CORPSE_NEGLECT_HARDEN_TICKS = 4
 /** Reject codes that emit a world event (design telemetry; avoid flood). */
 const TELEMETRY_REJECT_CODES: ReadonlySet<ActRejectCode> = new Set(['REFUSED_SATIATED'])
 
@@ -348,16 +350,6 @@ function rememberPull(bot: BotBody, particleId: string, from: Vec2, to: Vec2): v
   bot.lastPullTo = { ...to }
 }
 
-function dyingNear(state: WorldState, bot: BotBody, radius: number): boolean {
-  return state.bots.some(
-    (b) =>
-      b.alive &&
-      b.actorId !== bot.actorId &&
-      (b.starveTicks >= 3 || b.core_integrity < 0.35 || b.energy_pool < 1) &&
-      dist(bot.pos, b.pos) <= radius,
-  )
-}
-
 function listSaviors(state: WorldState, corpsePos: Vec2): ObserveSavior[] {
   const cost = ACTION_COST.revive
   const out: ObserveSavior[] = []
@@ -514,6 +506,9 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       const in_range = d <= REVIVE_RANGE + 1e-9
       const self_can_afford = bot.energy_pool + 1e-9 >= reviveCost
       const saviors = listSaviors(state, o.pos)
+      const diedAt = typeof o.diedAtTick === 'number' ? o.diedAtTick : state.tick
+      const ticks_unrevived = Math.max(0, state.tick - diedAt)
+      const neglect_hardened = ticks_unrevived >= CORPSE_NEGLECT_HARDEN_TICKS
       const ticksLeftRough =
         o.energy_locked > 0 ? Math.ceil(o.energy_locked / CORPSE_LOCK_LEAK) : 0
       const inaction_cost =
@@ -532,6 +527,8 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
         self_can_revive_now: in_range && self_can_afford && bot.alive,
         saviors,
         inaction_cost,
+        ticks_unrevived,
+        neglect_hardened,
       }
     })
 
@@ -557,13 +554,24 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     const whoAfford = c.saviors
       .filter((s) => s.can_afford)
       .map((s) => `${s.actor_id}(pool=${s.energy_pool})`)
+    const whoShould = (
+      whoNow.length
+        ? whoNow
+        : c.saviors.filter((s) => s.can_afford).map((s) => s.actor_id)
+    ).slice(0, 4)
     const saviorHint =
       whoNow.length > 0
         ? `can_revive_now=[${whoNow.join(',')}]`
         : `need_pool≥${c.revive_cost} or move_in_range; afford=[${whoAfford.join(',') || 'none'}]`
-    alerts.push(
-      `CORPSE ${c.corpse_of} id=${c.organic_id} @(${c.pos.x},${c.pos.y}) locked=${c.energy_locked} revive_cost=${c.revive_cost} dist=${c.dist} in_range=${c.in_range} self_afford=${c.self_can_afford} self_now=${c.self_can_revive_now} | ${saviorHint} | WAIT_COST: ${c.inaction_cost}`,
-    )
+    const base =
+      `CORPSE ${c.corpse_of} id=${c.organic_id} @(${c.pos.x},${c.pos.y}) locked=${c.energy_locked} revive_cost=${c.revive_cost} unrevived=${c.ticks_unrevived}t dist=${c.dist} in_range=${c.in_range} self_afford=${c.self_can_afford} self_now=${c.self_can_revive_now} | ${saviorHint} | WAIT_COST: ${c.inaction_cost}`
+    alerts.push(base)
+    if (c.neglect_hardened) {
+      const named = whoShould.length ? whoShould.join(',') : 'anyone_with_pool'
+      alerts.unshift(
+        `REVIVE_NEGLECT ${c.corpse_of} unrevived=${c.ticks_unrevived}t≥${CORPSE_NEGLECT_HARDEN_TICKS} — MUST revive: who=[${named}] cost=${c.revive_cost} else locked→waste + companion stays dead`,
+      )
+    }
   }
   for (const d of dying) {
     alerts.push(
@@ -587,6 +595,10 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     suggested_ops.push('revive') // path then revive
   } else if (corpses.length) {
     urgency += 35
+  }
+  if (corpses.some((c) => c.neglect_hardened)) {
+    urgency = Math.min(100, urgency + 25)
+    if (!suggested_ops.includes('revive')) suggested_ops.unshift('revive')
   }
   if (dying.length) {
     urgency += 25
@@ -709,16 +721,17 @@ function applyOne(
       state.waste_heat = Math.round((state.waste_heat + cost) * 1000) / 1000
       receipt.accepted.push(idx)
       resetBiteStreak(bot)
-      const nearCrisis = corpseNear(state, bot, VIEW_RADIUS) || dyingNear(state, bot, VIEW_RADIUS)
+      // wait_neglect ONLY when a corpse is in view — dying-alone must not spam
+      const nearCorpse = corpseNear(state, bot, VIEW_RADIUS)
       pushEvent(state, 'wait', {
         actor: bot.actorId,
-        neglect: nearCrisis || undefined,
+        neglect: nearCorpse || undefined,
       })
       // wait never pays micro_reward (wait_steady cancelled — no lying-flat income)
-      if (nearCrisis) {
+      if (nearCorpse) {
         pushEvent(state, 'wait_neglect', {
           actor: bot.actorId,
-          msg: 'wait near corpse/dying — no micro_reward; prefer revive',
+          msg: 'wait near corpse — no micro_reward; prefer revive',
         })
       }
       return
@@ -1200,6 +1213,7 @@ function killBot(state: WorldState, bot: BotBody, reason: string): void {
     pos: { ...bot.pos },
     energy_locked: locked,
     corpseOf: bot.actorId,
+    diedAtTick: state.tick,
     radius: 1,
   }
   state.organics.push(corpse)
@@ -1304,7 +1318,7 @@ export function formatEventLine(ev: WorldEvent): string {
     case 'micro_reward':
       return `[世界 t=${ev.t}] ${p.actor} 微操回收 +${p.amount}（${p.reason}，废热余 ${p.waste_heat_left}）`
     case 'wait_neglect':
-      return `[世界 t=${ev.t}] ${p.actor} 在尸体/濒死旁干等（无微操奖励）— 应 revive`
+      return `[世界 t=${ev.t}] ${p.actor} 在尸体旁干等（无微操奖励）— 应 revive`
     case 'pull_oscillation':
       return `[世界 t=${ev.t}] ${p.actor} 来回拉同一粒子（无 micro_reward）`
     case 'corpse_leak':

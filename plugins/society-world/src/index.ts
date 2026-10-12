@@ -179,12 +179,18 @@ export class SocietyWorldService extends Service {
         lines.push('【尸体警报 — 立刻评估 revive】')
         for (const c of snap.corpses) {
           const now = c.saviors?.filter((s) => s.can_revive_now).map((s) => s.actor_id) || []
+          const hard = c.neglect_hardened ? ' ⚠REVIVE_NEGLECT' : ''
           lines.push(
-            `- ${c.corpse_of} ${c.organic_id} @(${c.pos.x},${c.pos.y}) 锁能=${c.energy_locked} 成本=${c.revive_cost} dist=${c.dist} in_range=${c.in_range} 我能付=${c.self_can_afford} 我现在能救=${c.self_can_revive_now} 可立即救=[${now.join(',') || '无'}]`,
+            `- ${c.corpse_of} ${c.organic_id} @(${c.pos.x},${c.pos.y}) 锁能=${c.energy_locked} 成本=${c.revive_cost} 未救=${c.ticks_unrevived}t${hard} dist=${c.dist} in_range=${c.in_range} 我能付=${c.self_can_afford} 我现在能救=${c.self_can_revive_now} 可立即救=[${now.join(',') || '无'}]`,
           )
           lines.push(`  干等代价：${c.inaction_cost}`)
+          if (c.neglect_hardened) {
+            lines.push(
+              `  → 已拖延≥数 tick：点名可救者立即 revive（成本 ${c.revive_cost}），否则锁能变废热、同伴永死。`,
+            )
+          }
         }
-        lines.push('有尸体时 wait 无 micro_reward（wait_neglect）；锁能每 tick 渗漏到废热。')
+        lines.push('有尸体时 wait → wait_neglect（无 micro_reward）；无尸体时 wait 不发 wait_neglect。锁能每 tick 渗漏到废热。')
       }
       if (snap.dying?.length) {
         lines.push('【濒死同伴】')

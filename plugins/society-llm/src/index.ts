@@ -255,22 +255,18 @@ export class SocietyLlmService extends Service {
   }
 
   /**
-   * World synced-turn routing: Agnes/GLM stay; SiliconFlow remapped to flash
-   * (XingChen is too slow/unstable for 20–30s world deadlines).
+   * World synced-turn routing: always prefer GLM flash for observe/act.
+   * Agnes stays on chat/plaza only (free-tier 429 kills world attendance).
+   * SiliconFlow/XingChen likewise remapped — too slow for 20–30s deadlines.
    */
   resolveWorldTurnConfig(agentId: AgentId): LlmEndpointConfig {
     const prefer = this.resolveConfig(agentId)
-    if (prefer.provider !== 'siliconflow') return prefer
-    // Prefer GLM for remapped SiliconFlow — Agnes free tier 429s when both
-    // native Agnes + remapped SF hit it in parallel every turn.
+    if (prefer.provider === 'glm') return prefer
     try {
       return requireGlmConfig()
     } catch {
-      try {
-        return requireAgnesConfig()
-      } catch {
-        return prefer
-      }
+      // Last resort: keep preferred endpoint if GLM key missing
+      return prefer
     }
   }
 

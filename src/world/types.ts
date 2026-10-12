@@ -36,6 +36,8 @@ export interface Organic {
   energy_locked: number
   /** Corpse of this bot id when kind=corpse. */
   corpseOf?: string
+  /** World tick when this corpse was created (kind=corpse). */
+  diedAtTick?: number
   /** Approx radius for adjacency (fruit is large). */
   radius: number
 }
@@ -143,6 +145,10 @@ export interface ObserveCorpseAlert {
   saviors: ObserveSavior[]
   /** What waiting costs (locked stuck + leak). */
   inaction_cost: string
+  /** Ticks since death (state.tick - diedAtTick). */
+  ticks_unrevived: number
+  /** True when unrevived long enough for hardened alerts. */
+  neglect_hardened: boolean
 }
 
 export interface ObserveDyingAlert {

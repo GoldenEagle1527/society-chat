@@ -242,6 +242,24 @@ function main(): void {
   )
   console.log('✓ wait unpaid everywhere (no wait_steady)')
 
+  // wait near a low-pool living bot (no corpse) must NOT emit wait_neglect
+  {
+    const victim = state.bots.find((b) => b.actorId === 'glm')!
+    victim.alive = true
+    victim.energy_pool = 0.2
+    victim.starveTicks = 5
+    victim.pos = { x: bot.pos.x + 1, y: bot.pos.y }
+    // ensure no corpse in view
+    state.organics = state.organics.filter((o) => o.kind !== 'corpse')
+    const evD = state.events.length
+    act(state, { actor_id: 'agnes', budget_energy: 2, actions: [{ op: 'wait' }] })
+    assert.ok(
+      !state.events.slice(evD).some((e) => e.type === 'wait_neglect'),
+      'wait_neglect must NOT fire without corpse',
+    )
+    console.log('✓ wait_neglect only near corpse (dying alone ignored)')
+  }
+
   // spam pull far from others unpaid (isolate particle)
   const loner = state.particles.find((p) => !p.boundTo && p.id !== freeP!.id) || state.particles.find((p) => !p.boundTo)
   if (loner) {
