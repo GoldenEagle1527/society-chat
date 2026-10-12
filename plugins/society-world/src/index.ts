@@ -153,7 +153,8 @@ export class SocietyWorldService extends Service {
         formatSnapshotLine(snap),
         '生存只看 energy_pool / core_integrity（不是心情）。能池空会饿死；死亡由引擎裁定。',
         '工具：world_observe 读邻域；world_act 提交微操（nudge/pull/adsorb/catalyze/bite/digest/wait/revive）。',
-        '聊天是外壳；活下去靠微操粒子与硕果。探测笔记可记假设/错误码，闲聊默认不进长期记忆。',
+        '引擎立法：能池≥餍足阈值时咬果 → REFUSED_SATIATED；同目标连啃成本升、收益降。刚好够优于囤满。',
+        '能池够用时默认试探假说/挪粒子/复活同伴；咬果仅濒饿。聊天是外壳；探测笔记可记假设/错误码。',
       ]
       if (snap.events_recent.length) {
         lines.push('近期世界事件：')

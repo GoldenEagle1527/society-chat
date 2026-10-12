@@ -195,7 +195,7 @@ const WORLD_TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: 'world_act',
       description:
-        'Submit micro-ops to the physics engine (closing act). actions: nudge|pull|adsorb|catalyze|bite|digest|wait|revive with optional target_id/dir/mag. budget_energy caps spent from energy_pool. Survival only via energy_pool/core_integrity.',
+        'Submit micro-ops to the physics engine (closing act). actions: nudge|pull|adsorb|catalyze|bite|digest|wait|revive with optional target_id/dir/mag. budget_energy caps spent from energy_pool. Fruit bite refused (REFUSED_SATIATED) when energy_pool is comfortable; consecutive same-target bites cost more / yield less. Prefer probe/nudge/revive when not starving.',
       parameters: {
         type: 'object',
         properties: {

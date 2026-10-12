@@ -11,6 +11,7 @@ export type ActRejectCode =
   | 'TARGET_GONE'
   | 'ILLEGAL_OP'
   | 'BUDGET_EXCEEDED'
+  | 'REFUSED_SATIATED'
 
 export interface Vec2 {
   x: number
@@ -52,6 +53,10 @@ export interface BotBody {
   alive: boolean
   /** Starve counter: ticks with empty pool. */
   starveTicks: number
+  /** Consecutive successful bites on the same organic (diminishing returns). */
+  biteStreak: number
+  /** Organic id of the current bite streak; cleared on other ops / other targets. */
+  biteStreakTargetId?: string
   last_errors: Array<{ code: ActRejectCode; msg: string; at: string }>
 }
 
@@ -83,6 +88,11 @@ export interface ObserveSelf {
   bound_particle_ids: string[]
   stomach?: number
   alive?: boolean
+  /** Consecutive bites on same organic; 0 if last success was not a bite. */
+  bite_streak?: number
+  bite_streak_target_id?: string
+  /** Hard reject fruit bite when energy_pool >= this. */
+  satiety_threshold?: number
 }
 
 export interface ObserveParticle {

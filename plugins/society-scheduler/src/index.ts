@@ -1283,7 +1283,7 @@ export class SocietySchedulerService extends Service {
         formatBeijingNow(),
         '【阴阳场心跳】没有未读。你是场中控制器，聊天只是外壳。',
         worldLine,
-        '优先：world_observe 看邻域，再用 world_act 微操（靠近硕果 bite/digest，或 nudge/wait）。',
+        '优先：world_observe 看邻域，再用 world_act。能池够用 → 试探/nudge/复活；濒饿才 bite/digest。连啃硕果会被引擎餍足拒绝。',
         '能池尚可时也可 speak_in_room 短聊；不要日记人格循环。',
         closingList,
         recent ? `广场近况：\n${recent}` : '广场安静——生存优先于寒暄。',

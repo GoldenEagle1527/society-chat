@@ -37,6 +37,12 @@ export const ACTION_COST: Record<WorldOp, number> = {
 }
 export const STARVE_TICKS_TO_DIE = 8
 export const CORE_DEATH = 0.05
+/** Hard-reject fruit `bite` when energy_pool >= this (「刚好够」> hoarding). */
+export const SATIETY_THRESHOLD = 10
+/** Extra bite cost per consecutive same-target bite after the first. */
+export const BITE_STREAK_COST_STEP = 1.5
+/** Yield loss per consecutive same-target bite (floors at 25% of BITE_CHUNK). */
+export const BITE_STREAK_YIELD_STEP = 0.2
 
 const DIRS: Record<string, Vec2> = {
   n: { x: 0, y: -1 },
@@ -140,6 +146,52 @@ function recordError(bot: BotBody, code: ActRejectCode, msg: string): void {
   if (bot.last_errors.length > 8) bot.last_errors.length = 8
 }
 
+function ensureBiteFields(bot: BotBody): void {
+  if (typeof bot.biteStreak !== 'number' || Number.isNaN(bot.biteStreak)) bot.biteStreak = 0
+}
+
+/** Effective bite cost given prior consecutive bites on the same target. */
+export function biteCostForStreak(priorStreak: number): number {
+  const s = Math.max(0, Math.floor(priorStreak))
+  return Math.round((ACTION_COST.bite + s * BITE_STREAK_COST_STEP) * 1000) / 1000
+}
+
+/** Bite chunk yield given prior consecutive bites on the same target. */
+export function biteYieldForStreak(priorStreak: number): number {
+  const s = Math.max(0, Math.floor(priorStreak))
+  const mul = Math.max(0.25, 1 - s * BITE_STREAK_YIELD_STEP)
+  return Math.round(BITE_CHUNK * mul * 1000) / 1000
+}
+
+function resetBiteStreak(bot: BotBody): void {
+  ensureBiteFields(bot)
+  bot.biteStreak = 0
+  delete bot.biteStreakTargetId
+}
+
+function bumpBiteStreak(bot: BotBody, targetId: string): void {
+  ensureBiteFields(bot)
+  if (bot.biteStreakTargetId === targetId) {
+    bot.biteStreak += 1
+  } else {
+    bot.biteStreakTargetId = targetId
+    bot.biteStreak = 1
+  }
+}
+
+/**
+ * Stub hook for conserved micro-rewards on first useful probe
+ * (steady config / megamorph / hypothesis note). No-op this commit;
+ * when implemented, move energy from fruit lock or waste_heat — never mint.
+ */
+export function maybeGrantProbeReward(
+  _state: WorldState,
+  _bot: BotBody,
+  _kind: 'steady_config' | 'megamorph' | 'hypothesis',
+): void {
+  // reserved
+}
+
 /** Seed a fresh world with a big fruit and cast bots near it. */
 export function createSeedWorld(actorIds: string[]): WorldState {
   const width = WORLD_WIDTH
@@ -213,6 +265,7 @@ export function createSeedWorld(actorIds: string[]): WorldState {
       stomach: 0,
       alive: true,
       starveTicks: 0,
+      biteStreak: 0,
       last_errors: [],
     })
   })
@@ -272,6 +325,9 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       bound_particle_ids: [...bot.bound_particle_ids],
       stomach: bot.stomach,
       alive: bot.alive,
+      bite_streak: bot.biteStreak ?? 0,
+      ...(bot.biteStreakTargetId ? { bite_streak_target_id: bot.biteStreakTargetId } : {}),
+      satiety_threshold: SATIETY_THRESHOLD,
     },
     view: { radius, particles },
     organics,
@@ -303,12 +359,19 @@ function applyOne(
     reject(receipt, bot, idx, 'ILLEGAL_OP', 'bot is dead (corpse); needs revive')
     return
   }
+  ensureBiteFields(bot)
   const op = action.op
   if (!op || !(op in ACTION_COST)) {
     reject(receipt, bot, idx, 'ILLEGAL_OP', `unknown op: ${String(op)}`)
     return
   }
-  const cost = ACTION_COST[op]
+  // Precompute bite cost from streak (before budget/energy gates)
+  let cost = ACTION_COST[op]
+  if (op === 'bite' && action.target_id) {
+    const prior =
+      bot.biteStreakTargetId === action.target_id ? bot.biteStreak : 0
+    cost = biteCostForStreak(prior)
+  }
   if (budgetLeft.n + 1e-9 < cost) {
     reject(receipt, bot, idx, 'BUDGET_EXCEEDED', `need ${cost}, budget left ${budgetLeft.n}`)
     return
@@ -331,6 +394,7 @@ function applyOne(
       receipt.energy_spent += cost
       state.waste_heat = Math.round((state.waste_heat + cost) * 1000) / 1000
       receipt.accepted.push(idx)
+      resetBiteStreak(bot)
       pushEvent(state, 'wait', { actor: bot.actorId })
       return
     }
@@ -375,6 +439,7 @@ function applyOne(
       receipt.energy_spent += cost
       state.waste_heat = Math.round((state.waste_heat + cost) * 1000) / 1000
       receipt.accepted.push(idx)
+      resetBiteStreak(bot)
       pushEvent(state, op, { actor: bot.actorId, particle: target.id, to: next })
       return
     }
@@ -403,6 +468,7 @@ function applyOne(
       receipt.energy_spent += cost
       state.waste_heat = Math.round((state.waste_heat + cost) * 1000) / 1000
       receipt.accepted.push(idx)
+      resetBiteStreak(bot)
       pushEvent(state, 'adsorb', { actor: bot.actorId, particle: target.id })
       return
     }
@@ -425,6 +491,7 @@ function applyOne(
       receipt.energy_spent += cost
       state.waste_heat = Math.round((state.waste_heat + cost) * 1000) / 1000
       receipt.accepted.push(idx)
+      resetBiteStreak(bot)
       pushEvent(state, 'catalyze', { actor: bot.actorId, particle: target.id, bond: target.bond })
       return
     }
@@ -438,23 +505,41 @@ function applyOne(
         reject(receipt, bot, idx, 'NOT_ADJACENT', 'not close enough to bite')
         return
       }
-      if (!spend(bot, cost)) {
+      // Engine-side satiety: fruit bite hard-refused when pool already comfortable
+      if (org.kind === 'fruit' && bot.energy_pool >= SATIETY_THRESHOLD) {
+        reject(
+          receipt,
+          bot,
+          idx,
+          'REFUSED_SATIATED',
+          `energy_pool ${bot.energy_pool} >= satiety ${SATIETY_THRESHOLD}; probe/nudge/revive instead of hoarding fruit`,
+        )
+        return
+      }
+      const priorStreak = bot.biteStreakTargetId === org.id ? bot.biteStreak : 0
+      // cost already computed above via biteCostForStreak; reaffirm for events
+      const biteCost = cost
+      const yieldCap = biteYieldForStreak(priorStreak)
+      if (!spend(bot, biteCost)) {
         reject(receipt, bot, idx, 'NO_ENERGY', 'pool empty')
         return
       }
-      const chunk = Math.min(BITE_CHUNK, org.energy_locked)
+      const chunk = Math.min(yieldCap, org.energy_locked)
       org.energy_locked = Math.round((org.energy_locked - chunk) * 1000) / 1000
       bot.stomach = Math.round((bot.stomach + chunk) * 1000) / 1000
-      budgetLeft.n -= cost
-      receipt.energy_spent += cost
-      state.waste_heat = Math.round((state.waste_heat + cost) * 1000) / 1000
+      budgetLeft.n -= biteCost
+      receipt.energy_spent += biteCost
+      state.waste_heat = Math.round((state.waste_heat + biteCost) * 1000) / 1000
       receipt.accepted.push(idx)
+      bumpBiteStreak(bot, org.id)
       pushEvent(state, 'bite', {
         actor: bot.actorId,
         organic: org.id,
         kind: org.kind,
         chunk,
         remaining: org.energy_locked,
+        streak: bot.biteStreak,
+        cost: biteCost,
       })
       if (org.energy_locked <= 0.01 && org.kind !== 'corpse') {
         state.organics = state.organics.filter((o) => o.id !== org.id)
@@ -485,6 +570,7 @@ function applyOne(
       budgetLeft.n -= cost
       receipt.energy_spent += cost
       receipt.accepted.push(idx)
+      resetBiteStreak(bot)
       pushEvent(state, 'digest', { actor: bot.actorId, toPool, toHeat })
       return
     }
@@ -523,6 +609,7 @@ function applyOne(
       receipt.energy_spent += cost
       state.waste_heat = Math.round((state.waste_heat + cost) * 1000) / 1000
       receipt.accepted.push(idx)
+      resetBiteStreak(bot)
       pushEvent(state, 'revive', { actor: bot.actorId, revived: dead.actorId })
       return
     }
@@ -659,6 +746,8 @@ export function stepPhysics(state: WorldState): WorldEvent[] {
     // Remaining KE as tiny heat for conservation bookkeeping
     state.waste_heat = Math.round((state.waste_heat + ke * 0.7) * 1000) / 1000
     pushEvent(state, 'megamorph', { at: clump.pos, clump: clump.id, ke })
+    // Probe-reward hook: no single actor owns megamorph; callers may
+    // maybeGrantProbeReward(state, bot, 'megamorph') after attributing credit.
   }
 
   // Metabolism / starve
@@ -787,7 +876,7 @@ export function formatEventLine(ev: WorldEvent): string {
   const p = ev.payload
   switch (ev.type) {
     case 'bite':
-      return `[世界 t=${ev.t}] ${p.actor} 啃了 ${p.kind}（+${p.chunk} 入胃，剩余 ${p.remaining}）`
+      return `[世界 t=${ev.t}] ${p.actor} 啃了 ${p.kind}（+${p.chunk} 入胃，剩余 ${p.remaining}${p.streak != null ? `，连啃×${p.streak}` : ''}）`
     case 'digest':
       return `[世界 t=${ev.t}] ${p.actor} 消化：能池+${p.toPool}，废热+${p.toHeat}`
     case 'death':

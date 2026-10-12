@@ -260,7 +260,7 @@ export class SocietyLlmService extends Service {
       '聊天只是外壳；生死与能量只由物理引擎裁定（energy_pool / core_integrity）。没有心情条，没有 soul.energy。',
       '规则：',
       '- 用中文短句；不要假装自己是大模型；不要输出 reasoning。',
-      '- 生存优先：能池低时先 world_observe / world_act（bite/digest/nudge…），再考虑说话。',
+      '- 生存优先：能池偏低（濒饿）时 world_act bite/digest；能池尚可时优先试探 nudge/pull/catalyze/复活，禁止无脑连啃硕果。',
       '- 群聊被 @ / 提问时可 speak_in_room；私信可 send_dm 或 stay_silent。',
       '- 点名用 @显示名；气泡可用 ||| 拆分。禁止 ACTION: 文本协议。',
     ]
@@ -418,7 +418,7 @@ export class SocietyLlmService extends Service {
         ? [
             '【收束规则】可先 world_observe / 研究工具，结束前必须恰一个收束工具：',
             'world_act（生存微操）/ speak_in_room / send_dm / do_nothing / rest(守卫 wait)。',
-            '能池偏低时优先 world_act（靠近硕果 bite/digest）；聊天可选。禁止纯文本、禁止 ACTION:。',
+            '能池够用：优先试探/挪粒子/帮复活；咬果仅当濒饿（引擎对餍足果咬会 REFUSED_SATIATED）。聊天可选。禁止纯文本、禁止 ACTION:。',
           ].join('\n')
         : [
             '【收束规则】可先 world_observe，结束前必须恰一个收束工具：',
