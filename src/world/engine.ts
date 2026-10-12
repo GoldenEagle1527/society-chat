@@ -1059,7 +1059,7 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     }
   }
   // Research sink soft-append: SATIETY stays fruit-bite only; research opens at pool≥6 or stomach≥4
-  // (head-pin only after fruit_gone — see final RESEARCH_READY block; fruit-era stays tail-append)
+  // (head-pin only after fruit_gone AND mix_ok AND !clutter/forage — see final RESEARCH_READY block)
   if (
     !duty &&
     (bot.energy_pool + 1e-9 >= RESEARCH_POOL_THRESHOLD ||
@@ -1199,8 +1199,10 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     urgency = Math.max(urgency, 25)
   }
 
-  // Research threshold sink (no corpse duty): head-pin micro-ops ONLY after fruit_gone.
-  // During fruit era: append research to suggested_ops TAIL (soft; never unshift ahead of bite/digest).
+  // Research threshold sink (no corpse duty):
+  // - fruit era: tail-append only (never ahead of bite/digest)
+  // - fruit_gone + (!mix_ok OR clump forage OR clutter): tail-append only — prep/bite keep head
+  // - fruit_gone + mix_ok + !refuse_clutter + no forage pressure: research may head-pin
   // SATIETY_THRESHOLD remains fruit-bite only. REFUSED_CATALYZE_MAXED stays global.
   if (
     !duty &&
@@ -1210,9 +1212,16 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     urgency = Math.max(urgency, 26)
     const research = researchMicroOps(state, bot)
     const researchLabel = research.join('/')
-    if (fruit_gone) {
+    const needClumpBite =
+      clumpsList.length > 0 && bot.energy_pool < CLUMP_FORAGE_POOL_THRESHOLD
+    const allowResearchHead =
+      fruit_gone &&
+      condenseInfo.mix_ok &&
+      !condenseInfo.refuse_clutter &&
+      !needClumpBite
+    if (allowResearchHead) {
       alerts.unshift(
-        `RESEARCH_READY fruit_gone — head-pin ${researchLabel} (pool≥${RESEARCH_POOL_THRESHOLD}/stomach≥${RESEARCH_STOMACH_THRESHOLD}; satiety ${SATIETY_THRESHOLD}=fruit-bite only; catalyze iff bond<1 in view)`,
+        `RESEARCH_READY fruit_gone mix_ok — head-pin ${researchLabel} (pool≥${RESEARCH_POOL_THRESHOLD}/stomach≥${RESEARCH_STOMACH_THRESHOLD}; satiety ${SATIETY_THRESHOLD}=fruit-bite only; catalyze iff bond<1 in view)`,
       )
       const head: WorldOp[] = []
       // Starving forage still wins over research
@@ -1231,6 +1240,19 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       if (bot.stomach >= 1 && !suggested_ops.includes('digest')) suggested_ops.push('digest')
       for (const o of rest) {
         if (!suggested_ops.includes(o)) suggested_ops.push(o)
+      }
+    } else if (fruit_gone) {
+      // 齐窗未成 / clutter / clump forage — research below mix-prep; do not overwrite prep head
+      const why = !condenseInfo.mix_ok
+        ? 'mix_incomplete'
+        : needClumpBite
+          ? 'clump_forage'
+          : 'clutter'
+      alerts.unshift(
+        `RESEARCH_READY fruit_gone ${why} — tail-append ${researchLabel} (prep/bite keep head; research below mix-prep)`,
+      )
+      for (const op of research) {
+        if (!suggested_ops.includes(op)) suggested_ops.push(op)
       }
     } else {
       // Fruit era: tail-append only — do not rebuild suggested with research at head
