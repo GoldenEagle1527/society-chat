@@ -2,7 +2,7 @@
 
 export type ParticleKind = 'yin' | 'yang'
 export type OrganicKind = 'fruit' | 'corpse' | 'clump'
-export type WorldOp = 'nudge' | 'pull' | 'adsorb' | 'catalyze' | 'bite' | 'digest' | 'wait' | 'revive' | 'move'
+export type WorldOp = 'nudge' | 'pull' | 'adsorb' | 'catalyze' | 'bite' | 'digest' | 'wait' | 'revive' | 'move' | 'condense'
 
 export type ActRejectCode =
   | 'OUT_OF_RANGE'
@@ -186,6 +186,24 @@ export interface ObserveSnapshot {
   action_costs: Record<WorldOp, number>
   revive_cost: number
   satiety_threshold: number
+  /** Global waste_heat ledger (post-fruit foraging feedstock). */
+  waste_heat: number
+  /** True when no fruit remains with energy_locked>0. */
+  fruit_gone: boolean
+  /** Designer hooks for condense prerequisites (M0 basic). */
+  condense: {
+    cost: number
+    efficiency: number
+    min_waste: number
+    draw: number
+    window_radius: number
+    local_yin: number
+    local_yang: number
+    local_particles: number
+    can_afford: boolean
+    prereq_ok: boolean
+    prereq_reason?: string
+  }
   events_recent: WorldEvent[]
   last_errors: BotBody['last_errors']
 }

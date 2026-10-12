@@ -43,6 +43,8 @@ export const ACTION_COST: Record<WorldOp, number> = {
   wait: 0.2,
   revive: 8,
   move: 1,
+  /** Spend pool to rebind waste_heat → small clump (post-fruit). */
+  condense: 2,
 }
 export const STARVE_TICKS_TO_DIE = 8
 export const CORE_DEATH = 0.05
@@ -76,6 +78,20 @@ export const REVIVE_SAFETY_MARGIN = 0
 /** Fraction of corpse locked energy granted to savior / revived (rest → waste). */
 export const REVIVE_SHARE_SAVIOR = 0.35
 export const REVIVE_SHARE_REVIVED = 0.45
+/** Post-fruit condense: waste_heat → clump locked at this efficiency (15–25%). */
+export const CONDENSE_EFFICIENCY = 0.2
+export const CONDENSE_MIN_WASTE = 4
+export const CONDENSE_DRAW = 5
+export const CONDENSE_WINDOW_RADIUS = 2.5
+export const CONDENSE_MIN_YIN = 1
+export const CONDENSE_MIN_YANG = 1
+export const CONDENSE_MIN_PARTICLES = 3
+/** Corpse/clump bite: low yield + high waste (emergency, not riches). */
+export const CORPSE_BITE_YIELD_MUL = 0.35
+export const CORPSE_BITE_WASTE_FRAC = 0.55
+export const CORPSE_BITE_CORE_DAMAGE = 0.02
+export const CLUMP_BITE_YIELD_MUL = 0.55
+export const CLUMP_BITE_WASTE_FRAC = 0.35
 /** Reject codes that emit a world event (design telemetry; avoid flood). */
 const TELEMETRY_REJECT_CODES: ReadonlySet<ActRejectCode> = new Set([
   'REFUSED_SATIATED',
@@ -356,6 +372,81 @@ function reviveDutyCorpse(state: WorldState, bot: BotBody): Organic | null {
   return best
 }
 
+/** Free particles within radius of pos. */
+function localFreeParticles(state: WorldState, at: Vec2, radius: number): Particle[] {
+  return freeParticles(state).filter((p) => dist(p.pos, at) <= radius + 1e-9)
+}
+
+/** M0 condense prerequisites (hooks for designer observe fields). */
+export function evaluateCondensePrereqs(
+  state: WorldState,
+  bot: BotBody,
+): {
+  cost: number
+  efficiency: number
+  min_waste: number
+  draw: number
+  window_radius: number
+  local_yin: number
+  local_yang: number
+  local_particles: number
+  can_afford: boolean
+  prereq_ok: boolean
+  prereq_reason?: string
+} {
+  const cost = ACTION_COST.condense
+  const locals = localFreeParticles(state, bot.pos, CONDENSE_WINDOW_RADIUS)
+  let yin = 0
+  let yang = 0
+  for (const p of locals) {
+    if (p.kind === 'yin') yin++
+    else yang++
+  }
+  const can_afford = bot.energy_pool + 1e-9 >= cost
+  const base = {
+    cost,
+    efficiency: CONDENSE_EFFICIENCY,
+    min_waste: CONDENSE_MIN_WASTE,
+    draw: CONDENSE_DRAW,
+    window_radius: CONDENSE_WINDOW_RADIUS,
+    local_yin: yin,
+    local_yang: yang,
+    local_particles: locals.length,
+    can_afford,
+  }
+  if (!can_afford) {
+    return { ...base, prereq_ok: false, prereq_reason: `pool ${bot.energy_pool} < condense ${cost}` }
+  }
+  if (state.waste_heat + 1e-9 < CONDENSE_MIN_WASTE) {
+    return {
+      ...base,
+      prereq_ok: false,
+      prereq_reason: `waste_heat ${state.waste_heat} < min ${CONDENSE_MIN_WASTE}`,
+    }
+  }
+  if (yin < CONDENSE_MIN_YIN || yang < CONDENSE_MIN_YANG) {
+    return {
+      ...base,
+      prereq_ok: false,
+      prereq_reason: `need yin≥${CONDENSE_MIN_YIN} & yang≥${CONDENSE_MIN_YANG} in r=${CONDENSE_WINDOW_RADIUS} (have yin=${yin} yang=${yang})`,
+    }
+  }
+  if (locals.length < CONDENSE_MIN_PARTICLES) {
+    return {
+      ...base,
+      prereq_ok: false,
+      prereq_reason: `need ≥${CONDENSE_MIN_PARTICLES} free particles nearby (have ${locals.length})`,
+    }
+  }
+  return { ...base, prereq_ok: true }
+}
+
+function fruitPresent(state: WorldState): boolean {
+  return state.organics.some((o) => o.kind === 'fruit' && o.energy_locked > 0.01)
+}
+
+
+
 
 /** True if this relocate reverses the bot's previous pull/nudge on the same particle. */
 export function isPullOscillation(
@@ -612,6 +703,12 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
       `SATIATED pool=${bot.energy_pool}≥${SATIETY_THRESHOLD} — fruit bite REFUSED_SATIATED; prefer revive/probe/config`,
     )
   }
+  const fruit_gone = !fruitPresent(state)
+  if (fruit_gone) {
+    alerts.unshift(
+      `FRUIT_GONE — no living fruit; forage via condense (waste_heat→clump @${CONDENSE_EFFICIENCY * 100}% eff) or emergency corpse/clump bite (low yield, high waste)`,
+    )
+  }
 
   // Urgency + suggested ops: revive pinned when corpse present & affordable
   let urgency = 0
@@ -658,6 +755,18 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     urgency += 40
     suggested_ops.unshift('bite', 'digest')
   }
+  const condenseInfo = evaluateCondensePrereqs(state, bot)
+  if (fruit_gone) {
+    urgency = Math.max(urgency, 35)
+    if (condenseInfo.prereq_ok) {
+      if (!suggested_ops.includes('condense')) suggested_ops.unshift('condense')
+    } else {
+      // Arrange particles then condense
+      for (const op of ['pull', 'nudge', 'adsorb', 'condense'] as WorldOp[]) {
+        if (!suggested_ops.includes(op)) suggested_ops.push(op)
+      }
+    }
+  }
   urgency = clamp(urgency, 0, 100)
 
   const events_recent = state.events.filter((e) => e.t >= state.tick - 5).slice(-12)
@@ -685,6 +794,9 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     action_costs: { ...ACTION_COST },
     revive_cost: reviveCost,
     satiety_threshold: SATIETY_THRESHOLD,
+    waste_heat: state.waste_heat,
+    fruit_gone,
+    condense: condenseInfo,
     events_recent,
     last_errors: [...bot.last_errors],
   }
@@ -1002,19 +1114,34 @@ function applyOne(
         return
       }
       const priorStreak = bot.biteStreakTargetId === org.id ? bot.biteStreak : 0
-      // cost already computed above via biteCostForStreak; reaffirm for events
       const biteCost = cost
-      const yieldCap = biteYieldForStreak(priorStreak)
+      let yieldCap = biteYieldForStreak(priorStreak)
+      let wasteFrac = 0
+      let coreDmg = 0
+      // Post-fruit emergency: corpse/clump bites are low-yield / high-waste
+      if (org.kind === 'corpse') {
+        yieldCap = Math.round(yieldCap * CORPSE_BITE_YIELD_MUL * 1000) / 1000
+        wasteFrac = CORPSE_BITE_WASTE_FRAC
+        coreDmg = CORPSE_BITE_CORE_DAMAGE
+      } else if (org.kind === 'clump') {
+        yieldCap = Math.round(yieldCap * CLUMP_BITE_YIELD_MUL * 1000) / 1000
+        wasteFrac = CLUMP_BITE_WASTE_FRAC
+      }
       if (!spend(bot, biteCost)) {
         reject(state, receipt, bot, idx, 'NO_ENERGY', 'pool empty')
         return
       }
       const chunk = Math.min(yieldCap, org.energy_locked)
+      const toStomach = Math.round(chunk * (1 - wasteFrac) * 1000) / 1000
+      const toWasteChunk = Math.round((chunk - toStomach) * 1000) / 1000
       org.energy_locked = Math.round((org.energy_locked - chunk) * 1000) / 1000
-      bot.stomach = Math.round((bot.stomach + chunk) * 1000) / 1000
+      bot.stomach = Math.round((bot.stomach + toStomach) * 1000) / 1000
+      if (coreDmg > 0) {
+        bot.core_integrity = Math.max(CORE_DEATH, Math.round((bot.core_integrity - coreDmg) * 1000) / 1000)
+      }
       budgetLeft.n -= biteCost
       receipt.energy_spent += biteCost
-      state.waste_heat = Math.round((state.waste_heat + biteCost) * 1000) / 1000
+      state.waste_heat = Math.round((state.waste_heat + biteCost + toWasteChunk) * 1000) / 1000
       receipt.accepted.push(idx)
       bumpBiteStreak(bot, org.id)
       pushEvent(state, 'bite', {
@@ -1022,13 +1149,20 @@ function applyOne(
         organic: org.id,
         kind: org.kind,
         chunk,
+        to_stomach: toStomach,
+        to_waste: toWasteChunk,
         remaining: org.energy_locked,
         streak: bot.biteStreak,
         cost: biteCost,
+        ...(coreDmg ? { core_damage: coreDmg, core_integrity: bot.core_integrity } : {}),
       })
       if (org.energy_locked <= 0.01 && org.kind !== 'corpse') {
         state.organics = state.organics.filter((o) => o.id !== org.id)
-        pushEvent(state, 'organic_gone', { id: org.id, kind: org.kind })
+        pushEvent(state, 'organic_gone', {
+          id: org.id,
+          kind: org.kind,
+          ...(org.kind === 'fruit' ? { fruit_gone: true } : {}),
+        })
       }
       return
     }
@@ -1151,6 +1285,59 @@ function applyOne(
       receipt.accepted.push(idx)
       resetBiteStreak(bot)
       pushEvent(state, 'move', { actor: bot.actorId, to: next })
+      return
+    }
+    case 'condense': {
+      const pre = evaluateCondensePrereqs(state, bot)
+      if (!pre.prereq_ok) {
+        pushEvent(state, 'condense_fail', {
+          actor: bot.actorId,
+          reason: pre.prereq_reason,
+          waste_heat: state.waste_heat,
+          local_yin: pre.local_yin,
+          local_yang: pre.local_yang,
+          local_particles: pre.local_particles,
+        })
+        reject(state, receipt, bot, idx, 'ILLEGAL_OP', pre.prereq_reason || 'condense prereq failed')
+        return
+      }
+      if (!spend(bot, cost)) {
+        pushEvent(state, 'condense_fail', { actor: bot.actorId, reason: 'NO_ENERGY' })
+        reject(state, receipt, bot, idx, 'NO_ENERGY', 'cannot condense')
+        return
+      }
+      // Draw waste_heat; lock only CONDENSE_EFFICIENCY fraction into a small clump
+      const draw = Math.min(CONDENSE_DRAW, state.waste_heat)
+      const locked = Math.round(draw * CONDENSE_EFFICIENCY * 1000) / 1000
+      const stayWaste = Math.round((draw - locked) * 1000) / 1000
+      // Remove `draw` from waste, put `locked` into clump, leave `stayWaste` back in waste
+      // Net: waste loses `locked` only (draw - stayWaste = locked)
+      state.waste_heat = Math.round((state.waste_heat - locked) * 1000) / 1000
+      // Action cost → waste_heat (conservation)
+      state.waste_heat = Math.round((state.waste_heat + cost) * 1000) / 1000
+      const clump: Organic = {
+        id: newId('clump'),
+        kind: 'clump',
+        pos: { ...bot.pos },
+        energy_locked: locked,
+        radius: 1,
+      }
+      state.organics.push(clump)
+      budgetLeft.n -= cost
+      receipt.energy_spent += cost
+      receipt.accepted.push(idx)
+      resetBiteStreak(bot)
+      pushEvent(state, 'condense', {
+        actor: bot.actorId,
+        clump: clump.id,
+        draw,
+        locked,
+        efficiency: CONDENSE_EFFICIENCY,
+        stay_waste: stayWaste,
+        waste_heat_left: state.waste_heat,
+        local_yin: pre.local_yin,
+        local_yang: pre.local_yang,
+      })
       return
     }
     default:
@@ -1466,6 +1653,12 @@ export function formatEventLine(ev: WorldEvent): string {
       return `[世界 t=${ev.t}] ${p.actor} 来回拉同一粒子（无 micro_reward）`
     case 'corpse_leak':
       return `[世界 t=${ev.t}] 尸体 ${p.of || p.corpse} 锁能渗漏 −${p.leak}（余 ${p.locked_left}）→废热`
+    case 'condense':
+      return `[世界 t=${ev.t}] ${p.actor} 冷凝废热→团块 ${p.clump}（抽${p.draw} 锁${p.locked} @${Math.round(Number(p.efficiency) * 100)}%）`
+    case 'condense_fail':
+      return `[世界 t=${ev.t}] ${p.actor} 冷凝失败：${p.reason}`
+    case 'organic_gone':
+      return `[世界 t=${ev.t}] 有机物消失 ${p.kind} ${p.id}${p.fruit_gone ? '（硕果耗尽 FRUIT_GONE）' : ''}`
     default:
       return `[世界 t=${ev.t}] ${ev.type} ${JSON.stringify(p).slice(0, 120)}`
   }

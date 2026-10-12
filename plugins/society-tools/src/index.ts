@@ -196,7 +196,7 @@ const WORLD_TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: 'world_act',
       description:
-        'Submit micro-ops to the physics engine (closing act). actions: nudge|pull|adsorb|catalyze|bite|digest|wait|revive|move with optional target_id/dir/mag. budget_energy caps spent from energy_pool. Fruit bite refused (REFUSED_SATIATED) when satiated. Near a corpse with pool≥revive+margin: wait→REFUSED_REVIVE_WAIT and non-starve bite→REFUSED_REVIVE_BITE — must move/revive. Successful revive splits locked energy to both parties.',
+        'Submit micro-ops to the physics engine (closing act). actions: nudge|pull|adsorb|catalyze|bite|digest|wait|revive|move|condense with optional target_id/dir/mag. budget_energy caps spent from energy_pool. Fruit bite refused (REFUSED_SATIATED) when satiated. Near a corpse with pool≥revive+margin: wait→REFUSED_REVIVE_WAIT and non-starve bite→REFUSED_REVIVE_BITE — must move/revive. Successful revive splits locked energy to both parties.',
       parameters: {
         type: 'object',
         properties: {
@@ -207,7 +207,7 @@ const WORLD_TOOL_DEFINITIONS: ToolDefinition[] = [
             items: {
               type: 'object',
               properties: {
-                op: { type: 'string', description: 'nudge|pull|adsorb|catalyze|bite|digest|wait|revive|move' },
+                op: { type: 'string', description: 'nudge|pull|adsorb|catalyze|bite|digest|wait|revive|move|condense' },
                 target_id: { type: 'string' },
                 dir: { type: 'string', description: 'n/s/e/w or 东/西/南/北' },
                 mag: { type: 'number' },

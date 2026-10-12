@@ -8,8 +8,12 @@ import {
   ACTION_COST,
   biteCostForStreak,
   biteYieldForStreak,
+  CONDENSE_EFFICIENCY,
+  CONDENSE_MIN_WASTE,
   conservationOk,
+  CORPSE_BITE_YIELD_MUL,
   createSeedWorld,
+  evaluateCondensePrereqs,
   observe,
   REVIVE_SAFETY_MARGIN,
   SATIETY_THRESHOLD,
@@ -335,6 +339,116 @@ function main(): void {
     assert.ok(Math.abs(victim.energy_pool - 9) < 0.05, 'revived share 45% of 20')
     console.log(
       `✓ revive duty refuse wait/bite; revived split ok savior=${bot.energy_pool} revived=${victim.energy_pool}`,
+    )
+  }
+
+
+  // --- post-fruit: condense + low-yield corpse bite ---
+  {
+    // Drain fruit
+    for (const o of state.organics.filter((x) => x.kind === 'fruit')) {
+      state.waste_heat = Math.round((state.waste_heat + o.energy_locked) * 1000) / 1000
+      o.energy_locked = 0
+    }
+    state.organics = state.organics.filter((o) => o.kind !== 'fruit' || o.energy_locked > 0.01)
+    const snapGone = observe(state, 'agnes')
+    assert.equal(snapGone.fruit_gone, true, 'fruit_gone')
+    assert.ok(snapGone.alerts.some((a) => a.includes('FRUIT_GONE')), 'FRUIT_GONE alert')
+    assert.ok(typeof snapGone.waste_heat === 'number', 'waste_heat in observe')
+    assert.ok(snapGone.condense, 'condense hook')
+
+    // Seed yin+yang near bot + enough waste
+    const frees = state.particles.filter((p) => !p.boundTo)
+    let yi = 0
+    let ya = 0
+    for (const p of frees) {
+      if (p.kind === 'yin' && yi < 2) {
+        p.pos = { x: bot.pos.x + yi, y: bot.pos.y }
+        yi++
+      } else if (p.kind === 'yang' && ya < 2) {
+        p.pos = { x: bot.pos.x, y: bot.pos.y + ya + 1 }
+        ya++
+      }
+    }
+    if (state.waste_heat < CONDENSE_MIN_WASTE + 5) {
+      // mint via baseline-safe: transfer from bot stomach/pool already in ledger — use waste bump from fruit drain
+    }
+    transferPool(bot, state, ACTION_COST.condense + 3)
+    const pre = evaluateCondensePrereqs(state, bot)
+    assert.ok(pre.prereq_ok, `condense prereq ${pre.prereq_reason}`)
+    const evC = state.events.length
+    const heatBefore = state.waste_heat
+    const cond = act(
+      state,
+      { actor_id: 'agnes', budget_energy: 10, actions: [{ op: 'condense' }] },
+      { settle: false },
+    )
+    assert.ok(cond.accepted.includes(0), `condense accepted ${JSON.stringify(cond)}`)
+    assert.ok(state.events.slice(evC).some((e) => e.type === 'condense'), 'condense event')
+    const clump = state.organics.find((o) => o.kind === 'clump')
+    assert.ok(clump && clump.energy_locked > 0, 'clump created')
+    assert.ok(
+      Math.abs(clump!.energy_locked - Math.min(5, heatBefore) * CONDENSE_EFFICIENCY) < 0.05 ||
+        clump!.energy_locked <= 5 * CONDENSE_EFFICIENCY + 0.05,
+      `locked=${clump!.energy_locked} eff`,
+    )
+    assert.ok(conservationOk(state, 0.5), `after condense Σ=${totalEnergy(state)}`)
+
+    // Corpse bite low yield
+    const corpse = {
+      id: 'corpse_bite_test',
+      kind: 'corpse' as const,
+      pos: { ...bot.pos },
+      energy_locked: 10,
+      corpseOf: 'glm',
+      diedAtTick: state.tick,
+      radius: 1,
+    }
+    // fund from waste
+    assert.ok(state.waste_heat >= 10, 'waste for corpse')
+    state.waste_heat = Math.round((state.waste_heat - 10) * 1000) / 1000
+    state.organics.push(corpse)
+    const glmBot = state.bots.find((b) => b.actorId === 'glm')!
+    // Preserve conservation: dump any leftover pool into waste before marking dead
+    if (glmBot.energy_pool > 0) {
+      state.waste_heat = Math.round((state.waste_heat + glmBot.energy_pool) * 1000) / 1000
+      glmBot.energy_pool = 0
+    }
+    if (glmBot.stomach > 0) {
+      state.waste_heat = Math.round((state.waste_heat + glmBot.stomach) * 1000) / 1000
+      glmBot.stomach = 0
+    }
+    glmBot.alive = false
+    transferPool(bot, state, 5)
+    const stomBefore = bot.stomach
+    const coreBefore = bot.core_integrity
+    const biteC = act(
+      state,
+      { actor_id: 'agnes', budget_energy: 5, actions: [{ op: 'bite', target_id: corpse.id }] },
+      { settle: false },
+    )
+    assert.ok(biteC.accepted.includes(0), `corpse bite ${JSON.stringify(biteC)}`)
+    const gained = bot.stomach - stomBefore
+    assert.ok(gained + 1e-9 < 8 * CORPSE_BITE_YIELD_MUL + 0.5, `low yield stomach+${gained}`)
+    assert.ok(bot.core_integrity + 1e-9 < coreBefore, 'core damage on corpse bite')
+    assert.ok(
+      conservationOk(state, 0.6),
+      `after corpse bite Σ=${totalEnergy(state)} baseline=${state.conservation_baseline}`,
+    )
+    // husk bite refused
+    corpse.energy_locked = 0
+    transferPool(bot, state, 5)
+    const husk = act(
+      state,
+      { actor_id: 'agnes', budget_energy: 5, actions: [{ op: 'bite', target_id: corpse.id }] },
+      { settle: false },
+    )
+    assert.ok(
+      husk.rejected.length > 0 && husk.accepted.length === 0,
+      `husk bite refused got ${JSON.stringify(husk)}`,
+    )
+    console.log(
+      `✓ post-fruit condense locked=${clump!.energy_locked} corpseBite stomach+${gained.toFixed(2)} core=${bot.core_integrity}`,
     )
   }
 

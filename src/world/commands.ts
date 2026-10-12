@@ -164,6 +164,8 @@ export function formatSnapshotLine(snap: ObserveSnapshot): string {
   if (snap.dying?.length) {
     parts.push(`濒死=${snap.dying.map((d) => d.actor_id).join(',')}`)
   }
+  if (snap.fruit_gone) parts.push('FRUIT_GONE')
+  if (typeof snap.waste_heat === 'number') parts.push(`waste=${snap.waste_heat}`)
   if (snap.alerts?.length) parts.push(`⚠${snap.alerts[0]}`)
   if (snap.last_errors[0]) parts.push(`last_err=${snap.last_errors[0].code}`)
   return parts.join(' · ')
