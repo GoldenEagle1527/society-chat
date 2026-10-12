@@ -173,7 +173,7 @@ export class SocietyWorldService extends Service {
         `紧迫度 urgency=${snap.urgency}；建议操作 suggested_ops=[${(snap.suggested_ops || []).join(',')}]。有尸体时优先 revive，禁止在尸体旁干等。`,
         '引擎立法：能池≥餍足阈值时咬果 → REFUSED_SATIATED；同目标连啃成本升、收益降。刚好够优于囤满。',
         'micro_reward 只奖构型进展（pull_cluster/pull_pair/pull_morph_prep、adsorb_balance、catalyze_bond）；随机 pull_moved / 来回拉 / wait 不给奖。守恒：废热→能池。代谢每 tick 扣能。',
-        '能池够用时：挪粒子成团/催化键/复活同伴；咬果仅濒饿。硕果尾声（锁能很低）可无视餍足啃完残果。有团块且能池偏低时优先 bite 团块（wait 不硬拒）。果将尽/已尽：suggested 提升 condense 与 bite(clump)。冷凝效率固定 25%。聊天是外壳。',
+        '能池够用时：挪粒子成团/催化键/复活同伴；咬果仅濒饿。硕果尚在（含尾声）先 bite/digest 残果，勿空刷 condense。果尽后 suggested 才主推 condense 与 bite(clump)。尾声可无视餍足渴咬。有团块且能池偏低抬 bite（wait 不硬拒）。冷凝效率固定 25%。聊天是外壳。',
       ]
       if (snap.corpses?.length) {
         lines.push('【尸体警报 — 立刻评估 revive】')

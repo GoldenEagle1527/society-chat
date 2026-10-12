@@ -86,7 +86,7 @@ export const REVIVE_SHARE_REVIVED = 0.45
 /** M0-friendly upper band (15–25%); tune down later. */
 export const CONDENSE_EFFICIENCY = 0.25
 /** Below this fruit locked energy, satiety no longer blocks fruit bite (thirst). */
-export const FRUIT_TAIL_THRESHOLD = 40
+export const FRUIT_TAIL_THRESHOLD = 100
 /** Suggest bite(clump) when pool below this and clumps exist. */
 export const CLUMP_FORAGE_POOL_THRESHOLD = 8
 /** Boost condense/bite when fruit locked at or below this (nearly gone). */
@@ -783,8 +783,14 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     .filter((o) => o.kind === 'clump' && o.energy_locked > 0.01)
     .map((o) => ({ id: o.id, pos: { ...o.pos }, energy_locked: o.energy_locked }))
   const fruitNearlyGone = fruit_gone || fruitLocked <= FRUIT_NEARLY_GONE
-  if (fruitNearlyGone) {
-    urgency = Math.max(urgency, fruit_gone ? 40 : 30)
+  // Empty stomach first — huge stomach + condense spam stalls teaching window
+  if (bot.stomach >= 2 && !suggested_ops.includes('digest')) {
+    suggested_ops.unshift('digest')
+    urgency = Math.max(urgency, 28)
+  }
+  if (fruit_gone) {
+    // Only after fruit is gone: boost condense / clump bite
+    urgency = Math.max(urgency, 40)
     if (condenseInfo.prereq_ok) {
       if (!suggested_ops.includes('condense')) suggested_ops.unshift('condense')
     } else {
@@ -792,13 +798,21 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
         if (!suggested_ops.includes(op)) suggested_ops.push(op)
       }
     }
-    // Prefer biting existing clumps when hungry (do not hard-refuse wait)
     if (clumpsList.length && bot.energy_pool < CLUMP_FORAGE_POOL_THRESHOLD) {
       urgency = Math.max(urgency, 45)
       if (!suggested_ops.includes('bite')) suggested_ops.unshift('bite')
       if (!suggested_ops.includes('digest')) suggested_ops.splice(1, 0, 'digest')
     } else if (clumpsList.length && !suggested_ops.includes('bite')) {
       suggested_ops.push('bite')
+    }
+  } else if (fruitNearlyGone) {
+    // Tail fruit still present: finish fruit (bite/digest) before condensing
+    urgency = Math.max(urgency, 30)
+    if (!suggested_ops.includes('bite')) suggested_ops.unshift('bite')
+    if (bot.stomach >= 1 && !suggested_ops.includes('digest')) suggested_ops.unshift('digest')
+    // Soft hint condense only if prereq already ok — do not drown bite
+    if (condenseInfo.prereq_ok && !suggested_ops.includes('condense')) {
+      suggested_ops.push('condense')
     }
   } else if (clumpsList.length && bot.energy_pool < CLUMP_FORAGE_POOL_THRESHOLD) {
     // Mid-game: clumps available, pool low — elevate bite without refusing wait
