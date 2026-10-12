@@ -86,7 +86,7 @@ export const REVIVE_SHARE_REVIVED = 0.45
 /** M0-friendly upper band (15–25%); tune down later. */
 export const CONDENSE_EFFICIENCY = 0.25
 /** Below this fruit locked energy, satiety no longer blocks fruit bite (thirst). */
-export const FRUIT_TAIL_THRESHOLD = 100
+export const FRUIT_TAIL_THRESHOLD = 300
 /** Suggest bite(clump) when pool below this and clumps exist. */
 export const CLUMP_FORAGE_POOL_THRESHOLD = 8
 /** Boost condense/bite when fruit locked at or below this (nearly gone). */

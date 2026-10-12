@@ -93,7 +93,7 @@ function main(): void {
   {
     const lockedBefore = fruit.energy_locked
     const park = Math.round((lockedBefore - 20) * 1000) / 1000
-    fruit.energy_locked = 20 // below FRUIT_TAIL_THRESHOLD (40)
+    fruit.energy_locked = 20 // below FRUIT_TAIL_THRESHOLD (300)
     state.waste_heat = Math.round((state.waste_heat + park) * 1000) / 1000
     transferPool(bot, state, SATIETY_THRESHOLD + 2)
     const thirst = act(
