@@ -16,11 +16,19 @@ import type { AgentId, InboxMessage, RoomMessage } from '../../../src/types.ts'
 import {
   normalizeProviderId,
   providerModelLabel,
+  requireAgnesConfig,
+  requireGlmConfig,
   requireProviderConfig,
   type LlmEndpointConfig,
   type LlmProviderId,
 } from '../../../src/env.ts'
-import { LlmHttpError, withLlmRetries, llmTimeoutMs, isAbortLikeError, type LlmRetryMode } from '../../../src/llm-http.ts'
+import {
+  LlmHttpError,
+  withLlmRetries,
+  llmTimeoutMs,
+  isAbortLikeError,
+  type LlmRetryMode,
+} from '../../../src/llm-http.ts'
 import {
   isClosingToolName,
   type ToolDefinition,
@@ -246,6 +254,31 @@ export class SocietyLlmService extends Service {
     return providerModelLabel(this.resolveConfig(agentId))
   }
 
+  /**
+   * World synced-turn routing: Agnes/GLM stay; SiliconFlow remapped to flash
+   * (XingChen is too slow/unstable for 20–30s world deadlines).
+   */
+  resolveWorldTurnConfig(agentId: AgentId): LlmEndpointConfig {
+    const prefer = this.resolveConfig(agentId)
+    if (prefer.provider !== 'siliconflow') return prefer
+    try {
+      if (agentId.includes('lit')) {
+        try {
+          return requireGlmConfig()
+        } catch {
+          return requireAgnesConfig()
+        }
+      }
+      try {
+        return requireAgnesConfig()
+      } catch {
+        return requireGlmConfig()
+      }
+    } catch {
+      return prefer
+    }
+  }
+
   /** Build a Chinese-friendly system prompt from identity + soul + memory + tools. */
   buildSystemPrompt(agentId: AgentId, withTools: boolean): string {
     const agent = this.ctx.societyIdentity.require(agentId)
@@ -395,12 +428,21 @@ export class SocietyLlmService extends Service {
     agentId: AgentId,
     stimulus: ReplyStimulus,
     mode: ActMode,
-    opts?: { injectReplyTo?: string; defaultDmTo?: string; llmMode?: LlmRetryMode },
+    opts?: {
+      injectReplyTo?: string
+      defaultDmTo?: string
+      llmMode?: LlmRetryMode
+      timeoutMs?: number
+      signal?: AbortSignal
+      cfgOverride?: LlmEndpointConfig
+      skipNudge?: boolean
+      maxToolRounds?: number
+    },
   ): Promise<AgentActResult> {
     this.ctx.societyIdentity.require(agentId)
-    const cfg = this.resolveConfig(agentId)
+    const cfg = opts?.cfgOverride ?? this.resolveConfig(agentId)
     this.ctx.logger('society-llm').info(
-      `chat ${agentId} ${providerModelLabel(cfg)} (closing-tools mode=${mode})`,
+      `chat ${agentId} ${providerModelLabel(cfg)} (closing-tools mode=${mode}${opts?.timeoutMs ? ` t/o=${opts.timeoutMs}ms` : ''})`,
     )
 
     const tools =
@@ -437,13 +479,19 @@ export class SocietyLlmService extends Service {
     let nudged = false
     const llmMode: LlmRetryMode = opts?.llmMode ?? 'sync'
 
-    for (let round = 0; round <= MAX_TOOL_ROUNDS + 1; round++) {
+    const maxRounds = opts?.maxToolRounds ?? MAX_TOOL_ROUNDS
+    for (let round = 0; round <= maxRounds + 1; round++) {
       const allowTools = true
+      if (opts?.signal?.aborted) {
+        throw new LlmHttpError(cfg.provider, 408, `${cfg.provider} world-turn aborted`)
+      }
       const result = await this.chatCompletions(messages, cfg, {
         tools: allowTools,
         toolDefs: tools,
         toolChoice: 'auto',
         llmMode,
+        timeoutMs: opts?.timeoutMs,
+        signal: opts?.signal,
       })
 
       if (result.tool_calls?.length) {
@@ -504,9 +552,9 @@ export class SocietyLlmService extends Service {
         continue
       }
 
-      // Text-only response — nudge once then soft-fail
+      // Text-only response — nudge once then soft-fail (skip for world fail-fast)
       const cleaned = (result.content ?? '').trim()
-      if (!nudged) {
+      if (!nudged && !opts?.skipNudge) {
         nudged = true
         messages.push({
           role: 'assistant',
@@ -549,6 +597,8 @@ export class SocietyLlmService extends Service {
       toolDefs?: ToolDefinition[]
       toolChoice?: 'auto' | 'required' | 'none'
       llmMode?: LlmRetryMode
+      timeoutMs?: number
+      signal?: AbortSignal
     },
   ): Promise<{ content: string | null; tool_calls?: OpenAiToolCall[] }> {
     const log = (msg: string) => {
@@ -567,7 +617,13 @@ export class SocietyLlmService extends Service {
   private async chatCompletionsOnce(
     messages: ChatMessage[],
     cfg: LlmEndpointConfig,
-    opts: { tools: boolean; toolDefs?: ToolDefinition[]; toolChoice?: 'auto' | 'required' | 'none' },
+    opts: {
+      tools: boolean
+      toolDefs?: ToolDefinition[]
+      toolChoice?: 'auto' | 'required' | 'none'
+      timeoutMs?: number
+      signal?: AbortSignal
+    },
   ): Promise<{ content: string | null; tool_calls?: OpenAiToolCall[] }> {
     const url = `${cfg.baseUrl}/chat/completions`
     const body: Record<string, unknown> = {
@@ -582,7 +638,12 @@ export class SocietyLlmService extends Service {
       body.tool_choice = opts.toolChoice ?? 'auto'
     }
 
-    const timeoutMs = llmTimeoutMs()
+    const timeoutMs = opts.timeoutMs ?? llmTimeoutMs()
+    const deadline = AbortSignal.timeout(timeoutMs)
+    const signal =
+      opts.signal && typeof AbortSignal.any === 'function'
+        ? AbortSignal.any([deadline, opts.signal])
+        : (opts.signal ?? deadline)
     let res: Response
     try {
       res = await fetch(url, {
@@ -592,7 +653,7 @@ export class SocietyLlmService extends Service {
           Authorization: `Bearer ${cfg.apiKey}`,
         },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal,
       })
     } catch (err) {
       if (isAbortLikeError(err)) {

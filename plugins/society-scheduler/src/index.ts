@@ -33,7 +33,12 @@ import type { AgentId, InboxMessage, RoomId } from '../../../src/types.ts'
 import { HUMAN_SPEAKER_ID } from '../../../src/types.ts'
 import type { ActMode, AgentActResult, ReplyStimulus } from '../../society-llm/src/index.ts'
 import { formatBeijingNow } from '../../../src/beijing-time.ts'
-import { agentTickBudgetMs, sleep as sleepMs } from '../../../src/llm-http.ts'
+import {
+  agentTickBudgetMs,
+  sleep as sleepMs,
+  worldLlmTimeoutMs,
+  worldTurnTimeoutMs,
+} from '../../../src/llm-http.ts'
 import {
   recordLlm,
   recordSchedulerTick,
@@ -734,10 +739,7 @@ export class SocietySchedulerService extends Service {
       action?: string
     }>
   }> {
-    const timeoutMs = Math.max(
-      5_000,
-      opts?.timeoutMs ?? Math.min(agentTickBudgetMs(), 90_000),
-    )
+    const timeoutMs = Math.max(5_000, opts?.timeoutMs ?? worldTurnTimeoutMs())
     this.tickCount += 1
     this.roomRepliesThisTick = 0
 
@@ -770,20 +772,22 @@ export class SocietySchedulerService extends Service {
           /* */
         }
 
-        const work = this.forceIdleWorldTurn(agentId)
+        const ac = new AbortController()
+        const work = this.forceIdleWorldTurn(agentId, ac.signal)
         const raced = await Promise.race([
           work.then((r) => ({ tag: 'ok' as const, r })),
           sleepMs(timeoutMs).then(() => ({ tag: 'timeout' as const })),
         ])
 
         if (raced.tag === 'timeout') {
+          ac.abort()
+          this.inFlight.delete(agentId)
           try {
             recordSkip(agentId, 'timeout')
           } catch {
             /* */
           }
           this.applyWaitFill(agentId)
-          // Inner work may still finish; ignore late world_act under defer (next turns ok)
           void work.catch(() => undefined)
           return { agentId, status: 'timeout' as const, action: 'wait_fill' }
         }
@@ -836,6 +840,7 @@ export class SocietySchedulerService extends Service {
    */
   private async forceIdleWorldTurn(
     agentId: AgentId,
+    signal?: AbortSignal,
   ): Promise<{ action: TickResult['action']; body?: string; didWorldOp: boolean }> {
     if (this.inFlight.has(agentId)) {
       return { action: 'skip', didWorldOp: false }
@@ -890,10 +895,19 @@ export class SocietySchedulerService extends Service {
       this.ctx.societyMemory.recordLlmCall(agentId)
       const idleStimulusKey = `sync-${this.tickCount}-${agentId}`
       let result: AgentActResult
+      const t0 = Date.now()
       try {
-        result = await this.ctx.societyLlm.actClosedTurn(agentId, { text: stimulus }, 'idle')
+        const worldCfg = this.ctx.societyLlm.resolveWorldTurnConfig(agentId)
+        result = await this.ctx.societyLlm.actClosedTurn(agentId, { text: stimulus }, 'idle', {
+          llmMode: 'sync',
+          timeoutMs: worldLlmTimeoutMs(),
+          signal,
+          cfgOverride: worldCfg,
+          skipNudge: true,
+          maxToolRounds: 2,
+        })
         try {
-          recordLlm(agentId, true)
+          recordLlm(agentId, true, Date.now() - t0)
         } catch {
           /* */
         }
@@ -901,7 +915,7 @@ export class SocietySchedulerService extends Service {
         const msg = err instanceof Error ? err.message : String(err)
         const safe = msg.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
         try {
-          recordLlm(agentId, false)
+          recordLlm(agentId, false, Date.now() - t0)
         } catch {
           /* */
         }
@@ -929,7 +943,7 @@ export class SocietySchedulerService extends Service {
     }
   }
 
-    /**
+  /**
    * Single-agent slice with a hard time budget.
    * Hung LLM fetch must not block Promise.all / tickRunning forever.
    * On timeout we return skip immediately; the inner work may still finish and

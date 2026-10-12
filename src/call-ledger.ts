@@ -36,6 +36,9 @@ export interface AgentLedger {
   llmInvocations: number
   llmOk: number
   llmFail: number
+  /** Sum of recorded LLM wall times (ms). */
+  llmLatencySumMs: number
+  llmLatencySamples: number
   wakes: number
   skips: number
   skipReasons: Partial<Record<SkipReason, number>>
@@ -73,6 +76,8 @@ function emptyAgent(agentId: string): AgentLedger {
     llmInvocations: 0,
     llmOk: 0,
     llmFail: 0,
+    llmLatencySumMs: 0,
+    llmLatencySamples: 0,
     wakes: numberZero(),
     skips: 0,
     skipReasons: {},
@@ -172,13 +177,17 @@ export function recordAct(
   a.actRejectedOps += rejected
 }
 
-export function recordLlm(agentId: string, ok: boolean): void {
+export function recordLlm(agentId: string, ok: boolean, durationMs?: number): void {
   const a = touch(agentId)
   a.llmInvocations += 1
   a.llmAtMs.push(Date.now())
   if (a.llmAtMs.length > 200) a.llmAtMs.splice(0, a.llmAtMs.length - 200)
   if (ok) a.llmOk += 1
   else a.llmFail += 1
+  if (typeof durationMs === 'number' && durationMs >= 0) {
+    a.llmLatencySumMs += durationMs
+    a.llmLatencySamples += 1
+  }
 }
 
 export function recordWake(agentId: string): void {
@@ -241,6 +250,10 @@ function enrich(src: CallLedger): CallLedger & {
     agentsEnriched[id] = {
       ...a,
       avgLlmIntervalMs: avgInterval(a.llmAtMs),
+      avgLlmLatencyMs:
+        a.llmLatencySamples > 0
+          ? Math.round(a.llmLatencySumMs / a.llmLatencySamples)
+          : null,
       wallSpanMs: wallMs,
       llmAtMs: a.llmAtMs.slice(-20),
     }

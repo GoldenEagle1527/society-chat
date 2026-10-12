@@ -42,6 +42,16 @@ export function llmTimeoutMs(): number {
   return Math.max(5_000, societyEnvInt('SOCIETY_LLM_TIMEOUT_MS', 75_000) || 75_000)
 }
 
+/** World synced-turn HTTP timeout (default 20s) — fail-fast to wait_fill. */
+export function worldLlmTimeoutMs(): number {
+  return Math.max(5_000, societyEnvInt('SOCIETY_WORLD_LLM_TIMEOUT_MS', 20_000) || 20_000)
+}
+
+/** Outer per-agent deadline for a synced world turn (default 25s). */
+export function worldTurnTimeoutMs(): number {
+  return Math.max(5_000, societyEnvInt('SOCIETY_TURN_TIMEOUT_MS', 25_000) || 25_000)
+}
+
 /**
  * Hard cap for one agent slice of a tick so a hung LLM cannot freeze society forever.
  * Default: timeoutMs * syncAttempts + 45s (override with SOCIETY_AGENT_TICK_BUDGET_MS).

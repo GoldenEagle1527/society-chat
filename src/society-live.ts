@@ -510,10 +510,10 @@ async function main(): Promise<void> {
       try {
         // Synced turn-based: ALL living agents in parallel → then ONE physics settle.
         // No free-running metabolism while models think.
-        const turnTimeout = envInt('SOCIETY_TURN_TIMEOUT_MS', 0) || undefined
-        const result = await ctx.societyScheduler.runSyncedWorldTurn(
-          turnTimeout ? { timeoutMs: turnTimeout } : undefined,
-        )
+        const turnTimeout = envInt('SOCIETY_TURN_TIMEOUT_MS', 25_000)
+        const result = await ctx.societyScheduler.runSyncedWorldTurn({
+          timeoutMs: turnTimeout,
+        })
         ticksDone = result.tick
         if (result.tick % 2 === 0) {
           try {
