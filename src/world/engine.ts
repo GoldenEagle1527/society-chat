@@ -71,7 +71,8 @@ export const CORPSE_LOCK_LEAK = 0.08
 /** After this many ticks without revive, harden corpse alerts. */
 export const CORPSE_NEGLECT_HARDEN_TICKS = 4
 /** Pool must cover revive cost + this margin before wait/bite are hard-refused. */
-export const REVIVE_SAFETY_MARGIN = 1
+/** 0 = duty when pool can exactly cover revive (soft-metabolism worlds rarely hold +1). */
+export const REVIVE_SAFETY_MARGIN = 0
 /** Fraction of corpse locked energy granted to savior / revived (rest → waste). */
 export const REVIVE_SHARE_SAVIOR = 0.35
 export const REVIVE_SHARE_REVIVED = 0.45
