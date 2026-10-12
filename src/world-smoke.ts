@@ -490,7 +490,7 @@ function main(): void {
     )
   }
 
-  // --- research threshold sink: pool≥6 pins pull/adsorb/catalyze; SATIETY stays fruit-only ---
+  // --- research threshold sink: fruit-era tail-append (head-pin only after fruit_gone) ---
   {
     state.organics = state.organics.filter((o) => o.kind !== 'corpse')
     // Clear stomach first so research comes from pool gate only
@@ -501,12 +501,22 @@ function main(): void {
     transferPool(bot, state, RESEARCH_POOL_THRESHOLD) // 6 — below SATIETY 10
     assert.ok(Math.abs(bot.energy_pool - RESEARCH_POOL_THRESHOLD) < 0.05, `pool=${bot.energy_pool}`)
     const snapR = observe(state, 'agnes')
-    assert.ok(
-      snapR.suggested_ops[0] === 'pull' || snapR.suggested_ops.includes('pull'),
-      `research pin pull got ${snapR.suggested_ops}`,
-    )
+    assert.ok(snapR.suggested_ops.includes('pull'), `research pull present got ${snapR.suggested_ops}`)
     assert.ok(snapR.suggested_ops.includes('adsorb'), 'adsorb')
-    // catalyze only when some view particle has bond<1 (cores start ~0.9 → usually present)
+    // Fruit present → research must NOT sit ahead of bite
+    const biteIdx = snapR.suggested_ops.indexOf('bite')
+    const pullIdx = snapR.suggested_ops.indexOf('pull')
+    if (biteIdx >= 0 && pullIdx >= 0) {
+      assert.ok(
+        biteIdx < pullIdx,
+        `fruit-era: bite ahead of research pull got ${snapR.suggested_ops}`,
+      )
+    }
+    assert.ok(
+      snapR.alerts.some((a) => a.includes('RESEARCH_READY') && a.includes('fruit-era')),
+      `fruit-era RESEARCH_READY alert got ${snapR.alerts[0]}`,
+    )
+    // catalyze only when some view particle has bond<1
     const viewHasUnmaxed = state.particles.some(
       (p) =>
         Math.hypot(p.pos.x - bot.pos.x, p.pos.y - bot.pos.y) <= 6 && (p.bond ?? 0) < 1 - 1e-9,
@@ -516,10 +526,6 @@ function main(): void {
     } else {
       assert.ok(!snapR.suggested_ops.includes('catalyze'), `no catalyze when all maxed got ${snapR.suggested_ops}`)
     }
-    assert.ok(
-      snapR.alerts.some((a) => a.includes('RESEARCH_READY')),
-      'RESEARCH_READY alert',
-    )
     // SATIETY still fruit-only: pool 6 < 10 → fruit bite allowed if fruit present
     const fruit = state.organics.find((o) => o.kind === 'fruit' && o.energy_locked > 20)
     if (fruit) {
@@ -534,7 +540,7 @@ function main(): void {
         `fruit bite at pool6 not satiated ${JSON.stringify(biteF.rejected)}`,
       )
     }
-    console.log(`✓ RESEARCH_READY at pool=${bot.energy_pool} suggest=${snapR.suggested_ops.slice(0, 4)}`)
+    console.log(`✓ RESEARCH_READY fruit-era pool=${bot.energy_pool} suggest=${snapR.suggested_ops.slice(0, 4)}`)
   }
 
   // --- REFUSED_CATALYZE_MAXED + research divert (no catalyze when all bonds maxed) ---
