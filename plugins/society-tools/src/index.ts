@@ -7,8 +7,8 @@
  * run_command MUST go through societySandbox (bwrap or docker mode); no raw shell.
  * web_search (Exa; 1 call/model/Beijing-day) / generate_image HTTP clients use host allowlist from society-sandbox.
  * Social tools: create_room / invite_to_room / list_rooms / list_agents / post_room / speak_in_room / send_dm / spawn_agent.
- * Closing tools (idle/reply): speak_in_room / send_dm / write_diary / write_thought / do_nothing / stay_silent / rest.
- * Side tool: reflect_feelings (subjective soul nudge; not a closing act).
+ * Closing tools (idle/reply): speak_in_room / send_dm / do_nothing / stay_silent / world_act / rest(world wait).
+ * Research: world_observe (+ optional files/search). Diary/soul/reflect_feelings REMOVED (YinYang M0).
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -119,15 +119,15 @@ export function toWorkspaceRelative(workspaceRoot: string, absolutePath: string)
 export const IDLE_CLOSING_TOOL_NAMES = [
   'speak_in_room',
   'send_dm',
-  'write_diary',
-  'write_thought',
   'do_nothing',
+  'world_act',
   'rest',
 ] as const
 
-export const REPLY_CLOSING_TOOL_NAMES = ['stay_silent', 'speak_in_room', 'send_dm', 'rest'] as const
+export const REPLY_CLOSING_TOOL_NAMES = ['stay_silent', 'speak_in_room', 'send_dm', 'world_act', 'rest'] as const
 
 export const RESEARCH_TOOL_NAMES = [
+  'world_observe',
   'web_search',
   'write_file',
   'read_file',
@@ -136,19 +136,17 @@ export const RESEARCH_TOOL_NAMES = [
   'list_rooms',
   'run_command',
   'generate_image',
-  'reflect_feelings',
 ] as const
 
 /** Side tools that may run before/alongside a closing act (not closing themselves). */
-export const SIDE_TOOL_NAMES = ['reflect_feelings'] as const
+export const SIDE_TOOL_NAMES = [] as const
 
 export type ClosingActName =
   | 'speak_in_room'
   | 'send_dm'
-  | 'diary'
-  | 'thought'
   | 'do_nothing'
   | 'stay_silent'
+  | 'world_act'
   | 'rest'
 
 export function isClosingToolName(name: string): boolean {
@@ -180,38 +178,44 @@ function splitBubbleBodies(body: string): string[] {
   return [trimmed.slice(0, 2000)]
 }
 
-const SIDE_TOOL_DEFINITIONS: ToolDefinition[] = [
+const SIDE_TOOL_DEFINITIONS: ToolDefinition[] = []
+
+const WORLD_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: 'function',
     function: {
-      name: 'reflect_feelings',
+      name: 'world_observe',
       description:
-        'Record YOUR OWN subjective soul shift after this turn (openness/trust/energy/mood). Optional; call at most once per turn when your feelings actually changed. Warm chat may raise energy/trust; exhaustion may lower energy. Deltas are small (±0.05 max each). Does NOT speak for you — still call a closing tool.',
+        'Observe your local YinYang Field body and neighborhood (energy_pool, core_integrity, particles, organics, recent events, last_errors). Research tool — does not end the turn.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'world_act',
+      description:
+        'Submit micro-ops to the physics engine (closing act). actions: nudge|pull|adsorb|catalyze|bite|digest|wait|revive with optional target_id/dir/mag. budget_energy caps spent from energy_pool. Survival only via energy_pool/core_integrity.',
       parameters: {
         type: 'object',
         properties: {
-          openness: {
-            type: 'number',
-            description: 'Delta for openness, clamped to ±0.05',
-          },
-          trust: {
-            type: 'number',
-            description: 'Delta for trust, clamped to ±0.05',
-          },
-          energy: {
-            type: 'number',
-            description: 'Delta for energy, clamped to ±0.05',
-          },
-          mood: {
-            type: 'string',
-            description: 'Optional short mood label (e.g. 开心、疲惫、好奇)',
-          },
-          reason: {
-            type: 'string',
-            description: 'Optional short reason for the audit log',
+          budget_energy: { type: 'number', description: 'Max energy to spend this packet (default 8)' },
+          actions: {
+            type: 'array',
+            description: 'Ordered micro-ops',
+            items: {
+              type: 'object',
+              properties: {
+                op: { type: 'string', description: 'nudge|pull|adsorb|catalyze|bite|digest|wait|revive' },
+                target_id: { type: 'string' },
+                dir: { type: 'string', description: 'n/s/e/w or 东/西/南/北' },
+                mag: { type: 'number' },
+              },
+              required: ['op'],
+            },
           },
         },
-        required: [],
+        required: ['actions'],
       },
     },
   },
@@ -238,36 +242,6 @@ const CLOSING_TOOL_DEFINITIONS: ToolDefinition[] = [
           },
         },
         required: ['body'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'write_diary',
-      description:
-        'Append a PRIVATE diary entry for today (first-person notes to yourself ONLY). Rejects outbound chat voice (@mentions, 「xxx在吗」, asking the group). Use speak_in_room or send_dm to talk to others.',
-      parameters: {
-        type: 'object',
-        properties: {
-          text: { type: 'string', description: 'Private first-person diary text' },
-        },
-        required: ['text'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'write_thought',
-      description:
-        'Append a PRIVATE inner thought / note for today (not for others). Same privacy rules as write_diary.',
-      parameters: {
-        type: 'object',
-        properties: {
-          text: { type: 'string', description: 'Private thought text' },
-        },
-        required: ['text'],
       },
     },
   },
@@ -306,7 +280,7 @@ const CLOSING_TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: 'rest',
       description:
-        'End this turn and go to sleep / stop socializing until a chosen time. Use after saying goodnight, when tired, or when you want the scheduler to stop waking you for idle/chatter. Default (only reason or empty): next Beijing 07:00, or +7h if that is <3h or >12h away. until: ISO timestamp, Beijing HH:mm (next occurrence), or "morning" (= next Beijing 07:00). minutes: sleep for N minutes (1–1440). Human messages and @mentions still wake you early.',
+        'World-side low-cost idle/guard: spends a tiny energy_pool wait in the field (guard core). Ends the turn. Optional minutes only affects social snooze lightly; survival still depends on energy_pool. Prefer world_act wait for pure physics idle.',
       parameters: {
         type: 'object',
         properties: {
@@ -573,7 +547,7 @@ function mergeToolDefs(...groups: ToolDefinition[][]): ToolDefinition[] {
 }
 
 export class SocietyToolsService extends Service {
-  static inject = ['societyIdentity', 'societySandbox', 'societyRooms', 'societyMailbox', 'societySoul', 'societyMemory']
+  static inject = ['societyIdentity', 'societySandbox', 'societyRooms', 'societyMailbox', 'societyMemory', 'societyWorld']
 
   constructor(ctx: Context) {
     super(ctx, 'societyTools')
@@ -588,7 +562,7 @@ export class SocietyToolsService extends Service {
 
   /** OpenAI-style tool schemas for chat/completions (full catalog). */
   getToolDefinitions(): ToolDefinition[] {
-    return mergeToolDefs(TOOL_DEFINITIONS, CLOSING_TOOL_DEFINITIONS, SIDE_TOOL_DEFINITIONS)
+    return mergeToolDefs(TOOL_DEFINITIONS, WORLD_TOOL_DEFINITIONS, CLOSING_TOOL_DEFINITIONS, SIDE_TOOL_DEFINITIONS)
   }
 
   /** Idle self-loop: research tools + idle closing tools. */
@@ -689,8 +663,10 @@ export class SocietyToolsService extends Service {
           })
         case 'rest':
           return this.rest(agentId, args)
-        case 'reflect_feelings':
-          return this.reflectFeelings(agentId, args)
+        case 'world_observe':
+          return this.worldObserve(agentId)
+        case 'world_act':
+          return this.worldAct(agentId, args)
         case 'spawn_agent':
           return this.spawnAgent(agentId, args)
         default:
@@ -750,9 +726,8 @@ export class SocietyToolsService extends Service {
         soul,
         ...(llm ? { llm } : {}),
       })
-      // Seed durable soul + memory files
-      this.ctx.societySoul.load(profile.id)
-      this.ctx.societyMemory.load(profile.id)
+      // Memory only (soul layer deleted for YinYang M0)
+      try { this.ctx.societyMemory.load(profile.id) } catch { /* ignore */ }
       const pref = this.ctx.societyIdentity.getLlmPreference(profile.id)
       return JSON.stringify({
         id: profile.id,
@@ -1031,88 +1006,111 @@ export class SocietyToolsService extends Service {
   }
 
 
-  /** Closing act: snooze until a chosen time (persists rest.json). */
+  /** Closing act: world-side low-cost wait/guard (tiny energy_pool cost). Optional social snooze. */
   rest(agentId: AgentId, args: Record<string, unknown>): string {
     this.ctx.societyIdentity.require(agentId)
+    let worldReceipt: unknown = null
     try {
-      const { until, mode } = resolveRestUntil({
-        until: args.until,
-        minutes: args.minutes,
-        reason: args.reason,
-      })
-      const reason = args.reason != null ? String(args.reason) : undefined
-      const state = writeRest(agentId, until, { reason, mode })
-      return JSON.stringify({
-        ok: true,
-        acted: 'rest',
-        until: state.until,
-        mode: state.mode,
-        reason: state.reason,
-        text: state.reason || 'rest',
-      })
+      if (this.ctx.societyWorld) {
+        worldReceipt = this.ctx.societyWorld.act({
+          actor_id: agentId,
+          budget_energy: 1,
+          actions: [{ op: 'wait' }],
+        })
+      }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      return JSON.stringify({ ok: false, acted: 'rest', error: msg })
+      return JSON.stringify({
+        ok: false,
+        acted: 'rest',
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+    // Optional short social snooze if minutes/until provided (not soul)
+    let until: string | undefined
+    try {
+      if (args.minutes != null || args.until != null || args.reason != null) {
+        const resolved = resolveRestUntil({
+          until: args.until,
+          minutes: args.minutes,
+          reason: args.reason,
+        })
+        const reason = args.reason != null ? String(args.reason) : 'guard'
+        const state = writeRest(agentId, resolved.until, { reason, mode: resolved.mode })
+        until = state.until
+      }
+    } catch {
+      /* world wait already applied */
+    }
+    return JSON.stringify({
+      ok: true,
+      acted: 'rest',
+      until,
+      world: worldReceipt,
+      text: args.reason != null ? String(args.reason) : 'wait/guard',
+    })
+  }
+
+  worldObserve(agentId: AgentId): string {
+    this.ctx.societyIdentity.require(agentId)
+    try {
+      const snap = this.ctx.societyWorld.observe(agentId)
+      // Probe note into memory (world observation)
+      try {
+        this.ctx.societyMemory.recordProbeNote?.(agentId, {
+          kind: 'observe',
+          body: `t=${snap.tick} pool=${snap.self.energy_pool} core=${snap.self.core_integrity} particles=${snap.view.particles.length}`,
+        })
+      } catch { /* optional */ }
+      return JSON.stringify({ ok: true, acted: 'world_observe', snapshot: snap })
+    } catch (err) {
+      return JSON.stringify({
+        ok: false,
+        acted: 'world_observe',
+        error: err instanceof Error ? err.message : String(err),
+      })
     }
   }
 
-  /**
-   * Subjective soul update for THIS agent only (no keyword heuristics, no fan-out).
-   */
-  reflectFeelings(agentId: AgentId, args: Record<string, unknown>): string {
-    const patch: {
-      openness?: number
-      trust?: number
-      energy?: number
-      mood?: string
-      reason?: string
-    } = {}
-    if (args.openness != null && Number.isFinite(Number(args.openness))) {
-      patch.openness = Number(args.openness)
-    }
-    if (args.trust != null && Number.isFinite(Number(args.trust))) {
-      patch.trust = Number(args.trust)
-    }
-    if (args.energy != null && Number.isFinite(Number(args.energy))) {
-      patch.energy = Number(args.energy)
-    }
-    if (args.mood != null) patch.mood = String(args.mood)
-    if (args.reason != null) patch.reason = String(args.reason)
-    if (
-      patch.openness == null &&
-      patch.trust == null &&
-      patch.energy == null &&
-      !patch.mood
-    ) {
+  worldAct(agentId: AgentId, args: Record<string, unknown>): string {
+    this.ctx.societyIdentity.require(agentId)
+    try {
+      const actions = Array.isArray(args.actions) ? args.actions : []
+      const budget = args.budget_energy != null && Number.isFinite(Number(args.budget_energy))
+        ? Number(args.budget_energy)
+        : 8
+      const receipt = this.ctx.societyWorld.act({
+        actor_id: agentId,
+        budget_energy: budget,
+        actions: actions.map((a: any) => ({
+          op: String(a?.op || '') as import('../../../src/world/types.ts').WorldOp,
+          ...(a?.target_id != null ? { target_id: String(a.target_id) } : {}),
+          ...(a?.dir != null ? { dir: String(a.dir) } : {}),
+          ...(a?.mag != null ? { mag: Number(a.mag) } : {}),
+        })),
+      })
+      try {
+        this.ctx.societyMemory.recordProbeNote?.(agentId, {
+          kind: 'act',
+          body: `accepted=${receipt.accepted.length} spent=${receipt.energy_spent} rejected=${receipt.rejected.map((r: any) => r.code).join(',')}`,
+        })
+      } catch { /* optional */ }
+      return JSON.stringify({ ok: true, acted: 'world_act', receipt })
+    } catch (err) {
       return JSON.stringify({
         ok: false,
-        acted: 'reflect_feelings',
-        error: 'provide at least one of openness/trust/energy/mood',
+        acted: 'world_act',
+        error: err instanceof Error ? err.message : String(err),
       })
     }
-    const before = this.ctx.societySoul.get(agentId)
-    const after = this.ctx.societySoul.applySubjective(agentId, patch)
+  }
+
+  /** @deprecated Soul layer removed — always errors. */
+  reflectFeelings(agentId: AgentId, _args: Record<string, unknown>): string {
+    this.ctx.societyIdentity.require(agentId)
     return JSON.stringify({
-      ok: true,
+      ok: false,
       acted: 'reflect_feelings',
-      before: {
-        openness: before.openness,
-        trust: before.trust,
-        energy: before.energy,
-        mood: before.mood,
-      },
-      after: {
-        openness: after.openness,
-        trust: after.trust,
-        energy: after.energy,
-        mood: after.mood,
-      },
-      deltas: {
-        openness: Math.round((after.openness - before.openness) * 10000) / 10000,
-        trust: Math.round((after.trust - before.trust) * 10000) / 10000,
-        energy: Math.round((after.energy - before.energy) * 10000) / 10000,
-      },
-      reason: patch.reason || 'reflect_feelings',
+      error: 'soul layer removed; survival uses energy_pool/core_integrity via world_observe/world_act',
     })
   }
 
@@ -1333,7 +1331,7 @@ async function fetchWithTimeout(
 }
 
 export const name = 'society-tools'
-export const inject = ['societyIdentity', 'societySandbox', 'societyRooms', 'societyMailbox', 'societySoul', 'societyMemory']
+export const inject = ['societyIdentity', 'societySandbox', 'societyRooms', 'societyMailbox', 'societyMemory', 'societyWorld']
 
 export function apply(ctx: Context) {
   ctx.plugin(SocietyToolsService)

@@ -1,5 +1,6 @@
 /**
- * society-soul — Evolving personality state with audit log.
+ * society-soul — RETIRED for YinYang M0 (kept as stub for disk compat).
+ * Do not use soul.energy for wake/social; use energy_pool / core_integrity.
  * Cordis service name: `societySoul`
  *
  * Persists to data/agents/<id>/soul.json
@@ -175,18 +176,11 @@ export class SocietySoulService extends Service {
   }
 
   /** Chinese personality section for system prompt. */
-  getPromptSection(agentId: AgentId): string {
-    const s = this.load(agentId)
-    const lines = [
-      '【灵魂 / 性格】',
-      `- 开放度=${s.openness.toFixed(2)}，信任=${s.trust.toFixed(2)}，精力=${s.energy.toFixed(2)}`,
-      `- 心情：${s.mood || '平静'}`,
-      `- 兴趣：${s.interests.length ? s.interests.join('、') : '无'}`,
-      '- 以上数值是你的主观状态；若本回合心情/精力/信任确有变化，可另调一次 reflect_feelings（每回合最多一次，不必每次都调）。',
-    ]
-    if (s.notes?.trim()) lines.push(`- 备注：${s.notes.trim().slice(0, 120)}`)
-    return lines.join('\n')
+  /** Soul layer retired for YinYang M0 — empty prompt section. */
+  getPromptSection(_agentId: AgentId): string {
+    return ''
   }
+
 
   private normalize(raw: SoulRecord): SoulRecord {
     return {

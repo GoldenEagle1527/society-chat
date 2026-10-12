@@ -8,6 +8,7 @@ import { Context } from '@deepseek-ai/cordis'
 import * as identity from '../plugins/society-identity/src/index.ts'
 import * as mailbox from '../plugins/society-mailbox/src/index.ts'
 import * as rooms from '../plugins/society-rooms/src/index.ts'
+import * as world from '../plugins/society-world/src/index.ts'
 import * as memory from '../plugins/society-memory/src/index.ts'
 import * as soul from '../plugins/society-soul/src/index.ts'
 import * as sandbox from '../plugins/society-sandbox/src/index.ts'
@@ -25,10 +26,11 @@ export async function bootSociety(opts?: { loadSeeds?: boolean }): Promise<Socie
   const ctx = new Context()
   ctx.baseUrl = pathToFileURL(PROJECT_ROOT).href + '/'
 
-  // Mount order: identity → mailbox → rooms → memory/soul → sandbox → tools → llm → scheduler
+  // Mount order: identity → mailbox → rooms → world → memory/soul(stub) → sandbox → tools → llm → scheduler
   await ctx.plugin(identity)
   await ctx.plugin(mailbox)
   await ctx.plugin(rooms)
+  await ctx.plugin(world)
   await ctx.plugin(memory)
   await ctx.plugin(soul)
   await ctx.plugin(sandbox)

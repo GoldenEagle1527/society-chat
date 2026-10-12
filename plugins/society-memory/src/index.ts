@@ -3,7 +3,8 @@
  * Cordis service name: `societyMemory`
  *
  * Persists to data/agents/<id>/memory.json
- * LLM consolidate (free flash via agent's provider) when working exceeds N.
+ * YinYang M0: probe notes (observations / hypotheses / error codes / configs).
+ * Casual chat does NOT enter long-term memory by default — world/system events do.
  * Audit: optional data/agents/<id>/memory-log.jsonl
  * Never logs API keys.
  */
@@ -73,20 +74,15 @@ export class SocietyMemoryService extends Service {
     super(ctx, 'societyMemory')
 
     ctx.on('society/room-message', (msg: RoomMessage) => {
+      // Casual agent/human chat: working only skipped — world/system lines become probe notes.
+      if (msg.from !== 'system') return
       const room = ctx.societyRooms.get(msg.roomId)
       const members = room?.members ?? []
-      const roomName = room?.name
       for (const member of members) {
-        const role = member === msg.from ? 'speaker' : 'listener'
-        const effectiveRole = msg.from === 'system' ? 'listener' : role
         try {
-          this.rememberInteraction(member, {
-            kind: 'room',
-            from: msg.from,
-            body: msg.body,
-            roomId: msg.roomId,
-            roomName,
-            role: effectiveRole,
+          this.recordProbeNote(member, {
+            kind: 'world_event',
+            body: msg.body.slice(0, 240),
             at: msg.createdAt,
           })
         } catch (err) {
@@ -97,31 +93,16 @@ export class SocietyMemoryService extends Service {
 
     ctx.on('society/mail-delivered', (msg) => {
       if (msg.kind !== 'direct') return
+      // Only human/system DMs leave a short probe note; agent↔agent chatter stays out of LTM.
+      if (msg.from !== 'human' && msg.from !== 'system') return
       try {
-        this.rememberInteraction(msg.to, {
-          kind: 'direct',
-          from: msg.from,
-          body: msg.body,
-          role: 'listener',
+        this.recordProbeNote(msg.to, {
+          kind: 'dm_probe',
+          body: `${msg.from}: ${msg.body.slice(0, 160)}`,
           at: msg.createdAt,
         })
       } catch (err) {
         ctx.logger('society-memory').warn(String(err))
-      }
-      if (msg.from !== 'system' && msg.from !== 'room') {
-        try {
-          if (ctx.societyIdentity.get(msg.from)) {
-            this.rememberInteraction(msg.from, {
-              kind: 'direct',
-              from: msg.from,
-              body: msg.body,
-              role: 'speaker',
-              at: msg.createdAt,
-            })
-          }
-        } catch {
-          /* sender may be synthetic */
-        }
       }
     })
   }
@@ -341,34 +322,56 @@ export class SocietyMemoryService extends Service {
     }
   }
 
-  /** Short Chinese block for system prompt. */
+  /**
+   * Probe note: observations / hypotheses / error codes / useful configs.
+   * Prefer world events; not casual chat.
+   */
+  recordProbeNote(
+    agentId: AgentId,
+    note: { kind: string; body: string; at?: string },
+  ): void {
+    const store = this.load(agentId)
+    const line: WorkingMemoryLine = {
+      ts: note.at || new Date().toISOString(),
+      from: 'probe',
+      body: `[${note.kind}] ${note.body}`.slice(0, 400),
+      kind: 'self',
+    }
+    store.working.push(line)
+    const soft = this.workingMax()
+    if (store.working.length > soft) {
+      store.working.splice(0, store.working.length - soft)
+    }
+    // Promote high-signal world/error notes into semantic hypotheses lightly
+    if (/error|err|OUT_OF|NO_ENERGY|starve|death|hypothesis|假设/i.test(note.body + note.kind)) {
+      store.semantic.unshift({
+        subject: note.kind,
+        belief: note.body.slice(0, 160),
+        confidence: 0.45,
+      })
+      if (store.semantic.length > SEMANTIC_MAX) store.semantic.length = SEMANTIC_MAX
+    }
+    store.updatedAt = new Date().toISOString()
+    this.persist(agentId, store)
+  }
+
+  /** Short Chinese block for system prompt — probe notes only. */
   getPromptSection(agentId: AgentId): string {
     const s = this.load(agentId)
-    const lines: string[] = ['【记忆】']
-    if (s.working.length === 0 && s.episodic.length === 0 && s.semantic.length === 0) {
-      lines.push('- （尚无记忆）')
+    const lines: string[] = ['【探测笔记】']
+    const probes = s.working.filter((w) => w.from === 'probe' || w.kind === 'self').slice(-8)
+    const sem = s.semantic.slice(0, 6)
+    if (!probes.length && !sem.length) {
+      lines.push('- （尚无探测笔记；用 world_observe / 世界事件积累）')
       return lines.join('\n')
     }
-    const recent = s.working.slice(-6)
-    if (recent.length) {
-      lines.push('- 近期对话：')
-      for (const w of recent) {
-        lines.push(`  · ${w.from}: ${w.body.slice(0, 80)}`)
-      }
+    if (probes.length) {
+      lines.push('- 近期探测：')
+      for (const w of probes) lines.push(`  · ${w.body.slice(0, 100)}`)
     }
-    const epi = s.episodic.slice(-3)
-    if (epi.length) {
-      lines.push('- 情节记忆：')
-      for (const e of epi) {
-        lines.push(`  · (${e.salience.toFixed(1)}) ${e.summary.slice(0, 100)}`)
-      }
-    }
-    const sem = s.semantic.slice(0, 5)
     if (sem.length) {
-      lines.push('- 信念：')
-      for (const b of sem) {
-        lines.push(`  · 关于 ${b.subject}：${b.belief}（置信 ${b.confidence.toFixed(2)}）`)
-      }
+      lines.push('- 假设 / 错误码：')
+      for (const b of sem) lines.push(`  · ${b.subject}: ${b.belief.slice(0, 80)}`)
     }
     return lines.join('\n')
   }

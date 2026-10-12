@@ -126,6 +126,11 @@ async function main(): Promise<void> {
   }
   ctx.societyScheduler.setDefaultRoom(room.id)
   ctx.societyTools.setDefaultRoom(room.id)
+  ctx.societyWorld.setPlazaRoom(room.id)
+  const world = ctx.societyWorld.ensureSeeded(['human'])
+  console.log(
+    `✓ world: tick=${world.tick} baseline=${world.conservation_baseline} bots=${world.bots.length} ok=${ctx.societyWorld.conservationOk()}`,
+  )
   console.log(`✓ room: ${room.name} (${room.id.slice(0, 8)}…) members=${room.members.join(',') || '(empty)'}`)
 
   // New births during live: join plaza + allowlist so they show up and can act
@@ -144,10 +149,9 @@ async function main(): Promise<void> {
   if (agentIds.length && ctx.societyRooms.historyOf(room.id).length === 0) {
     const seed =
       process.env.SOCIETY_SEED_LINE?.trim() ||
-      '广场开机了。人类随时可以插话；我们先打个招呼。'
-    const from = agentIds[0]!
-    ctx.societyRooms.post({ roomId: room.id, from, body: seed })
-    console.log(`[seed] ${ctx.societyIdentity.displayNameOf(from)}: ${seed}`)
+      '[世界] 阴阳场直播中。生存看 energy_pool/core_integrity。人类：/world look 或直接闲聊。'
+    ctx.societyRooms.post({ roomId: room.id, from: 'system', body: seed })
+    console.log(`[seed] system: ${seed}`)
   }
 
   let tickRunning = false
@@ -162,6 +166,28 @@ async function main(): Promise<void> {
 
       if (parsed.kind === 'room') {
         const target = ctx.societyRooms.require(parsed.roomId!)
+        // World commands → system lines in plaza/world (not human bubble)
+        if (target.name === 'plaza' || target.id === room!.id) {
+          const handled = ctx.societyWorld.handleHumanText(req.text)
+          if (handled.handled) {
+            const synthetic = {
+              id: randomUUID(),
+              roomId: target.id,
+              from: 'system' as const,
+              body: handled.systemLines.join('\n') || '[世界] ok',
+              createdAt: new Date().toISOString(),
+            }
+            console.log(`[world] ← you: ${req.text}`)
+            return {
+              ok: true as const,
+              message: synthetic,
+              roomId: target.id,
+              roomName: target.name,
+              chatId: req.chatId,
+              kind: 'room' as const,
+            }
+          }
+        }
         const msg = ctx.societyRooms.post({
           roomId: target.id,
           from: HUMAN_SPEAKER_ID,
@@ -283,6 +309,27 @@ async function main(): Promise<void> {
       const found = ctx.societyRooms.listRooms().find((r) => r.name === req.roomName)
       if (!found) throw new Error(`unknown roomName: ${req.roomName}`)
       target = found
+    }
+    if (target.name === 'plaza' || target.id === room!.id) {
+      const handled = ctx.societyWorld.handleHumanText(req.text)
+      if (handled.handled) {
+        const synthetic = {
+          id: randomUUID(),
+          roomId: target.id,
+          from: 'system' as const,
+          body: handled.systemLines.join('\n') || '[世界] ok',
+          createdAt: new Date().toISOString(),
+        }
+        console.log(`[world] ← you: ${req.text}`)
+        return {
+          ok: true as const,
+          message: synthetic,
+          roomId: target.id,
+          roomName: target.name,
+          chatId: `room:${target.id}`,
+          kind: 'room' as const,
+        }
+      }
     }
     const msg = ctx.societyRooms.post({
       roomId: target.id,
@@ -407,8 +454,10 @@ async function main(): Promise<void> {
     onCreateDm,
     onSpawnAgent,
     getSettings: () => readObserveSettings(),
-    liveNote: () =>
-      `直播中 · tick=${ticksDone} exchanges=${ctx.societyScheduler.exchangeCountOf()}/${maxExchanges > 0 ? maxExchanges : "∞"} · 选中会话后发言 · 不暴露密钥`,
+    liveNote: () => {
+      const w = ctx.societyWorld.getState()
+      return `阴阳场直播 · societyTick=${ticksDone} worldTick=${w?.tick ?? '?'} · energyΣ=${w ? ctx.societyWorld.totalEnergy() : '?'} · /world look · 不暴露密钥`
+    },
   })
   await listenObserveServer(srv)
   console.log(`[live] http://${srv.host}:${srv.port}/`)

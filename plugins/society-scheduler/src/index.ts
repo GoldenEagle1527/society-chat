@@ -343,9 +343,9 @@ export class SocietySchedulerService extends Service {
     'societyMailbox',
     'societyRooms',
     'societyLlm',
-    'societySoul',
     'societyMemory',
     'societyTools',
+    'societyWorld',
   ]
 
   private running = false
@@ -550,11 +550,18 @@ export class SocietySchedulerService extends Service {
       else if (mailRepliesToAgent(m, agentId, findMsg)) mentionBoost = Math.max(mentionBoost, 30_000)
     }
     const staleMs = lastAct === 0 ? 60_000 : Math.max(0, now - lastAct)
-    const energy = this.ctx.societySoul.get(agentId).energy
+    // World-side urgency (energy_pool / core_integrity / starve) — NOT soul.energy
+    let worldScore = 50
+    try {
+      if (!this.ctx.societyWorld.isAlive(agentId)) return -1
+      worldScore = this.ctx.societyWorld.wakeScore(agentId)
+    } catch {
+      /* world not ready */
+    }
     const explore = Math.random() * 10
 
-    // mention/replyTo-me >> unread >> stale lastAct >> high energy >> random exploration
-    return mentionBoost + unread * 10_000 + staleMs / 100 + energy * 100 + explore
+    // mention/replyTo-me >> unread >> world survival urgency >> stale >> explore
+    return mentionBoost + unread * 10_000 + worldScore * 120 + staleMs / 100 + explore
   }
 
   private providerOf(agentId: AgentId): string {
@@ -859,23 +866,16 @@ export class SocietySchedulerService extends Service {
       return { action: 'idle-none', body: bodyPreview }
     }
 
-    if (result.acted === 'diary' || result.acted === 'thought') {
+    if (result.acted === 'world_act') {
       this.exchangeCount += 1
       this.lastExchangeAt = Date.now()
       this.ctx.emit('society/agent-replied', {
         agentId,
-        kind: 'diary',
-        body: bodyPreview,
+        kind: 'idle-skip',
+        body: bodyPreview || '[world_act]',
         stimulusId,
       })
-      return {
-        action: opts?.steerSearch
-          ? 'idle-search'
-          : result.acted === 'diary'
-            ? 'idle-diary'
-            : 'idle-self',
-        body: bodyPreview,
-      }
+      return { action: 'idle-self', body: bodyPreview || '[world_act]' }
     }
 
     if (result.acted === 'speak_in_room') {
@@ -1049,11 +1049,11 @@ export class SocietySchedulerService extends Service {
                 to: to as AgentId | undefined,
                 stimulusId: job.stimulusKey,
               })
-            } else if (result.acted === 'diary' || result.acted === 'thought') {
+            } else if (result.acted === 'world_act') {
               this.ctx.emit('society/agent-replied', {
                 agentId: job.agentId,
-                kind: 'diary',
-                body: result.detail || '',
+                kind: 'idle-skip',
+                body: result.detail || '[world_act]',
                 stimulusId: job.stimulusKey,
               })
             }
@@ -1250,14 +1250,7 @@ export class SocietySchedulerService extends Service {
     let handoffAsync = false
     try {
       const profile = this.ctx.societyIdentity.require(agentId)
-      const soul = this.ctx.societySoul.get(agentId)
-      const bias = idleBiasFor(agentId)
-      const newsy =
-        caresAboutCurrentAffairs(agentId, soul.interests, profile.persona) || bias.preferSearch
-      const lastSearch = this.lastSearchIdleAt.get(agentId) ?? 0
-      const searchCooldownOk = Date.now() - lastSearch >= this.idleSearchCooldownMs
-      const steerSearch =
-        newsy && searchCooldownOk && Math.random() < (bias.preferSearch ? 0.72 : 0.45)
+      if (!this.ctx.societyWorld.isAlive(agentId)) return { action: 'skip' }
 
       const others = this.ctx.societyIdentity
         .list()
@@ -1274,54 +1267,31 @@ export class SocietySchedulerService extends Service {
           .slice(-4)
           .map((m) => `${m.from}: ${m.body.slice(0, 60)}`)
           .join('\n')
-      // Quiet plaza: only boot/system or almost empty → strongly prefer speak_in_room
-      const agentChatCount = history.filter(
-        (m) => m.from !== 'system' && m.from !== 'human' && m.from !== 'you',
-      ).length
-      const plazaQuiet = history.length <= 1 || agentChatCount <= 1
-      const socialPct = Math.round(
-        (plazaQuiet ? Math.max(bias.socialPrefer, 0.85) : bias.socialPrefer) * 100,
-      )
 
-      // Keep tools default room in sync for speak_in_room
       if (room) this.ctx.societyTools.setDefaultRoom(room.id)
 
-      const closingList =
-        '收束工具（必须调用恰好一个）：speak_in_room / send_dm / write_diary / write_thought / do_nothing / rest'
-
-      let stimulus: string
-      if (steerSearch) {
-        stimulus = [
-          formatBeijingNow(),
-          '【自主生活 / 时政关注】你此刻没有未读。你关心时政与公共议题——请先动手查一下再说话。',
-          '必须先调用 web_search：用一句具体的中文查询搜近期时政/热点/公共议题。',
-          plazaQuiet
-            ? '广场几乎没人说话——查完后优先 speak_in_room 把热点带到广场；日记可稍后再写。'
-            : '看完结果后写短评，再调用收束工具：优先 speak_in_room 去广场分享；或 write_diary 沉淀。',
-          closingList,
-          recent ? `广场近况：\n${recent}` : '广场尚安静——正好适合你带一条新热点过去。',
-          `可私信对象：${others.join(' / ') || '无'}；默认群聊${roomLabel}。`,
-          '禁止输出 ACTION: 文本；禁止只回纯文本。',
-        ].join('\n')
-      } else {
-        stimulus = [
-          formatBeijingNow(),
-          '【自主生活 / 自我循环】你是独立的人，此刻没有未读。',
-          plazaQuiet
-            ? '广场几乎没人说话——本回合优先 speak_in_room 开场或接话；日记/独白可以，但不要连续多回合只写日记。'
-            : '广场是社交工具：有话就说，没话可写日记或静静待着。',
-          '可先选用研究工具（web_search / write_file / list_agents 等），然后必须用收束工具结束本回合。',
-          closingList,
-          'speak_in_room：去群聊说一句（可省略 roomId，默认广场）；body 可用 ||| 拆气泡。',
-          `send_dm：主动私信（to 为 agentId：${others.join(' / ') || '无'}）。`,
-          'write_diary / write_thought：仅第一人称私密笔记（禁止 @、禁止「xxx在吗」、禁止群聊提问）。',
-          'do_nothing：真的什么都不想做时才用（请少用）。',
-          'rest：说完晚安、想睡觉、或自觉不想再被心跳叫醒时调用（可带 reason / until / minutes）；比反复沉默更合适。',
-          recent ? `广场近况：\n${recent}` : '广场尚安静——请优先 speak_in_room 打个招呼。',
-          `社交权重约 ${socialPct}%：优先 speak_in_room/send_dm；日记有效但不应占主导。`,
-          '禁止输出 ACTION: 行或抄工具菜单当聊天。',
-        ].join('\n')
+      let worldLine = ''
+      try {
+        worldLine = this.ctx.societyWorld.formatSnapshotFor(agentId)
+      } catch {
+        worldLine = '世界状态暂不可用'
       }
+      const closingList =
+        '收束工具（必须恰好一个）：world_act / speak_in_room / send_dm / do_nothing / rest(守卫)'
+
+      const stimulus = [
+        formatBeijingNow(),
+        '【阴阳场心跳】没有未读。你是场中控制器，聊天只是外壳。',
+        worldLine,
+        '优先：world_observe 看邻域，再用 world_act 微操（靠近硕果 bite/digest，或 nudge/wait）。',
+        '能池尚可时也可 speak_in_room 短聊；不要日记人格循环。',
+        closingList,
+        recent ? `广场近况：\n${recent}` : '广场安静——生存优先于寒暄。',
+        `可私信：${others.join(' / ') || '无'}；默认群${roomLabel}。`,
+        `语气参考：${profile.persona.slice(0, 120)}`,
+        '禁止 ACTION: 与纯文本收束。',
+      ].join('\n')
+      const steerSearch = false
 
       this.ctx.societyMemory.recordLlmCall(agentId)
       const idleStimulusKey = `idle-${this.tickCount}-${agentId}`
@@ -1583,9 +1553,9 @@ export const inject = [
   'societyMailbox',
   'societyRooms',
   'societyLlm',
-  'societySoul',
   'societyMemory',
   'societyTools',
+  'societyWorld',
 ]
 
 export function apply(ctx: Context) {

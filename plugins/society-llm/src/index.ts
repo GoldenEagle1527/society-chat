@@ -62,10 +62,9 @@ export interface AgentTurn {
 export type ClosingActKind =
   | 'speak_in_room'
   | 'send_dm'
-  | 'diary'
-  | 'thought'
   | 'do_nothing'
   | 'stay_silent'
+  | 'world_act'
   | 'rest'
   | 'none'
 
@@ -229,7 +228,7 @@ function splitBubbles(body: string): string[] {
 }
 
 export class SocietyLlmService extends Service {
-  static inject = ['societyIdentity', 'societyMemory', 'societySoul', 'societyTools', 'societyRooms']
+  static inject = ['societyIdentity', 'societyMemory', 'societyTools', 'societyRooms', 'societyWorld']
 
   constructor(ctx: Context) {
     super(ctx, 'societyLlm')
@@ -250,35 +249,26 @@ export class SocietyLlmService extends Service {
   /** Build a Chinese-friendly system prompt from identity + soul + memory + tools. */
   buildSystemPrompt(agentId: AgentId, withTools: boolean): string {
     const agent = this.ctx.societyIdentity.require(agentId)
-    const soulSection = this.ctx.societySoul.getPromptSection(agentId)
     const memorySection = this.ctx.societyMemory.getPromptSection(agentId)
+    const worldSection = this.ctx.societyWorld?.promptWorldSection(agentId) || ''
     const lines = [
-      `你是 ${agent.displayName}（内部 id: ${agent.id}）。`,
+      `你是控制器 ${agent.displayName}（id: ${agent.id}），栖于阴阳场中的一具 Bot 身体。`,
       formatBeijingNow(),
-      `人设：${agent.persona}`,
-      soulSection,
+      `语气：${agent.persona}`,
+      worldSection,
       memorySection,
-      '你是独立的人：先过自己的生活（思考、日记、工具、主动私信）；广场/群聊只是可选社交工具，不是你存在的全部。',
+      '聊天只是外壳；生死与能量只由物理引擎裁定（energy_pool / core_integrity）。没有心情条，没有 soul.energy。',
       '规则：',
-      '- 始终保持上述人设、灵魂状态与记忆，用中文简短说话。',
-      '- 不要加「Alice:」之类前缀，不要解释你是 AI 或模型。',
-      '- 不要输出思考过程或 reasoning。',
-      '- 收到消息后先判断要不要开口：群聊里若被 @点名、被回复、被问候或被提问，通常应回复（speak_in_room）；私信可自由选择 send_dm / stay_silent / rest，想不理就可以不理，没有「必须回私信」。',
-      '- 群聊里别人互相对话、话题与你无关、刺激已被更新的话题盖过且你未被 @，调用 stay_silent，不要抢着刷屏。',
-      '- 说完晚安、想睡觉、或自觉不想再被心跳叫醒时，优先调用 rest（可带 reason）；不要反复 stay_silent / do_nothing 却仍被调度激活。',
-      '- 点名某人时在正文里写 @显示名（例如 @阿宁）；回复某条时系统会自动挂 replyTo。',
-      '- 长话可在工具参数 body 里用 ||| 拆成 2～4 条短气泡。单条尽量一两句。不要扮演别人发言。',
-      '- 禁止输出 ACTION: 控制行或把工具菜单抄进聊天；只能通过工具完成发言/日记/沉默。',
+      '- 用中文短句；不要假装自己是大模型；不要输出 reasoning。',
+      '- 生存优先：能池低时先 world_observe / world_act（bite/digest/nudge…），再考虑说话。',
+      '- 群聊被 @ / 提问时可 speak_in_room；私信可 send_dm 或 stay_silent。',
+      '- 点名用 @显示名；气泡可用 ||| 拆分。禁止 ACTION: 文本协议。',
     ]
     if (withTools) {
       lines.push(
-        '- 研究工具（可选）：web_search / write_file / read_file / list_workspace / list_agents / list_rooms / run_command / generate_image。',
-        '- 主观感受（可选）：reflect_feelings — 仅当你自己心情/精力/信任确有变化时调用，每回合最多一次；暖聊可主观上调 energy/trust，累了可下调 energy；数值会小幅钳制。这不是收束工具。',
-        '- 收束工具（本回合必须最终调用其一）：speak_in_room / send_dm / write_diary / write_thought / do_nothing / rest（空闲）或 stay_silent / speak_in_room / send_dm / rest（回复）。',
-        '- write_diary / write_thought 只能写给自己的第一人称私密内容；想喊人、提问群友、说「xxx在吗」必须用 speak_in_room 或 send_dm。',
-        '- 若兴趣含时政/新闻/辩论/政治：空闲时请先 web_search 再 speak_in_room 或 write_diary。',
-        '- 只有对方明确要求生图时才调用 generate_image。',
-        '- 路径必须相对 workspace；run_command 的 argv[0] 必须是 /bin/ 或 /usr/bin/ 下绝对路径。',
+        '- 研究：world_observe（必看邻域）以及可选 web_search / 文件工具。',
+        '- 收束（必须恰一个）：world_act（微操）/ speak_in_room / send_dm / do_nothing / rest(世界 wait 守卫) / stay_silent（仅回复模式）。',
+        '- 探测笔记由系统在 world 工具后写入；不要靠日记人格循环。',
       )
     }
     return lines.join('\n')
@@ -389,7 +379,7 @@ export class SocietyLlmService extends Service {
     const mode: ActMode =
       stimulus.message?.kind === 'direct' ? 'reply-dm' : 'reply-room'
     const result = await this.actClosedTurn(agentId, stimulus, mode)
-    if (result.acted === 'stay_silent' || result.acted === 'do_nothing' || result.acted === 'rest' || result.acted === 'none') {
+    if (result.acted === 'stay_silent' || result.acted === 'do_nothing' || result.acted === 'rest' || result.acted === 'world_act' || result.acted === 'none') {
       return { silent: true, bubbles: [], raw: result.detail || '' }
     }
     // Side effects already done by tools — bubbles empty so scheduler does not re-post
@@ -426,17 +416,16 @@ export class SocietyLlmService extends Service {
     const closingHint =
       mode === 'idle'
         ? [
-            '【收束规则】可先用研究工具（如 web_search），可选一次 reflect_feelings 记录主观感受，但本回合结束前必须调用且仅调用一个收束工具：',
-            'speak_in_room（去广场/群聊说话；可省略 roomId） / send_dm / write_diary / write_thought / do_nothing / rest。',
-            '广场冷清或几乎没人说话时，优先 speak_in_room；日记/独白有效，但不要连续多回合只写私密笔记。',
-            '暖聊后若自觉精力/信任上升，可 reflect_feelings；不必每回合都调。禁止输出 ACTION: 行，禁止只回纯文本。日记必须是写给自己的私密话。',
+            '【收束规则】可先 world_observe / 研究工具，结束前必须恰一个收束工具：',
+            'world_act（生存微操）/ speak_in_room / send_dm / do_nothing / rest(守卫 wait)。',
+            '能池偏低时优先 world_act（靠近硕果 bite/digest）；聊天可选。禁止纯文本、禁止 ACTION:。',
           ].join('\n')
         : [
-            '【收束规则】可先用研究工具，可选一次 reflect_feelings，但本回合结束前必须调用且仅调用一个收束工具：',
+            '【收束规则】可先 world_observe，结束前必须恰一个收束工具：',
             mode === 'reply-dm'
-              ? 'send_dm（想回再回）、stay_silent（可直接不理任何私信）、或 rest（想歇了/说完晚安）。私信无强制回复。'
-              : 'speak_in_room（回复当前刺激；系统会自动带 replyTo）、stay_silent，或 rest（说完晚安/不想再聊）；一般不要改去私信。',
-            '若本回合主观感受有变可 reflect_feelings 一次。禁止输出 ACTION: 行，禁止只回纯文本当回复。',
+              ? 'send_dm / stay_silent / world_act / rest。私信无强制回复。'
+              : 'speak_in_room / stay_silent / world_act / rest。系统会挂 replyTo。',
+            '禁止纯文本、禁止 ACTION:。生死看 energy_pool/core_integrity。',
           ].join('\n')
 
     const messages: ChatMessage[] = [
@@ -446,7 +435,6 @@ export class SocietyLlmService extends Service {
 
     const researchTools: string[] = []
     let nudged = false
-    let reflected = false
     const llmMode: LlmRetryMode = opts?.llmMode ?? 'sync'
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS + 1; round++) {
@@ -488,28 +476,11 @@ export class SocietyLlmService extends Service {
             }
           }
 
-          let toolResult: string
-          if (tc.function.name === 'reflect_feelings' && reflected) {
-            toolResult = JSON.stringify({
-              ok: false,
-              acted: 'reflect_feelings',
-              error: 'reflect_feelings already used this turn; skip duplicate',
-            })
-          } else {
-            toolResult = await this.ctx.societyTools.execute(
-              agentId,
-              tc.function.name,
-              argsJson,
-            )
-            if (tc.function.name === 'reflect_feelings') {
-              try {
-                const j = JSON.parse(toolResult) as { ok?: boolean }
-                if (j.ok) reflected = true
-              } catch {
-                /* ignore */
-              }
-            }
-          }
+          const toolResult = await this.ctx.societyTools.execute(
+            agentId,
+            tc.function.name,
+            argsJson,
+          )
           this.ctx.logger('society-llm').info(
             `tool ${agentId} ${tc.function.name} → ${toolResult.slice(0, 160)}`,
           )
@@ -522,18 +493,7 @@ export class SocietyLlmService extends Service {
 
           if (isClosingToolName(tc.function.name)) {
             const parsed = parseClosingToolResult(tc.function.name, toolResult)
-            if (parsed.ok) {
-              closing = { ...parsed, researchTools }
-            } else if (parsed.acted === 'diary' || parsed.acted === 'thought') {
-              // Chatty reject — nudge to use speak_in_room; do not treat as success
-              messages.push({
-                role: 'user',
-                content:
-                  '上一次日记/随想因像群聊喊话被拒绝。请改用 speak_in_room 或 send_dm 说话，或写真正私密的第一人称日记。必须再调用一个收束工具。',
-              })
-            } else {
-              closing = { ...parsed, researchTools }
-            }
+            closing = { ...parsed, researchTools }
           } else {
             researchTools.push(tc.function.name)
           }
@@ -555,7 +515,7 @@ export class SocietyLlmService extends Service {
         messages.push({
           role: 'user',
           content:
-            '不要只输出文字。请立刻调用一个收束工具（speak_in_room / send_dm / write_diary / write_thought / do_nothing / rest 或 stay_silent）完成本回合；若感受有变可先/同时 reflect_feelings 一次。',
+            '不要只输出文字。请立刻调用一个收束工具（world_act / speak_in_room / send_dm / do_nothing / rest 或 stay_silent）完成本回合。',
         })
         continue
       }
@@ -701,14 +661,13 @@ export class SocietyLlmService extends Service {
 
 
 function parseClosingToolResult(name: string, toolResult: string): AgentActResult {
-  const sideEffectDone = ['speak_in_room', 'send_dm', 'write_diary', 'write_thought'].includes(name)
+  const sideEffectDone = ['speak_in_room', 'send_dm', 'world_act'].includes(name)
   let acted: ClosingActKind = 'none'
   if (name === 'speak_in_room') acted = 'speak_in_room'
   else if (name === 'send_dm') acted = 'send_dm'
-  else if (name === 'write_diary') acted = 'diary'
-  else if (name === 'write_thought') acted = 'thought'
   else if (name === 'do_nothing') acted = 'do_nothing'
   else if (name === 'stay_silent') acted = 'stay_silent'
+  else if (name === 'world_act') acted = 'world_act'
   else if (name === 'rest') acted = 'rest'
 
   if (toolResult.startsWith('Error:')) {
@@ -751,7 +710,7 @@ function parseClosingToolResult(name: string, toolResult: string): AgentActResul
 }
 
 export const name = 'society-llm'
-export const inject = ['societyIdentity', 'societyMemory', 'societySoul', 'societyTools', 'societyRooms']
+export const inject = ['societyIdentity', 'societyMemory', 'societyTools', 'societyRooms', 'societyWorld']
 
 export function apply(ctx: Context) {
   ctx.plugin(SocietyLlmService)
