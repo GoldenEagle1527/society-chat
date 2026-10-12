@@ -91,8 +91,8 @@ export const FRUIT_TAIL_THRESHOLD = 100
 export const CLUMP_FORAGE_POOL_THRESHOLD = 8
 /** Boost condense/bite when fruit locked at or below this (nearly gone). */
 export const FRUIT_NEARLY_GONE = 80
-export const CONDENSE_MIN_WASTE = 3
-export const CONDENSE_DRAW = 6
+export const CONDENSE_MIN_WASTE = 8
+export const CONDENSE_DRAW = 20
 export const CONDENSE_WINDOW_RADIUS = 3.5
 export const CONDENSE_MIN_YIN = 1
 export const CONDENSE_MIN_YANG = 1
@@ -117,6 +117,8 @@ const TELEMETRY_REJECT_CODES: ReadonlySet<ActRejectCode> = new Set([
   'REFUSED_REVIVE_BITE',
   'REFUSED_CONDENSE_MIX',
   'REFUSED_CONDENSE_COOLDOWN',
+  'REFUSED_CONDENSE_PREP',
+  'REFUSED_CLUMP_WAIT',
 ])
 
 const DIRS: Record<string, Vec2> = {
@@ -554,11 +556,50 @@ function noteCondenseSuccess(bot: BotBody): void {
   bot.condenseCooldownUntil = 0
 }
 
+
 function fruitPresent(state: WorldState): boolean {
   return state.organics.some((o) => o.kind === 'fruit' && o.energy_locked > 0.01)
 }
 
 
+
+
+/** Post-fruit mix incomplete → prep gate (pull/nudge/move toward opposite only). */
+export function mixPrepGateActive(state: WorldState, bot: BotBody): boolean {
+  if (fruitPresent(state)) return false
+  const pre = evaluateCondensePrereqs(state, bot)
+  return !pre.mix_ok
+}
+
+function clumpInView(state: WorldState, bot: BotBody): Organic | null {
+  let best: Organic | null = null
+  let bestD = Infinity
+  for (const o of state.organics) {
+    if (o.kind !== 'clump' || o.energy_locked <= 0.01) continue
+    const d = dist(bot.pos, o.pos)
+    if (d <= VIEW_RADIUS + o.radius && d < bestD) {
+      bestD = d
+      best = o
+    }
+  }
+  return best
+}
+
+/** Cardinal/diagonal unit step that reduces distance to target (or null if none). */
+function stepToward(from: Vec2, to: Vec2): Vec2 | null {
+  const dx = Math.sign(to.x - from.x)
+  const dy = Math.sign(to.y - from.y)
+  if (dx === 0 && dy === 0) return null
+  return { x: dx, y: dy }
+}
+
+function moveReducesDist(from: Vec2, dir: Vec2, target: Vec2, width: number, height: number): boolean {
+  const next = {
+    x: clamp(from.x + dir.x, 0, width - 1),
+    y: clamp(from.y + dir.y, 0, height - 1),
+  }
+  return dist(next, target) + 1e-9 < dist(from, target)
+}
 
 
 /** True if this relocate reverses the bot's previous pull/nudge on the same particle. */
@@ -897,37 +938,52 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     urgency = Math.max(urgency, 28)
   }
   if (fruit_gone) {
-    // Post-fruit: teach mix prep — pin pull/nudge when window unbalanced
+    // Post-fruit: teach mix prep — pin pull/nudge/move when window unbalanced
     urgency = Math.max(urgency, 40)
     if (condenseInfo.refuse_cooldown || (!condenseInfo.mix_ok && condenseInfo.fail_streak > 0)) {
       urgency = Math.max(urgency, 48)
     }
+    // Hungry + clump in view: elevate bite(clump) (wait will be hard-refused)
+    if (clumpsList.length && bot.energy_pool < CLUMP_FORAGE_POOL_THRESHOLD) {
+      urgency = Math.max(urgency, 50)
+      alerts.push(
+        `CLUMP_FORAGE pool=${bot.energy_pool}<${CLUMP_FORAGE_POOL_THRESHOLD} clumps=${clumpsList.length} — bite(clump); wait REFUSED_CLUMP_WAIT`,
+      )
+      if (!suggested_ops.includes('bite')) suggested_ops.unshift('bite')
+      if (!suggested_ops.includes('digest')) suggested_ops.splice(1, 0, 'digest')
+    }
     if (condenseInfo.prereq_ok) {
       if (!suggested_ops.includes('condense')) suggested_ops.unshift('condense')
     } else if (!condenseInfo.mix_ok || condenseInfo.refuse_cooldown) {
-      // Hard-pin prep ops; do not suggest condense until mix ok
-      const pinned: WorldOp[] = ['pull', 'nudge']
+      const pinned: WorldOp[] = ['pull', 'nudge', 'move']
       if (condenseInfo.nearest_opposite) {
         alerts.push(
-          `CONDENSE_MIX missing=${condenseInfo.missing} local_yin=${condenseInfo.local_yin} local_yang=${condenseInfo.local_yang} — pull/nudge ${condenseInfo.nearest_opposite.kind} ${condenseInfo.nearest_opposite.id} (d=${condenseInfo.nearest_opposite.dist}) into r=${CONDENSE_WINDOW_RADIUS}`,
+          `CONDENSE_MIX missing=${condenseInfo.missing} local_yin=${condenseInfo.local_yin} local_yang=${condenseInfo.local_yang} — ONLY pull/nudge/move toward ${condenseInfo.nearest_opposite.kind} ${condenseInfo.nearest_opposite.id} (d=${condenseInfo.nearest_opposite.dist}) r=${CONDENSE_WINDOW_RADIUS}`,
         )
       } else {
         alerts.push(
-          `CONDENSE_MIX missing=${condenseInfo.missing} local_yin=${condenseInfo.local_yin} local_yang=${condenseInfo.local_yang} — bring opposite polarity into r=${CONDENSE_WINDOW_RADIUS}`,
+          `CONDENSE_MIX missing=${condenseInfo.missing} local_yin=${condenseInfo.local_yin} local_yang=${condenseInfo.local_yang} — bring opposite into r=${CONDENSE_WINDOW_RADIUS}`,
         )
       }
       if (condenseInfo.cooldown_ticks_left > 0) {
         alerts.push(
-          `CONDENSE_COOLDOWN ${condenseInfo.cooldown_ticks_left}t — stop empty smash; arrange mix first`,
+          `CONDENSE_COOLDOWN ${condenseInfo.cooldown_ticks_left}t — arrange mix; empty smash blocked`,
         )
       }
       const reviveFirst = suggested_ops[0] === 'revive'
-      const head = reviveFirst ? (['revive'] as WorldOp[]) : []
-      const rest = suggested_ops.filter((o) => o !== 'revive' && o !== 'condense' && o !== 'pull' && o !== 'nudge')
+      const biteFirst = suggested_ops[0] === 'bite' || suggested_ops[1] === 'bite'
+      const head: WorldOp[] = []
+      if (reviveFirst) head.push('revive')
+      if (suggested_ops.includes('bite') && bot.energy_pool < CLUMP_FORAGE_POOL_THRESHOLD) {
+        if (!head.includes('bite')) head.push('bite')
+      }
+      const rest = suggested_ops.filter(
+        (o) => !head.includes(o) && o !== 'condense' && o !== 'pull' && o !== 'nudge' && o !== 'move' && o !== 'wait',
+      )
       suggested_ops.length = 0
       suggested_ops.push(...head, ...pinned, ...rest)
     } else {
-      for (const op of ['pull', 'nudge', 'adsorb'] as WorldOp[]) {
+      for (const op of ['pull', 'nudge', 'move'] as WorldOp[]) {
         if (!suggested_ops.includes(op)) suggested_ops.push(op)
       }
     }
@@ -1078,6 +1134,109 @@ function applyOne(
     if (bot.energy_pool + 1e-9 < cost) {
       reject(state, receipt, bot, idx, 'NO_ENERGY', `pool ${bot.energy_pool} < cost ${cost}`)
       return
+    }
+  }
+
+
+  // --- Mix-prep hard gate (post-fruit, window unbalanced) ---
+  // Revive duty always wins; digest + bite(clump) when foraging still allowed.
+  {
+    const fruitGone = !fruitPresent(state)
+    const preGate = fruitGone ? evaluateCondensePrereqs(state, bot) : null
+    const mixPrep = Boolean(fruitGone && preGate && !preGate.mix_ok)
+    const clumpView = clumpInView(state, bot)
+    const hungryClump =
+      Boolean(clumpView) && bot.energy_pool < CLUMP_FORAGE_POOL_THRESHOLD
+
+    if (op === 'wait' && hungryClump && !reviveDutyCorpse(state, bot)) {
+      reject(
+        state,
+        receipt,
+        bot,
+        idx,
+        'REFUSED_CLUMP_WAIT',
+        `clump ${clumpView!.id} in view (locked=${clumpView!.energy_locked}) and pool ${bot.energy_pool}<${CLUMP_FORAGE_POOL_THRESHOLD} — bite(clump) not wait`,
+        {
+          clump: clumpView!.id,
+          energy_locked: clumpView!.energy_locked,
+          pool: bot.energy_pool,
+        },
+      )
+      return
+    }
+
+    if (mixPrep) {
+      const opp = preGate!.nearest_opposite
+      const missing = preGate!.missing
+      const allowedAlways = op === 'revive' || op === 'digest'
+      const biteClumpOk =
+        op === 'bite' &&
+        action.target_id &&
+        state.organics.some(
+          (o) => o.id === action.target_id && o.kind === 'clump' && o.energy_locked > 0.01,
+        )
+      if (allowedAlways || biteClumpOk) {
+        // pass through
+      } else if (op === 'pull' || op === 'nudge') {
+        const target = action.target_id ? findParticle(state, action.target_id) : undefined
+        const kindOk =
+          target &&
+          !target.boundTo &&
+          (missing === 'both'
+            ? true
+            : missing === 'yin' || missing === 'yang'
+              ? target.kind === missing
+              : false)
+        const idOk = opp ? target && target.id === opp.id : kindOk
+        if (!target || (!kindOk && !idOk)) {
+          reject(
+            state,
+            receipt,
+            bot,
+            idx,
+            'REFUSED_CONDENSE_PREP',
+            `mix missing=${missing} — ${op} must target opposite (${opp ? `${opp.kind} ${opp.id}@${opp.dist}` : missing}) into r=${CONDENSE_WINDOW_RADIUS}`,
+            { missing, nearest_opposite: opp, local_yin: preGate!.local_yin, local_yang: preGate!.local_yang },
+          )
+          return
+        }
+      } else if (op === 'move') {
+        const dir = parseDir(action.dir)
+        if (!opp) {
+          // no opposite particle in world — allow move to search
+        } else if (!dir || (dir.x === 0 && dir.y === 0)) {
+          reject(state, receipt, bot, idx, 'ILLEGAL_OP', 'dir required for move')
+          return
+        } else {
+          // Find particle pos for opposite
+          const pOpp = findParticle(state, opp.id)
+          if (pOpp && !moveReducesDist(bot.pos, dir, pOpp.pos, state.width, state.height)) {
+            reject(
+              state,
+              receipt,
+              bot,
+              idx,
+              'REFUSED_CONDENSE_PREP',
+              `mix missing=${missing} — move must approach ${opp.kind} ${opp.id} (d=${opp.dist})`,
+              { missing, nearest_opposite: opp, dir: action.dir },
+            )
+            return
+          }
+        }
+      } else if (op === 'condense') {
+        // fall through to condense case (REFUSED_CONDENSE_MIX / cooldown)
+      } else {
+        reject(
+          state,
+          receipt,
+          bot,
+          idx,
+          'REFUSED_CONDENSE_PREP',
+          `mix missing=${missing} local_yin=${preGate!.local_yin} local_yang=${preGate!.local_yang} — only pull/nudge/move toward opposite (or revive/digest/bite clump); refused ${op}`,
+          { missing, nearest_opposite: opp, refused_op: op },
+        )
+        return
+      }
     }
   }
 

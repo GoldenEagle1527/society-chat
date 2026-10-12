@@ -8,6 +8,7 @@ import {
   ACTION_COST,
   biteCostForStreak,
   biteYieldForStreak,
+  CONDENSE_DRAW,
   CONDENSE_EFFICIENCY,
   CONDENSE_MIN_WASTE,
   conservationOk,
@@ -416,6 +417,53 @@ function main(): void {
       bot.condenseFailStreak = 0
       bot.condenseCooldownUntil = 0
       console.log('✓ REFUSED_CONDENSE_MIX + cooldown teaching')
+
+      // Prep gate: catalyze refused; pull wrong kind refused; pull opposite ok
+      bot.condenseFailStreak = 0
+      bot.condenseCooldownUntil = 0
+      transferPool(bot, state, 8)
+      const badCat = act(
+        state,
+        { actor_id: 'agnes', budget_energy: 5, actions: [{ op: 'catalyze', target_id: state.particles.find((p) => !p.boundTo)!.id }] },
+        { settle: false },
+      )
+      assert.ok(badCat.rejected.some((r) => r.code === 'REFUSED_CONDENSE_PREP'), `prep catalyze ${JSON.stringify(badCat.rejected)}`)
+      const yinNear = state.particles.find((p) => !p.boundTo && p.kind === 'yin')!
+      yinNear.pos = { x: bot.pos.x + 1, y: bot.pos.y }
+      const yangFar = state.particles.find((p) => !p.boundTo && p.kind === 'yang')!
+      yangFar.pos = { x: 0, y: 0 }
+      const badPull = act(
+        state,
+        { actor_id: 'agnes', budget_energy: 5, actions: [{ op: 'pull', target_id: yinNear.id, dir: 'e' }] },
+        { settle: false },
+      )
+      assert.ok(badPull.rejected.some((r) => r.code === 'REFUSED_CONDENSE_PREP'), `pull yin while missing yang ${JSON.stringify(badPull.rejected)}`)
+      // Window has yin only; sole yang east → move east toward it
+      bot.pos = { x: 10, y: 10 }
+      yinNear.pos = { x: 10, y: 11 } // south of bot; east cell free for move
+      for (const p of state.particles) {
+        if (p.boundTo) continue
+        if (p.kind === 'yang') p.pos = { x: 40, y: 40 } // park all yang far SE
+        else if (p.id !== yinNear.id) p.pos = { x: 0, y: 0 }
+      }
+      yangFar.pos = { x: 18, y: 10 } // only yang east of bot
+      const snapPre = observe(state, 'agnes')
+      assert.equal(snapPre.condense.missing, 'yang', `missing before move ${snapPre.condense.missing}`)
+      assert.equal(snapPre.condense.nearest_opposite?.id, yangFar.id, `nearest ${snapPre.condense.nearest_opposite}`)
+      const goodMove = act(
+        state,
+        { actor_id: 'agnes', budget_energy: 5, actions: [{ op: 'move', dir: 'e' }] },
+        { settle: false },
+      )
+      assert.ok(goodMove.accepted.includes(0), `move toward opposite ${JSON.stringify(goodMove)}`)
+      const badMove = act(
+        state,
+        { actor_id: 'agnes', budget_energy: 5, actions: [{ op: 'move', dir: 'w' }] },
+        { settle: false },
+      )
+      assert.ok(badMove.rejected.some((r) => r.code === 'REFUSED_CONDENSE_PREP'), `move away ${JSON.stringify(badMove.rejected)}`)
+      assert.ok(state.events.some((e) => e.type === 'refused_condense_prep'), 'telemetry prep')
+      console.log('✓ REFUSED_CONDENSE_PREP gate + move toward opposite')
     }
 
     // Seed yin+yang near bot + enough waste
@@ -435,6 +483,19 @@ function main(): void {
       // mint via baseline-safe: transfer from bot stomach/pool already in ledger — use waste bump from fruit drain
     }
     transferPool(bot, state, ACTION_COST.condense + 3)
+    // Ensure enough waste_heat for full CONDENSE_DRAW (locked ~= DRAW*eff ≥ 4)
+    if (state.waste_heat < CONDENSE_DRAW) {
+      const need = CONDENSE_DRAW - state.waste_heat
+      // conservation: take from bot stomach/pool excess via ledger — park from other bots
+      for (const b of state.bots) {
+        if (need <= 0) break
+        if (b.stomach > 0) {
+          const t = Math.min(b.stomach, need)
+          b.stomach = Math.round((b.stomach - t) * 1000) / 1000
+          state.waste_heat = Math.round((state.waste_heat + t) * 1000) / 1000
+        }
+      }
+    }
     const pre = evaluateCondensePrereqs(state, bot)
     assert.ok(pre.prereq_ok, `condense prereq ${pre.prereq_reason}`)
     const evC = state.events.length
@@ -449,11 +510,34 @@ function main(): void {
     const clump = state.organics.find((o) => o.kind === 'clump')
     assert.ok(clump && clump.energy_locked > 0, 'clump created')
     assert.ok(
-      clump!.energy_locked > 0 &&
-        clump!.energy_locked <= 6 * CONDENSE_EFFICIENCY + 0.05,
-      `locked=${clump!.energy_locked} eff=${CONDENSE_EFFICIENCY}`,
+      clump!.energy_locked >= 4 - 0.05 &&
+        clump!.energy_locked <= CONDENSE_DRAW * CONDENSE_EFFICIENCY + 0.05,
+      `locked=${clump!.energy_locked} expect ~${CONDENSE_DRAW * CONDENSE_EFFICIENCY}`,
     )
     assert.ok(conservationOk(state, 0.5), `after condense Σ=${totalEnergy(state)}`)
+
+    // Low pool + clump in view → wait refused; bite(clump) elevated
+    {
+      transferPool(bot, state, 3) // below CLUMP_FORAGE_POOL_THRESHOLD (8)
+      const snapC = observe(state, 'agnes')
+      assert.ok(snapC.suggested_ops.includes('bite'), `suggest bite got ${snapC.suggested_ops}`)
+      const waitC = act(
+        state,
+        { actor_id: 'agnes', budget_energy: 2, actions: [{ op: 'wait' }] },
+        { settle: false },
+      )
+      assert.ok(waitC.rejected.some((r) => r.code === 'REFUSED_CLUMP_WAIT'), `clump wait ${JSON.stringify(waitC.rejected)}`)
+      bot.pos = { ...clump!.pos }
+      transferPool(bot, state, 5)
+      const biteCl = act(
+        state,
+        { actor_id: 'agnes', budget_energy: 5, actions: [{ op: 'bite', target_id: clump!.id }] },
+        { settle: false },
+      )
+      assert.ok(biteCl.accepted.includes(0), `clump bite ${JSON.stringify(biteCl)}`)
+      assert.ok(state.events.some((e) => e.type === 'bite' && e.payload.kind === 'clump'), 'clump bite event')
+      console.log('✓ REFUSED_CLUMP_WAIT + clumpBite')
+    }
 
     // Corpse bite low yield
     const corpse = {
@@ -511,6 +595,21 @@ function main(): void {
     console.log(
       `✓ post-fruit condense locked=${clump!.energy_locked} corpseBite stomach+${gained.toFixed(2)} core=${bot.core_integrity}`,
     )
+  }
+
+  // Re-plant tiny fruit so mix-prep gate (post-fruit) does not block pull osc tests
+  {
+    const need = 1
+    if (state.waste_heat >= need) {
+      state.waste_heat = Math.round((state.waste_heat - need) * 1000) / 1000
+      state.organics.push({
+        id: 'fruit_smoke_keep',
+        kind: 'fruit',
+        pos: { x: 2, y: 2 },
+        energy_locked: need,
+        radius: 3,
+      })
+    }
   }
 
   // spam pull far from others unpaid (isolate particle)

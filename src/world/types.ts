@@ -20,6 +20,10 @@ export type ActRejectCode =
   | 'REFUSED_CONDENSE_MIX'
   /** Condense refused: consecutive empty fails → cool down (teach prep). */
   | 'REFUSED_CONDENSE_COOLDOWN'
+  /** Mix incomplete: only pull/nudge/move toward opposite (post-fruit prep). */
+  | 'REFUSED_CONDENSE_PREP'
+  /** Clump in view + low pool: wait refused — bite(clump) instead. */
+  | 'REFUSED_CLUMP_WAIT'
 
 export interface Vec2 {
   x: number
