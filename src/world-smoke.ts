@@ -5,11 +5,13 @@
 import assert from 'node:assert/strict'
 import {
   act,
+  ACTION_COST,
   biteCostForStreak,
   biteYieldForStreak,
   conservationOk,
   createSeedWorld,
   observe,
+  REVIVE_SAFETY_MARGIN,
   SATIETY_THRESHOLD,
   stepPhysics,
   totalEnergy,
@@ -258,6 +260,82 @@ function main(): void {
       'wait_neglect must NOT fire without corpse',
     )
     console.log('✓ wait_neglect only near corpse (dying alone ignored)')
+  }
+
+  // --- revive duty: wait/bite refused when corpse in view + pool covers revive+margin ---
+  {
+    const victim = state.bots.find((b) => b.actorId === 'glm')!
+    state.organics = state.organics.filter((o) => o.kind !== 'corpse')
+    // Fund corpse locked from waste_heat (conservation); clear victim pools
+    const locked = 20
+    const fruit = state.organics.find((o) => o.kind === 'fruit')!
+    assert.ok(fruit.energy_locked + 1e-9 >= locked, 'need fruit energy to fund test corpse')
+    fruit.energy_locked = Math.round((fruit.energy_locked - locked) * 1000) / 1000
+    fruit.pos = { ...bot.pos }
+    victim.energy_pool = 0
+    victim.stomach = 0
+    victim.alive = false
+    const corpse = {
+      id: 'corpse_duty_test',
+      kind: 'corpse' as const,
+      pos: { x: bot.pos.x + 1, y: bot.pos.y },
+      energy_locked: locked,
+      corpseOf: 'glm',
+      diedAtTick: state.tick,
+      radius: 1,
+    }
+    state.organics.push(corpse)
+    transferPool(bot, state, ACTION_COST.revive + REVIVE_SAFETY_MARGIN + 1)
+    assert.ok(conservationOk(state, 0.5), `pre-duty Σ=${totalEnergy(state)} baseline=${state.conservation_baseline}`)
+    const evDuty = state.events.length
+    const waitR = act(state, { actor_id: 'agnes', budget_energy: 2, actions: [{ op: 'wait' }] }, { settle: false })
+    assert.ok(
+      waitR.rejected.some((r) => r.code === 'REFUSED_REVIVE_WAIT'),
+      `expected REFUSED_REVIVE_WAIT got ${JSON.stringify(waitR.rejected)}`,
+    )
+    const biteR = act(
+      state,
+      { actor_id: 'agnes', budget_energy: 5, actions: [{ op: 'bite', target_id: fruit.id }] },
+      { settle: false },
+    )
+    assert.ok(
+      biteR.rejected.some((r) => r.code === 'REFUSED_REVIVE_BITE'),
+      `expected REFUSED_REVIVE_BITE got ${JSON.stringify(biteR.rejected)}`,
+    )
+    assert.ok(
+      state.events.slice(evDuty).some((e) => e.type === 'refused_revive_wait'),
+      'telemetry refused_revive_wait',
+    )
+    assert.ok(
+      state.events.slice(evDuty).some((e) => e.type === 'refused_revive_bite'),
+      'telemetry refused_revive_bite',
+    )
+    const snapD = observe(state, 'agnes')
+    assert.equal(snapD.suggested_ops[0], 'revive', `revive pinned got ${snapD.suggested_ops}`)
+    bot.pos = { ...corpse.pos }
+    transferPool(bot, state, ACTION_COST.revive + 2)
+    const poolBefore = bot.energy_pool
+    const rev = act(
+      state,
+      { actor_id: 'agnes', budget_energy: 20, actions: [{ op: 'revive', target_id: corpse.id }] },
+      { settle: false },
+    )
+    assert.ok(rev.accepted.includes(0), `revive accepted ${JSON.stringify(rev)}`)
+    assert.ok(victim.alive, 'victim alive')
+    assert.ok(
+      state.events.some((e) => e.type === 'revived' && e.payload.revived === 'glm'),
+      'revived event',
+    )
+    assert.ok(
+      conservationOk(state, 0.5),
+      `after revive Σ=${totalEnergy(state)} baseline=${state.conservation_baseline}`,
+    )
+    // Net: -cost + savior_share; with locked=20 share=7 cost=8 → net -1
+    assert.ok(Math.abs(bot.energy_pool - (poolBefore - ACTION_COST.revive + 7)) < 0.05, 'savior share 35%')
+    assert.ok(Math.abs(victim.energy_pool - 9) < 0.05, 'revived share 45% of 20')
+    console.log(
+      `✓ revive duty refuse wait/bite; revived split ok savior=${bot.energy_pool} revived=${victim.energy_pool}`,
+    )
   }
 
   // spam pull far from others unpaid (isolate particle)

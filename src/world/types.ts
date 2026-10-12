@@ -2,7 +2,7 @@
 
 export type ParticleKind = 'yin' | 'yang'
 export type OrganicKind = 'fruit' | 'corpse' | 'clump'
-export type WorldOp = 'nudge' | 'pull' | 'adsorb' | 'catalyze' | 'bite' | 'digest' | 'wait' | 'revive'
+export type WorldOp = 'nudge' | 'pull' | 'adsorb' | 'catalyze' | 'bite' | 'digest' | 'wait' | 'revive' | 'move'
 
 export type ActRejectCode =
   | 'OUT_OF_RANGE'
@@ -12,6 +12,10 @@ export type ActRejectCode =
   | 'ILLEGAL_OP'
   | 'BUDGET_EXCEEDED'
   | 'REFUSED_SATIATED'
+  /** Wait refused: corpse in view and pool can cover revive+margin. */
+  | 'REFUSED_REVIVE_WAIT'
+  /** Non-starvation bite refused: same duty gate. */
+  | 'REFUSED_REVIVE_BITE'
 
 export interface Vec2 {
   x: number

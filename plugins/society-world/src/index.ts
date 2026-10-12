@@ -168,7 +168,7 @@ export class SocietyWorldService extends Service {
         '【阴阳场身体】',
         formatSnapshotLine(snap),
         '生存只看 energy_pool / core_integrity（不是心情）。能池空会饿死；死亡由引擎裁定。',
-        '工具：world_observe 读邻域；world_act 提交微操（nudge/pull/adsorb/catalyze/bite/digest/wait/revive）。',
+        '工具：world_observe 读邻域；world_act 提交微操（nudge/pull/adsorb/catalyze/bite/digest/wait/revive/move）。',
         `行动成本：revive=${snap.revive_cost}（最贵）、adsorb=${snap.action_costs.adsorb}、bite=${snap.action_costs.bite}、pull=${snap.action_costs.pull}、wait=${snap.action_costs.wait}。`,
         `紧迫度 urgency=${snap.urgency}；建议操作 suggested_ops=[${(snap.suggested_ops || []).join(',')}]。有尸体时优先 revive，禁止在尸体旁干等。`,
         '引擎立法：能池≥餍足阈值时咬果 → REFUSED_SATIATED；同目标连啃成本升、收益降。刚好够优于囤满。',
@@ -190,7 +190,7 @@ export class SocietyWorldService extends Service {
             )
           }
         }
-        lines.push('有尸体时 wait → wait_neglect（无 micro_reward）；无尸体时 wait 不发 wait_neglect。锁能每 tick 渗漏到废热。')
+        lines.push('有尸体且能池≥revive+余量：wait→REFUSED_REVIVE_WAIT、非饥饿咬果→REFUSED_REVIVE_BITE（引擎硬拒）。无尸体时 wait 不发 wait_neglect。锁能每 tick 渗漏；复活成功双方分锁能。')
       }
       if (snap.dying?.length) {
         lines.push('【濒死同伴】')

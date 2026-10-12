@@ -42,6 +42,7 @@ export const ACTION_COST: Record<WorldOp, number> = {
   digest: 0.5,
   wait: 0.2,
   revive: 8,
+  move: 1,
 }
 export const STARVE_TICKS_TO_DIE = 8
 export const CORE_DEATH = 0.05
@@ -69,8 +70,17 @@ export const REVIVE_RANGE = INTERACT_RADIUS + 1
 export const CORPSE_LOCK_LEAK = 0.08
 /** After this many ticks without revive, harden corpse alerts. */
 export const CORPSE_NEGLECT_HARDEN_TICKS = 4
+/** Pool must cover revive cost + this margin before wait/bite are hard-refused. */
+export const REVIVE_SAFETY_MARGIN = 1
+/** Fraction of corpse locked energy granted to savior / revived (rest → waste). */
+export const REVIVE_SHARE_SAVIOR = 0.35
+export const REVIVE_SHARE_REVIVED = 0.45
 /** Reject codes that emit a world event (design telemetry; avoid flood). */
-const TELEMETRY_REJECT_CODES: ReadonlySet<ActRejectCode> = new Set(['REFUSED_SATIATED'])
+const TELEMETRY_REJECT_CODES: ReadonlySet<ActRejectCode> = new Set([
+  'REFUSED_SATIATED',
+  'REFUSED_REVIVE_WAIT',
+  'REFUSED_REVIVE_BITE',
+])
 
 const DIRS: Record<string, Vec2> = {
   n: { x: 0, y: -1 },
@@ -328,6 +338,24 @@ function corpseNear(state: WorldState, bot: BotBody, radius: number): boolean {
   return state.organics.some((o) => o.kind === 'corpse' && dist(bot.pos, o.pos) <= radius)
 }
 
+/** Nearest corpse in view if bot can afford revive+margin (engine revive pressure). */
+function reviveDutyCorpse(state: WorldState, bot: BotBody): Organic | null {
+  const need = ACTION_COST.revive + REVIVE_SAFETY_MARGIN
+  if (bot.energy_pool + 1e-9 < need) return null
+  let best: Organic | null = null
+  let bestD = Infinity
+  for (const o of state.organics) {
+    if (o.kind !== 'corpse' || !o.corpseOf) continue
+    const d = dist(bot.pos, o.pos)
+    if (d <= VIEW_RADIUS + o.radius && d < bestD) {
+      bestD = d
+      best = o
+    }
+  }
+  return best
+}
+
+
 /** True if this relocate reverses the bot's previous pull/nudge on the same particle. */
 export function isPullOscillation(
   bot: BotBody,
@@ -584,17 +612,32 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     )
   }
 
-  // Urgency + suggested ops: revive beats wait when corpses/dying present
+  // Urgency + suggested ops: revive pinned when corpse present & affordable
   let urgency = 0
   const suggested_ops: WorldOp[] = []
+  const duty = reviveDutyCorpse(state, bot)
   if (corpses.some((c) => c.self_can_revive_now)) {
-    urgency += 80
+    urgency += 90
     suggested_ops.push('revive')
   } else if (corpses.some((c) => c.self_can_afford)) {
-    urgency += 55
-    suggested_ops.push('revive') // path then revive
+    urgency += 70
+    // Path then revive — move is first-class for locomotion toward corpse
+    suggested_ops.push('move', 'revive')
   } else if (corpses.length) {
-    urgency += 35
+    urgency += 40
+    suggested_ops.push('move', 'adsorb') // earn pool then revive
+  }
+  if (duty) {
+    urgency = Math.min(100, urgency + 15)
+    // Pin revive at top; keep move if not yet adjacent
+    const pinned: WorldOp[] = duty && dist(bot.pos, duty.pos) > REVIVE_RANGE + 1e-9
+      ? ['move', 'revive']
+      : ['revive']
+    for (const op of suggested_ops) {
+      if (!pinned.includes(op)) pinned.push(op)
+    }
+    suggested_ops.length = 0
+    suggested_ops.push(...pinned)
   }
   if (corpses.some((c) => c.neglect_hardened)) {
     urgency = Math.min(100, urgency + 25)
@@ -660,14 +703,14 @@ function reject(
   recordError(bot, code, msg)
   // Design telemetry: satiety (and selected codes) must land in events / world.json
   if (TELEMETRY_REJECT_CODES.has(code)) {
-    const type =
-      code === 'REFUSED_SATIATED' ? 'refused_satiated' : `refused_${code.toLowerCase()}`
+    // REFUSED_* → lowercase event name (refused_satiated / refused_revive_wait / …)
+    const type = code.toLowerCase()
     pushEvent(state, type, {
       actor: bot.actorId,
       code,
       msg,
       energy_pool: bot.energy_pool,
-      threshold: SATIETY_THRESHOLD,
+      ...(code === 'REFUSED_SATIATED' ? { threshold: SATIETY_THRESHOLD } : {}),
       ...extra,
     })
   }
@@ -712,6 +755,25 @@ function applyOne(
 
   switch (op) {
     case 'wait': {
+      const duty = reviveDutyCorpse(state, bot)
+      if (duty) {
+        reject(
+          state,
+          receipt,
+          bot,
+          idx,
+          'REFUSED_REVIVE_WAIT',
+          `corpse ${duty.id} (${duty.corpseOf}) in view; pool ${bot.energy_pool}≥revive ${ACTION_COST.revive}+${REVIVE_SAFETY_MARGIN} — must move/revive not wait`,
+          {
+            corpse: duty.id,
+            corpse_of: duty.corpseOf,
+            revive_cost: ACTION_COST.revive,
+            safety_margin: REVIVE_SAFETY_MARGIN,
+            dist: Math.round(dist(bot.pos, duty.pos) * 10) / 10,
+          },
+        )
+        return
+      }
       if (!spend(bot, cost)) {
         reject(state, receipt, bot, idx, 'NO_ENERGY', 'cannot wait')
         return
@@ -902,6 +964,29 @@ function applyOne(
         reject(state, receipt, bot, idx, 'NOT_ADJACENT', 'not close enough to bite')
         return
       }
+      // Revive duty first (corpse in view + can afford): blocks non-starve bite before satiety
+      if (org.kind !== 'corpse') {
+        const duty = reviveDutyCorpse(state, bot)
+        if (duty) {
+          reject(
+            state,
+            receipt,
+            bot,
+            idx,
+            'REFUSED_REVIVE_BITE',
+            `corpse ${duty.id} (${duty.corpseOf}) in view; pool ${bot.energy_pool}≥revive ${ACTION_COST.revive}+${REVIVE_SAFETY_MARGIN} — revive before biting ${org.kind} ${org.id}`,
+            {
+              corpse: duty.id,
+              corpse_of: duty.corpseOf,
+              revive_cost: ACTION_COST.revive,
+              safety_margin: REVIVE_SAFETY_MARGIN,
+              organic: org.id,
+              kind: org.kind,
+            },
+          )
+          return
+        }
+      }
       // Engine-side satiety: fruit bite hard-refused when pool already comfortable
       if (org.kind === 'fruit' && bot.energy_pool >= SATIETY_THRESHOLD) {
         reject(
@@ -979,8 +1064,8 @@ function applyOne(
         reject(state, receipt, bot, idx, 'TARGET_GONE', 'need a corpse organic')
         return
       }
-      if (dist(bot.pos, org.pos) > INTERACT_RADIUS + 1) {
-        reject(state, receipt, bot, idx, 'NOT_ADJACENT', 'corpse too far')
+      if (dist(bot.pos, org.pos) > REVIVE_RANGE + 1e-9) {
+        reject(state, receipt, bot, idx, 'NOT_ADJACENT', 'corpse too far — move closer then revive')
         return
       }
       const dead = findBot(state, org.corpseOf)
@@ -992,24 +1077,79 @@ function applyOne(
         reject(state, receipt, bot, idx, 'NO_ENERGY', 'need energy to revive')
         return
       }
-      // Transfer locked corpse energy back into revived pool partially
-      const unlock = Math.min(org.energy_locked, 6)
-      org.energy_locked = Math.round((org.energy_locked - unlock) * 1000) / 1000
+      // Split locked energy: savior + revived share; remainder → waste (conservation)
+      const lockedWas = org.energy_locked
+      let toSavior = Math.round(lockedWas * REVIVE_SHARE_SAVIOR * 1000) / 1000
+      let toRevived = Math.round(lockedWas * REVIVE_SHARE_REVIVED * 1000) / 1000
+      let toWasteLock = Math.round((lockedWas - toSavior - toRevived) * 1000) / 1000
+      if (toWasteLock < 0) {
+        toRevived = Math.round((toRevived + toWasteLock) * 1000) / 1000
+        toWasteLock = 0
+      }
+      org.energy_locked = 0
       dead.alive = true
-      dead.core_integrity = 0.55
-      dead.energy_pool = Math.round((dead.energy_pool + unlock) * 1000) / 1000
+      dead.core_integrity = Math.max(dead.core_integrity, 0.55)
+      dead.energy_pool = Math.round((dead.energy_pool + toRevived) * 1000) / 1000
+      bot.energy_pool = Math.round((bot.energy_pool + toSavior) * 1000) / 1000
       dead.starveTicks = 0
       dead.pos = { ...org.pos }
       state.organics = state.organics.filter((o) => o.id !== org.id)
-      if (org.energy_locked > 0.01) {
-        state.waste_heat = Math.round((state.waste_heat + org.energy_locked) * 1000) / 1000
+      budgetLeft.n -= cost
+      receipt.energy_spent += cost
+      state.waste_heat = Math.round((state.waste_heat + cost + toWasteLock) * 1000) / 1000
+      receipt.accepted.push(idx)
+      resetBiteStreak(bot)
+      pushEvent(state, 'revived', {
+        actor: bot.actorId,
+        revived: dead.actorId,
+        corpse: org.id,
+        cost,
+        locked_was: lockedWas,
+        to_savior: toSavior,
+        to_revived: toRevived,
+        waste_from_lock: toWasteLock,
+      })
+      // Compat alias for older readers
+      pushEvent(state, 'revive', {
+        actor: bot.actorId,
+        revived: dead.actorId,
+        corpse: org.id,
+        to_savior: toSavior,
+        to_revived: toRevived,
+      })
+      return
+    }
+    case 'move': {
+      const dir = parseDir(action.dir)
+      if (!dir || (dir.x === 0 && dir.y === 0)) {
+        reject(state, receipt, bot, idx, 'ILLEGAL_OP', 'dir required (n/s/e/w/…)')
+        return
+      }
+      const next = {
+        x: clamp(bot.pos.x + dir.x, 0, state.width - 1),
+        y: clamp(bot.pos.y + dir.y, 0, state.height - 1),
+      }
+      const occ = occupiedKeys(state)
+      occ.delete(keyOf(bot.pos))
+      if (occ.has(keyOf(next))) {
+        reject(state, receipt, bot, idx, 'ILLEGAL_OP', 'destination occupied')
+        return
+      }
+      if (!spend(bot, cost)) {
+        reject(state, receipt, bot, idx, 'NO_ENERGY', 'cannot move')
+        return
+      }
+      bot.pos = next
+      for (const pid of bot.bound_particle_ids) {
+        const p = findParticle(state, pid)
+        if (p) p.pos = { ...bot.pos }
       }
       budgetLeft.n -= cost
       receipt.energy_spent += cost
       state.waste_heat = Math.round((state.waste_heat + cost) * 1000) / 1000
       receipt.accepted.push(idx)
       resetBiteStreak(bot)
-      pushEvent(state, 'revive', { actor: bot.actorId, revived: dead.actorId })
+      pushEvent(state, 'move', { actor: bot.actorId, to: next })
       return
     }
     default:
@@ -1303,6 +1443,8 @@ export function formatEventLine(ev: WorldEvent): string {
       return `[世界 t=${ev.t}] ${p.actor} 消化：能池+${p.toPool}，废热+${p.toHeat}`
     case 'death':
       return `[世界 t=${ev.t}] ${p.actor} 死亡（${p.reason}），留下尸体 ${p.corpse}`
+    case 'revived':
+      return `[世界 t=${ev.t}] ${p.actor} 复活了 ${p.revived}（锁能${p.locked_was}→救者+${p.to_savior}/死者+${p.to_revived}）`
     case 'revive':
       return `[世界 t=${ev.t}] ${p.actor} 复活了 ${p.revived}`
     case 'megamorph':
