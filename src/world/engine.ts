@@ -130,6 +130,7 @@ const TELEMETRY_REJECT_CODES: ReadonlySet<ActRejectCode> = new Set([
   'REFUSED_CONDENSE_STARVING',
   'REFUSED_CONDENSE_CLUTTER',
   'REFUSED_CATALYZE_MAXED',
+  'REFUSED_FRUIT_FORAGE',
 ])
 
 const DIRS: Record<string, Vec2> = {
@@ -604,6 +605,26 @@ function noteCondenseSuccess(bot: BotBody): void {
 
 function fruitPresent(state: WorldState): boolean {
   return state.organics.some((o) => o.kind === 'fruit' && o.energy_locked > 0.01)
+}
+
+/** Nearest living fruit (or null). */
+function nearestFruit(state: WorldState, at: Vec2): Organic | null {
+  let best: Organic | null = null
+  let bestD = Infinity
+  for (const o of state.organics) {
+    if (o.kind !== 'fruit' || o.energy_locked <= 0.01) continue
+    const d = dist(at, o.pos)
+    if (d < bestD) {
+      bestD = d
+      best = o
+    }
+  }
+  return best
+}
+
+/** True when bot is within bite/interact range of fruit. */
+function adjacentToFruit(bot: BotBody, fruit: Organic): boolean {
+  return dist(bot.pos, fruit.pos) <= fruit.radius + INTERACT_RADIUS + 1e-9
 }
 
 
@@ -1312,6 +1333,32 @@ export function observe(state: WorldState, actorId: string): ObserveSnapshot {
     suggested_ops.push(...stripped)
   }
 
+  // Fruit-era forage pin: hungry + fruit present + not adjacent → only move toward fruit.
+  // Revive duty / digest / in-range fruit bite still win when applicable.
+  if (!fruit_gone && bot.energy_pool + 1e-9 < SATIETY_THRESHOLD) {
+    const fruitOrg = nearestFruit(state, bot.pos)
+    if (fruitOrg && !adjacentToFruit(bot, fruitOrg)) {
+      const dFruit = Math.round(dist(bot.pos, fruitOrg.pos) * 10) / 10
+      const adjR = Math.round((fruitOrg.radius + INTERACT_RADIUS) * 10) / 10
+      const needDir = compassDir(bot.pos, fruitOrg.pos)
+      alerts.unshift(
+        `FRUIT_FORAGE pool=${bot.energy_pool}<${SATIETY_THRESHOLD} d=${dFruit}>${adjR} — suggested=move dir=${needDir} fruit_id=${fruitOrg.id}；拒 wait/catalyze (REFUSED_FRUIT_FORAGE)；pool<move 时 hungry_move 从废热付`,
+      )
+      if (duty) {
+        // Revive duty keeps existing pin (move/revive); only alert forage
+        urgency = Math.max(urgency, 62)
+      } else {
+        const head: WorldOp[] = []
+        // Digest still wins when stomach has buffer
+        if (bot.stomach >= 1 && suggested_ops.includes('digest')) head.push('digest')
+        // In-range fruit bite cannot apply here (not adjacent)
+        suggested_ops.length = 0
+        suggested_ops.push(...head, 'move')
+        urgency = Math.max(urgency, 62)
+      }
+    }
+  }
+
   urgency = clamp(urgency, 0, 100)
 
   const events_recent = state.events.filter((e) => e.t >= state.tick - 5).slice(-12)
@@ -1497,11 +1544,53 @@ function applyOne(
       const shortfall = Math.max(0, Math.round((cost - bot.energy_pool) * 1000) / 1000)
       return o.energy_locked + 1e-9 >= shortfall
     })
-  if (bot.energy_pool + 1e-9 < cost && op !== 'digest' && !hungryClumpBite && !hungryReviveOk) {
+  // Hungry move: pay shortfall from waste_heat (top-up then spend; no mint)
+  const hungryMoveOk =
+    op === 'move' &&
+    bot.energy_pool + 1e-9 < cost &&
+    state.waste_heat + bot.energy_pool + 1e-9 >= cost
+  if (
+    bot.energy_pool + 1e-9 < cost &&
+    op !== 'digest' &&
+    !hungryClumpBite &&
+    !hungryReviveOk &&
+    !hungryMoveOk
+  ) {
     reject(state, receipt, bot, idx, 'NO_ENERGY', `pool ${bot.energy_pool} < cost ${cost}`)
     return
   }
 
+
+  // --- Fruit-era forage: refuse wait/catalyze when hungry and not adjacent to fruit ---
+  // Revive duty still wins (no refuse when corpse duty active).
+  {
+    if (fruitPresent(state) && bot.energy_pool + 1e-9 < SATIETY_THRESHOLD) {
+      const fruitOrg = nearestFruit(state, bot.pos)
+      if (fruitOrg && !adjacentToFruit(bot, fruitOrg) && !reviveDutyCorpse(state, bot)) {
+        if (op === 'wait' || op === 'catalyze') {
+          const needDir = compassDir(bot.pos, fruitOrg.pos)
+          const dFruit = Math.round(dist(bot.pos, fruitOrg.pos) * 10) / 10
+          reject(
+            state,
+            receipt,
+            bot,
+            idx,
+            'REFUSED_FRUIT_FORAGE',
+            `fruit ${fruitOrg.id} still present; pool ${bot.energy_pool}<${SATIETY_THRESHOLD} d=${dFruit} — move dir=${needDir} fruit_id=${fruitOrg.id} (not ${op})`,
+            {
+              fruit_id: fruitOrg.id,
+              dir: needDir,
+              pool: bot.energy_pool,
+              dist: dFruit,
+              refused_op: op,
+              allowed: 'move / digest / bite(fruit in range) / revive',
+            },
+          )
+          return
+        }
+      }
+    }
+  }
 
   // --- Mix-prep hard gate (post-fruit, window unbalanced) ---
   // Revive duty always wins; digest + bite(clump) when foraging still allowed.
@@ -2196,6 +2285,30 @@ function applyOne(
         reject(state, receipt, bot, idx, 'ILLEGAL_OP', 'destination occupied')
         return
       }
+      // Hungry move: top up shortfall from waste_heat, then normal spend (pool→waste).
+      // Net conservation holds; no mint into pool beyond the cost bridge.
+      let toppedFromWaste = 0
+      let hungryMove = false
+      if (bot.energy_pool + 1e-9 < cost) {
+        const shortfall = Math.round((cost - bot.energy_pool) * 1000) / 1000
+        const take = Math.min(shortfall, Math.max(0, state.waste_heat))
+        if (bot.energy_pool + take + 1e-9 < cost) {
+          reject(
+            state,
+            receipt,
+            bot,
+            idx,
+            'NO_ENERGY',
+            `hungry_move needs waste≥shortfall ${shortfall}, have waste ${state.waste_heat} pool ${bot.energy_pool}`,
+            { pool: bot.energy_pool, waste_heat: state.waste_heat, cost, shortfall },
+          )
+          return
+        }
+        state.waste_heat = Math.round((state.waste_heat - take) * 1000) / 1000
+        bot.energy_pool = Math.round((bot.energy_pool + take) * 1000) / 1000
+        toppedFromWaste = take
+        hungryMove = true
+      }
       if (!spend(bot, cost)) {
         reject(state, receipt, bot, idx, 'NO_ENERGY', 'cannot move')
         return
@@ -2210,7 +2323,11 @@ function applyOne(
       state.waste_heat = Math.round((state.waste_heat + cost) * 1000) / 1000
       receipt.accepted.push(idx)
       resetBiteStreak(bot)
-      pushEvent(state, 'move', { actor: bot.actorId, to: next })
+      pushEvent(state, 'move', {
+        actor: bot.actorId,
+        to: next,
+        ...(hungryMove ? { hungry_move: true, topped_from_waste: toppedFromWaste } : {}),
+      })
       return
     }
     case 'condense': {
@@ -2680,7 +2797,7 @@ export function formatEventLine(ev: WorldEvent): string {
     case 'collide_transfer':
       return `[世界 t=${ev.t}] 阴阳碰撞转能 ${p.a}↔${p.b}`
     case 'move':
-      return `[世界 t=${ev.t}] ${p.actor} 移动到 (${(p.to as Vec2).x},${(p.to as Vec2).y})`
+      return `[世界 t=${ev.t}] ${p.actor} 移动到 (${(p.to as Vec2).x},${(p.to as Vec2).y})${p.hungry_move ? `（饿走·废热补${p.topped_from_waste}）` : ''}`
     case 'world_seeded':
       return `[世界 t=${ev.t}] 阴阳场开机 · 守恒基线=${p.baseline} · 硕果能量=${p.fruit_energy}`
     case 'refused_satiated':

@@ -30,6 +30,8 @@ export type ActRejectCode =
   | 'REFUSED_CONDENSE_CLUTTER'
   /** Catalyze refused: particle bond already ≥1 — no further gain. */
   | 'REFUSED_CATALYZE_MAXED'
+  /** Fruit-era forage: wait/catalyze refused while hungry and not adjacent to fruit — move toward fruit. */
+  | 'REFUSED_FRUIT_FORAGE'
 
 export interface Vec2 {
   x: number

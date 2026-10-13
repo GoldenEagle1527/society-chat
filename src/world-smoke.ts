@@ -500,6 +500,11 @@ function main(): void {
     }
     transferPool(bot, state, RESEARCH_POOL_THRESHOLD) // 6 — below SATIETY 10
     assert.ok(Math.abs(bot.energy_pool - RESEARCH_POOL_THRESHOLD) < 0.05, `pool=${bot.energy_pool}`)
+    // Park adjacent to fruit so FRUIT_FORAGE move-pin does not strip research tail
+    {
+      const fr = state.organics.find((o) => o.kind === 'fruit' && o.energy_locked > 0.01)
+      if (fr) bot.pos = { x: fr.pos.x + fr.radius, y: fr.pos.y }
+    }
     const snapR = observe(state, 'agnes')
     assert.ok(snapR.suggested_ops.includes('pull'), `research pull present got ${snapR.suggested_ops}`)
     assert.ok(snapR.suggested_ops.includes('adsorb'), 'adsorb')
@@ -1138,6 +1143,98 @@ function main(): void {
       )
       console.log('✓ pull_oscillation forced unpaid')
     }
+  }
+
+  // --- Fruit-era forage pin + hungry_move from waste ---
+  {
+    state.organics = state.organics.filter((o) => o.kind !== 'corpse' && o.kind !== 'clump')
+    let fr = state.organics.find((o) => o.kind === 'fruit' && o.energy_locked > 20)
+    if (!fr) {
+      // Re-seed a fruit from waste for forage-pin coverage (post-fruit tests emptied it)
+      const lock = Math.min(80, Math.max(0, state.waste_heat - 5))
+      assert.ok(lock >= 20, `need waste for fruit reseed have ${state.waste_heat}`)
+      state.waste_heat = Math.round((state.waste_heat - lock) * 1000) / 1000
+      fr = {
+        id: 'fruit_forage_test',
+        kind: 'fruit' as const,
+        pos: { x: 24, y: 24 },
+        energy_locked: lock,
+        radius: 3,
+      }
+      state.organics.push(fr)
+    }
+    assert.ok(fr, 'need fruit for forage pin')
+    if (bot.stomach > 0) {
+      state.waste_heat = Math.round((state.waste_heat + bot.stomach) * 1000) / 1000
+      bot.stomach = 0
+    }
+    // Far from fruit, pool below satiety → suggested only move; wait/catalyze refused
+    bot.pos = {
+      x: Math.min(state.width - 1, fr!.pos.x + fr!.radius + 8),
+      y: fr!.pos.y,
+    }
+    transferPool(bot, state, 3)
+    const snapF = observe(state, 'agnes')
+    assert.ok(
+      snapF.alerts.some((a) => a.includes('FRUIT_FORAGE') && a.includes(fr!.id)),
+      `FRUIT_FORAGE alert got ${snapF.alerts[0]}`,
+    )
+    assert.deepEqual(
+      snapF.suggested_ops.filter((o) => o === 'move' || o === 'wait' || o === 'catalyze'),
+      ['move'],
+      `forage suggested got ${snapF.suggested_ops}`,
+    )
+    assert.ok(snapF.suggested_ops[0] === 'move' || snapF.suggested_ops.includes('move'), 'move present')
+    assert.ok(!snapF.suggested_ops.includes('wait'), 'no wait in forage pin')
+    assert.ok(!snapF.suggested_ops.includes('catalyze'), 'no catalyze in forage pin')
+    const refuseW = act(
+      state,
+      { actor_id: 'agnes', budget_energy: 5, actions: [{ op: 'wait' }] },
+      { settle: false },
+    )
+    assert.ok(
+      refuseW.rejected.some((r) => r.code === 'REFUSED_FRUIT_FORAGE'),
+      `wait refuse forage got ${JSON.stringify(refuseW.rejected)}`,
+    )
+    const refuseC = act(
+      state,
+      { actor_id: 'agnes', budget_energy: 5, actions: [{ op: 'catalyze', target_id: state.particles[0]?.id }] },
+      { settle: false },
+    )
+    assert.ok(
+      refuseC.rejected.some((r) => r.code === 'REFUSED_FRUIT_FORAGE'),
+      `catalyze refuse forage got ${JSON.stringify(refuseC.rejected)}`,
+    )
+    // Hungry move: pool < ACTION_COST.move, pay from waste
+    transferPool(bot, state, 0.2)
+    assert.ok(bot.energy_pool + 1e-9 < ACTION_COST.move, `pool ${bot.energy_pool} < move`)
+    assert.ok(state.waste_heat >= ACTION_COST.move, 'waste covers move')
+    const beforeW = state.waste_heat
+    const beforeP = bot.energy_pool
+    const beforeE = totalEnergy(state)
+    const dirToward =
+      fr!.pos.x > bot.pos.x ? 'e' : fr!.pos.x < bot.pos.x ? 'w' : fr!.pos.y > bot.pos.y ? 's' : 'n'
+    state.events.length = 0
+    const hm = act(
+      state,
+      { actor_id: 'agnes', budget_energy: 5, actions: [{ op: 'move', dir: dirToward }] },
+      { settle: false },
+    )
+    assert.ok(hm.accepted.includes(0), `hungry_move accepted ${JSON.stringify(hm.rejected)}`)
+    const moveEv = state.events.find((e) => e.type === 'move')
+    assert.ok(moveEv?.payload?.hungry_move, `hungry_move event got ${JSON.stringify(moveEv)}`)
+    assert.ok(
+      Number(moveEv?.payload?.topped_from_waste) > 0,
+      `topped_from_waste got ${moveEv?.payload?.topped_from_waste}`,
+    )
+    const afterE = totalEnergy(state)
+    assert.ok(
+      Math.abs(afterE - beforeE) < 0.35,
+      `after hungry_move Σ=${afterE} was ${beforeE} (Δ must ~0)`,
+    )
+    console.log(
+      `✓ FRUIT_FORAGE + hungry_move pool ${beforeP}→${bot.energy_pool} waste ${beforeW}→${state.waste_heat} topped=${moveEv?.payload?.topped_from_waste}`,
+    )
   }
 
   console.log('=== WORLD-SMOKE OK ===')
